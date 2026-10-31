@@ -12,7 +12,7 @@
 
 | 名稱                | host      | 做什麼                                                                          |
 | ------------------- | --------- | ------------------------------------------------------------------------------- |
-| `env-guard`         | cmdc / pi | 環境修復層（詳見下方各章節）                                                    |
+| `env-guard`         | cmdc / pi / OpenCode | 環境修復層（詳見下方各章節）                                          |
 | `system-prompt`     | cmdc      | 用 `SYSTEM.md` / `APPEND_SYSTEM.md` 自訂或附加系統提示詞                        |
 | `disable-tools`     | cmdc      | `DISABLED_TOOLS` 常數列 tool wire name——完全不載入（不送出 schema）             |
 | `chat-trim-context` | OpenCode  | `id: chat.trim-context` — 針對 `chat` agent，每次送出模型請求前清理系統提示段落 |
@@ -31,7 +31,7 @@ mod/extension/plugin 名稱取自資料夾名（`index.ts` 就是本體）。三
 不帶共用說明：cmdc 與 pi 的 git 套件 package root 都是 repo 根目錄
 （`commandcode.mods` 與 `pi.extensions` 必須宣告在根、指向 root 內的路徑，
 兩者都不支援 git 子路徑安裝）；OpenCode 不受限——它用 `::path:` 子路徑選擇器
-直接指到 `oc-plugins/chat-trim-context/`（該資料夾另有一份自己的 package.json）。
+直接指到 `oc-plugins/<插件名>/`（每個插件資料夾另有一份自己的 package.json）。
 
 
 ## 安裝（Command Code，二選一）
@@ -95,19 +95,21 @@ pi remove git:github.com/Artin0123/harness-plugins
 
 ```sh
 opencode plugin add "github:Artin0123/harness-plugins#master::path:oc-plugins/chat-trim-context"
+opencode plugin add "github:Artin0123/harness-plugins#master::path:oc-plugins/env-guard"
 ```
 
 - 登記到全域 `~/.config/opencode/opencode.json` 的 `plugins`；實體安裝在 `~/.cache/opencode/npm/`
-- 以 `#master` 跟隨 master 分支，之後 `opencode plugin update chat.trim-context` 更新到最新 commit；釘版本就用完整 commit hash
+- 以 `#master` 跟隨 master 分支，之後 `opencode plugin update <插件 id>` 更新到最新 commit；釘版本就用完整 commit hash
 - 管理指令：`opencode plugin list` / `check` / `remove`——注意 `list` 只列本地插件目錄裡的；指令安裝的要用 `check` 看（會顯示插件 id 與所在 commit）
 
 ### 2. 本地檔案安裝
 
 把插件資料夾放進 OpenCode 的插件目錄（啟動時自動載入）：
 
-- 全域：複製 `oc-plugins/chat-trim-context/` 到 `~/.config/opencode/plugins/`
+- 全域：複製 `oc-plugins/chat-trim-context/`（或 `oc-plugins/env-guard/`）到 `~/.config/opencode/plugins/`
 - 專案層級：複製到專案的 `.opencode/plugins/`
 - 更新就重新拉 repo 再覆蓋一次
+- 本機實測（v2.2.5）：直接放進插件目錄的檔案若以 `import { Plugin } from "@opencode/plugin"` 取得 `Plugin`，會被以 `ReferenceError: Plugin is not defined` 跳過；改用上面的套件安裝則正常。堅持本地檔案安裝時，把那一行換成 `const Plugin = { define: (p) => p };` 即可（`define` 只是回傳原物件的語法糖）
 
 > **1、2 只選一種。**
 
@@ -255,6 +257,37 @@ agent 可用 `cygpath -w` 自癒。全面改寫 argv 會誤傷依賴 posix 形�
 
 ---
 
+## env-guard (oc-plugins)
+
+`id: env.guard` — **只影響 Windows**（MSYS/MINGW bash）。與 cmdc / pi 版同一套判準，
+但 OpenCode 的執行層不同，修法與接線跟著不同：
+
+| 故障                                                                          | OpenCode 版做法                                                                                                                                                                                                                                     |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 檔案工具路徑（`read`/`write`/`edit`/`glob`/`grep` 的 `path`）                 | host 解析、不經 MSYS 映射、不展開變數 → `/tmp`、`$TEMP`/`$TMP`/`$TMPDIR`、`%TEMP%`/`%TMP%` 開頭改寫到偵測到的 bash 自己回報的 temp 錨點（`cygpath -w /tmp`），檔案工具與 bash 的 `/tmp` 因此是同一個目錄                             |
+| `cmd //c` / `//k`                                                             | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（GBK banner、命令沒跑、exit 0，靜默失敗）。只在**指令位置**改寫成 `/c`，含巢狀 `$( )`／反引號／雙引號與貼緊的 `cmd//c`；資料位置（`echo cmd //c`）不動。以真實 bash 探測 `$MSYS_NO_PATHCONV`，確認關閉才啟用 |
+
+接線（v2.2.5 實測）：路徑改寫掛 `ctx.tool.hook("execute.before")`（改 `event.input.path`）；
+指令改寫掛 `ctx.shell.hook("create.before")`（改 `event.command`），並先用 `uname -s`
+確認 `event.shell` 真的是 MSYS bash（按執行檔快取）。任何閘門失敗 → 整體不動
+（漏修是大聲失敗、agent 可自癒；誤修是靜默破壞正確語法）。
+
+**刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
+（OpenCode 工具層自己解析正確）、`nul` 重導向（bash 原生行為）、cmd 的非 ASCII 亂碼
+（無忠實改寫，亂碼本身就是可見、可自矯正的訊號）。
+
+**實測（v2.2.5，乾淨啟動）**：`write` 寫 `$TEMP/...` 落在真實
+`%LOCALAPPDATA%\Temp`，專案底下不會出現字面 `$TEMP` 資料夾；`cmd //c ver` 的 spawn 行
+為 `-c "cmd /c ver"` 並實際輸出 `Microsoft Windows [版本 10.0.19045.7725]`；對照的
+`echo cmd //c ver` 原樣不動。
+
+本機提醒：用 bash 啟動 host 時**不要** `export PWD='C:\...'`——Windows 形式（`C:\...`
+或 `C:/...`）的 `PWD` 會讓 MSYS bash 子代啟動即死鎖：命令不執行、零輸出、還會複製子代
+（任何 host 都一樣；清掉 `PWD` 恢復約 0.3 秒啟動）。要從 bash 啟動時改用 cmd 啟動器先
+`set "PWD="` 再 `cd /d` 呼叫。
+
+---
+
 ## chat-trim-context (oc-plugins)
 
 `id: chat.trim-context` — 針對 `chat` agent，在每次送出模型請求前（`context` / `compaction` / `generate`）清理系統提示：
@@ -271,6 +304,7 @@ node cmdc-mods/tests/env-guard/index.mjs      # cmdc 版回歸測試
 node cmdc-mods/tests/system-prompt/index.mjs  # system-prompt 回歸測試
 node cmdc-mods/tests/disable-tools/index.mjs  # disable-tools 回歸測試
 node pi-extensions/tests/env-guard/index.mjs  # pi 版單元電池（含「刻意不修」釘死）
+node oc-plugins/tests/env-guard/index.mjs     # OpenCode 版單元電池（含 hook 接線與「刻意不修」釘死）
 ```
 
 需要 Node ≥ 22.6（23.6 起預設支援 `.ts`，更舊的要加 `--experimental-strip-types`）。
