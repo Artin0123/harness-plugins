@@ -401,18 +401,32 @@ function scanBash(
   let cmdPosNext = true;
   let cmdFlagZone = false; // after cmd, /flags keep the zone alive (cmd //q //c)
 
+  // A cmd token is recognised by basename, so an explicit path
+  // (C:\Windows\System32\cmd.exe) is the same command as `cmd`. Quoted
+  // spellings ("cmd") still fall through -- no rewrite, the pre-plugin
+  // behaviour (documented as a known miss).
   const isCmdTok = (t: string) => {
-    const l = t.toLowerCase();
-    return l === "cmd" || l === "cmd.exe";
+    const base = t.split(/[\\/]/).pop()!.toLowerCase();
+    return base === "cmd" || base === "cmd.exe";
   };
+
+  // Shell keywords never end a command position (if/then/do/{ ... }), so a
+  // cmd after them is still the command being run. Only matters when the
+  // token is literally cmd, so a wrong guess cannot rewrite anything else.
+  const SHELL_KEYWORDS = new Set([
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+    "case", "esac", "in", "select", "function", "time", "exec", "command",
+    "builtin", "env", "!", "{", "}",
+  ]);
 
   const commitTok = () => {
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
     if (cmdPosNext) {
       sawCmd = sawCmd || isCmdTok(curTok);
-      // FOO=bar env prefixes do not end the command position
-      cmdPosNext = /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok);
+      // FOO=bar env prefixes and shell keywords do not end the command position
+      cmdPosNext =
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok) || SHELL_KEYWORDS.has(curTok.toLowerCase());
     }
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
@@ -579,6 +593,8 @@ function scanBash(
     }
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok(); // a redirect target is not a command position
+      // a case-pattern "x) cmd ..." starts a command list after the ")"
+      if (ch === ")") cmdPosNext = true;
       out += ch;
       i++;
       continue;

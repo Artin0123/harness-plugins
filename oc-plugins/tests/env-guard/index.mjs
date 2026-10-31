@@ -65,6 +65,12 @@ check('P: ~ untouched (tool expands)', rt('~/x') === '~/x', JSON.stringify(rt('~
 // duplicate protection (pure side effect).
 check('P: /c/Users passes through (host maps natively)', rt('/c/Users/a') === '/c/Users/a', JSON.stringify(rt('/c/Users/a')));
 check('P: /c/tmp passes through', rt('/c/tmp/x') === '/c/tmp/x', JSON.stringify(rt('/c/tmp/x')));
+// prefix boundaries: a temp-looking name that is not the temp dir stays put
+check('P: $TEMPFILE/x untouched', rt('$TEMPFILE/x') === '$TEMPFILE/x', JSON.stringify(rt('$TEMPFILE/x')));
+check('P: $TMPDIRX/x untouched', rt('$TMPDIRX/x') === '$TMPDIRX/x', JSON.stringify(rt('$TMPDIRX/x')));
+check('P: /tmpfoo/x untouched', rt('/tmpfoo/x') === '/tmpfoo/x', JSON.stringify(rt('/tmpfoo/x')));
+check('P: //server/share untouched', rt('//server/share') === '//server/share', JSON.stringify(rt('//server/share')));
+check('P: bare %TEMP%', rt('%TEMP%') === T, JSON.stringify(rt('%TEMP%')));
 
 // --- rewriteBashCommand: doubled flags (probe-gated: fires only when the
 // spawned bash actually reports MSYS_NO_PATHCONV=1; on a machine without the
@@ -190,6 +196,29 @@ const gp3 = split('$TMP/a\\b.txt');
 check('P: glob $TMP backslash splits', !!gp3 && gp3.rest === 'a/b.txt', JSON.stringify(gp3));
 check('P: glob unrelated pattern untouched', split('src/**/*.ts') === null, JSON.stringify(split('src/**/*.ts')));
 check('P: glob bare $TEMP untouched', split('$TEMP') === null, JSON.stringify(split('$TEMP')));
+
+// --- command position: shells keywords, groups, case patterns, path forms ---
+const fullPath = bc('C:\\Windows\\System32\\cmd.exe //c ver');
+check('P: full-path cmd.exe fixed', fullPath.command === 'C:\\Windows\\System32\\cmd.exe /c ver', JSON.stringify(fullPath));
+const thenKw = bc('if true; then cmd //c ver; fi');
+check('P: cmd after then', thenKw.command === 'if true; then cmd /c ver; fi', JSON.stringify(thenKw));
+const doKw = bc('for f in a b; do cmd //c ver; done');
+check('P: cmd after do', doKw.command === 'for f in a b; do cmd /c ver; done', JSON.stringify(doKw));
+const braceGrp = bc('{ cmd //c ver; }');
+check('P: cmd in brace group', braceGrp.command === '{ cmd /c ver; }', JSON.stringify(braceGrp));
+const casePat = bc('case x in a) cmd //c ver;; esac');
+check('P: cmd after case pattern )', casePat.command === 'case x in a) cmd /c ver;; esac', JSON.stringify(casePat));
+const timeKw = bc('time cmd //c ver');
+check('P: cmd after time', timeKw.command === 'time cmd /c ver', JSON.stringify(timeKw));
+const bang = bc('! cmd //c ver');
+check('P: cmd after !', bang.command === '! cmd /c ver', JSON.stringify(bang));
+const envCmd = bc('env FOO=1 cmd //c ver');
+check('P: cmd after env', envCmd.command === 'env FOO=1 cmd /c ver', JSON.stringify(envCmd));
+check('P: quoted word in argument position untouched', bc('echo "if" cmd //c ver').command === 'echo "if" cmd //c ver', JSON.stringify(bc('echo "if" cmd //c ver')));
+check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver').command === 'ls | xargs cmd //c ver', JSON.stringify(bc('ls | xargs cmd //c ver')));
+// Known miss, pinned on purpose: a quoted command name ("cmd") is not
+// recognised, so the doubled flag stays -- pre-plugin behaviour, documented.
+check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver').command === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
 
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();
