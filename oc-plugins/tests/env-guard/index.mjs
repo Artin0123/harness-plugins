@@ -217,7 +217,9 @@ check('P: cmd after env', envCmd.command === 'env FOO=1 cmd /c ver', JSON.string
 check('P: quoted word in argument position untouched', bc('echo "if" cmd //c ver').command === 'echo "if" cmd //c ver', JSON.stringify(bc('echo "if" cmd //c ver')));
 check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver').command === 'ls | xargs cmd //c ver', JSON.stringify(bc('ls | xargs cmd //c ver')));
 // Known miss, pinned on purpose: a quoted command name ("cmd") is not
-// recognised, so the doubled flag stays -- pre-plugin behaviour, documented.
+// recognised. It is fixable in principle but has zero organic occurrences
+// (0/508 real commands in this machine's log), so handling it would only add
+// scanner risk. Left as-is: pre-plugin behaviour.
 check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver').command === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
 
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
