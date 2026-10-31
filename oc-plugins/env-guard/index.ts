@@ -179,32 +179,32 @@ export function findBash(): string | null {
 // ---- the real temp anchor ------------------------------------------------
 // The anchor is what the detected bash answers for /tmp (cygpath -w /tmp):
 // that is the directory bash itself uses for '/tmp', so file tools and a
-// command's `> /tmp/x` land together even with a custom fstab. os.tmpdir() is
-// only a fallback -- measured, MSYS already converts TEMP to a Windows path
-// for native children, so it usually agrees, but it is not the shell's map.
-// Then the canonical user temp under homedir().
+// command's `> /tmp/x` land together even with a custom fstab. os.tmpdir()
+// is a fallback only when it is a real drive-letter path (it reads TEMP --
+// an environment fact, not a guess). No anchor otherwise: the temp rewrite
+// stays INERT -- never guess an AppData-style layout convention.
+// Lazy: probing spawns processes (uname + cygpath, ~370ms measured) and
+// module import must not pay it for calls that never touch a path.
 
-let bashTmp: string | null = null;
-let bashTmpProbed = false;
+let tempAnchor: string | null | undefined; // undefined = not probed yet; null = no anchor
 
-function realTempDir(): string {
-  if (!bashTmpProbed) {
-    bashTmpProbed = true;
-    try {
-      const bash = findBash();
-      if (bash) {
-        const p = spawnSync(bash, ["-c", "cygpath -w /tmp"], { timeout: 5000, windowsHide: true });
-        const out = (p.stdout?.toString() ?? "").trim();
-        if (!p.error && /^[A-Za-z]:[\\/]/.test(out)) bashTmp = out;
-      }
-    } catch { /* fallbacks below */ }
+export function realTempDir(): string | null {
+  if (tempAnchor !== undefined) return tempAnchor;
+  tempAnchor = null;
+  try {
+    const bash = findBash();
+    if (bash) {
+      const p = spawnSync(bash, ["-c", "cygpath -w /tmp"], { timeout: 5000, windowsHide: true });
+      const out = (p.stdout?.toString() ?? "").trim();
+      if (!p.error && /^[A-Za-z]:[\\/]/.test(out)) tempAnchor = out;
+    }
+  } catch { /* stay null: no anchor, no rewrite */ }
+  if (tempAnchor === null) {
+    const t = os.tmpdir();
+    if (/^[A-Za-z]:[\\/]/.test(t)) tempAnchor = path.normalize(t);
   }
-  if (bashTmp) return bashTmp;
-  const t = os.tmpdir();
-  if (/^[A-Za-z]:[\\/]/.test(t)) return path.normalize(t);
-  return path.join(os.homedir(), "AppData", "Local", "Temp");
+  return tempAnchor;
 }
-const realTemp = realTempDir();
 
 // ---- shell identity + MSYS_NO_PATHCONV probe (gate the //c rewrite) -------
 // The shell hook reports the executable the host is about to spawn. Only a
@@ -317,13 +317,19 @@ const TEMP_FORM = /^(?:\/tmp|\$(?:tmpdir|temp|tmp)|\$\{(?:tmpdir|temp|tmp)\}|%(?
 
 // File-tool path rewrite: the temp-dir forms only. Everything else --
 // relative paths, other drives, drive-letter MSYS paths (handled natively by
-// OpenCode's tool layer) -- passes through untouched.
+// OpenCode's tool layer) -- passes through untouched. Windows-only: the
+// failure point is this host's Windows path resolution; on other platforms
+// /tmp and $TEMP are native semantics and rewriting them would BE the side
+// effect. No measured anchor -> inert (no guessed layout).
 export function rewritePath(p: string): string {
+  if (!IS_WINDOWS) return p;
   const head = TEMP_FORM.exec(p);
   if (!head) return p;
   const rest = p.slice(head[0].length);
   // $TEMPFILE/x, /tmpfoo/x and friends are not the temp dir
   if (rest !== "" && !/^[\\/]/.test(rest)) return p;
+  const realTemp = realTempDir();
+  if (!realTemp) return p;
   const tail = rest.replace(/\//g, "\\").replace(/\\+$/, "");
   return tail ? realTemp + tail : realTemp;
 }
@@ -357,10 +363,13 @@ export function rewritePatchText(text: string): string {
 // `path` and the rest stays the pattern. Only used when the call has no path,
 // so a call that works today is never reshaped.
 export function splitTempPrefix(pattern: string): { dir: string; rest: string } | null {
+  if (!IS_WINDOWS) return null;
   const head = TEMP_FORM.exec(pattern);
   if (!head) return null;
   const rest = pattern.slice(head[0].length);
   if (!/^[\\/].+/.test(rest)) return null;
+  const realTemp = realTempDir();
+  if (!realTemp) return null; // no anchor: leave the pattern alone
   return { dir: realTemp, rest: rest.slice(1).replace(/\\/g, "/") };
 }
 

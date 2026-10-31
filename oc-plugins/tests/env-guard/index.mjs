@@ -11,7 +11,7 @@
 // temp dir, so the two can be compared directly.
 //
 // Needs Node >= 22.6 (type stripping default from 23.6).
-import {dirname, join} from 'node:path';
+import {dirname, join, normalize} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {readFileSync, writeFileSync, mkdtempSync, rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -300,6 +300,14 @@ check('B: <<EOF; same-line cmd still fixed', sameLine === 'cat <<EOF; cmd /c ver
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();
 check('P: findBash finds an MSYS bash on this machine', !!bash, String(bash));
+
+// --- temp anchor contract: this machine's bash maps /tmp to the user temp,
+// and the anchor is a measured drive path (never a guessed layout). Without
+// an anchor (no bash / non-drive tmpdir) rewritePath goes inert instead ---
+const anchor = mod.realTempDir();
+check('P: temp anchor is a drive path equal to tmpdir()',
+  typeof anchor === 'string' && /^[A-Za-z]:[\\/]/.test(anchor) && anchor === normalize(tmpdir()),
+  JSON.stringify(anchor));
 
 // --- probe expansion semantics: MSYS_NO_PATHCONV is presence-based
 // (measured: "0", "" and "yes" all disable conversion, so the probe tests
