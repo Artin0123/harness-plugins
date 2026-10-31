@@ -15,6 +15,7 @@ import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {readFileSync, writeFileSync, mkdtempSync, rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
+import {spawnSync} from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The plugin imports `Plugin` from @opencode/plugin (a runtime dep only the
@@ -144,11 +145,16 @@ toolBefore(p6);
 check('H: patch text rewritten', p6.input.patchText.includes(N + 'z.txt'), JSON.stringify(p6.input));
 
 const bashPath = mod.findBash();
+// gate-aware: on a default git-bash (conversion ON) the probe must leave the
+// command alone -- the battery then pins the OFF direction instead of
+// failing on machine config
+const gateOn = bashPath ? mod.pathConvDisabled(bashPath) : false;
 const evShell = (command, shell, cwd = '') => ({ command, cwd, timeout: 0, shell, env: {} });
 const s1 = evShell('echo cmd //c ver', bashPath); shellBefore(s1);
 check('H: shell hook keeps data position', s1.command === 'echo cmd //c ver', JSON.stringify(s1.command));
 const s2 = evShell('cmd //c ver', bashPath); shellBefore(s2);
-check('H: shell hook rewrites command-position cmd', s2.command === 'cmd /c ver', JSON.stringify(s2.command));
+check(gateOn ? 'H: shell hook rewrites command-position cmd (gate ON)' : 'H: shell hook leaves cmd //c verbatim (gate OFF, default git-bash)',
+  s2.command === (gateOn ? 'cmd /c ver' : 'cmd //c ver'), JSON.stringify(s2.command));
 const s3 = evShell('cmd //c ver', process.execPath); shellBefore(s3);
 check('H: shell hook ignores a non-bash shell', s3.command === 'cmd //c ver', JSON.stringify(s3.command));
 const s4 = evShell('cmd //c ver', 'pwsh'); shellBefore(s4);
@@ -230,7 +236,13 @@ check('B: flag fixed, redirect target kept', redirAfterFlag === 'cmd /c < //in',
 check('B: <<\\EOF body untouched', bc('cat <<\\EOF\ncmd //c ver\nEOF') === 'cat <<\\EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<\\EOF\ncmd //c ver\nEOF')));
 check('B: trailing-space terminator is body', bc('cat <<EOF\nbody\nEOF \ncmd //c ver') === 'cat <<EOF\nbody\nEOF \ncmd //c ver', JSON.stringify(bc('cat <<EOF\nbody\nEOF \ncmd //c ver')));
 check('B: leading-space terminator is body', bc('cat <<EOF\na\n  EOF\ncmd //c ver\nEOF') === 'cat <<EOF\na\n  EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<EOF\na\n  EOF\ncmd //c ver\nEOF')));
-check('B: CRLF terminator is body', bc('cat <<EOF\nbody\nEOF\r\ncmd //c ver') === 'cat <<EOF\nbody\nEOF\r\ncmd //c ver', JSON.stringify(bc('cat <<EOF\nbody\nEOF\r\ncmd //c ver')));
+// bash ignores ONE trailing \r on the terminator line (measured: a clean
+// delimiter followed by an "EOF\r" line DOES terminate the body), so the
+// command after it is real and gets rewritten
+const crlfMix = bc('cat <<EOF\nbody\nEOF\r\ncmd //c ver');
+check('B: "EOF\\r" terminator ends body', crlfMix === 'cat <<EOF\nbody\nEOF\r\ncmd /c ver', JSON.stringify(crlfMix));
+const crlfFull = bc('cat <<EOF\r\nbody\r\nEOF\r\ncmd //c ver\r\n');
+check('B: full-CRLF heredoc ends body', crlfFull === 'cat <<EOF\r\nbody\r\nEOF\r\ncmd /c ver\r\n', JSON.stringify(crlfFull));
 const dashOk = bc('cat <<-EOF\n\tx\n\tEOF\ncmd //c ver');
 check('B: <<- tab terminator recognized, next line is a command', dashOk === 'cat <<-EOF\n\tx\n\tEOF\ncmd /c ver', JSON.stringify(dashOk));
 check('B: <<- space-indented line is body', bc('cat <<-EOF\n  EOF\ncmd //c ver\nEOF') === 'cat <<-EOF\n  EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<-EOF\n  EOF\ncmd //c ver\nEOF')));
@@ -249,10 +261,22 @@ check('B: process substitution still fixed', bc('tee <(cmd //c ver)') === 'tee <
 check('B: subshell cmd still fixed', bc('(cmd //c ver)') === '(cmd /c ver)', JSON.stringify(bc('(cmd //c ver)')));
 check('B: multiline $( ) still fixed', bc('x=$(\ncmd //c ver\n)') === 'x=$(\ncmd /c ver\n)', JSON.stringify(bc('x=$(\ncmd //c ver\n)')));
 
-// pinned conservative misses (assignment-prefix after a substitution used to
-// be rewritten correctly-by-accident; miss beats a silent misfix)
-check('B: count=$(...) cmd //c is a pinned miss', bc('count=$(cat f) cmd //c ver') === 'count=$(cat f) cmd //c ver', JSON.stringify(bc('count=$(cat f) cmd //c ver')));
-check('B: x=`y` cmd //c is a pinned miss', bc('x=`y` cmd //c ver') === 'x=`y` cmd //c ver', JSON.stringify(bc('x=`y` cmd //c ver')));
+// token state from INSIDE a substitution must not leak past its close:
+// "//x" here is the OUTER command's argument
+check('B: echo $(cmd) //x untouched', bc('echo $(cmd) //x') === 'echo $(cmd) //x', JSON.stringify(bc('echo $(cmd) //x')));
+check('B: echo `cmd` //x untouched', bc('echo `cmd` //x') === 'echo `cmd` //x', JSON.stringify(bc('echo `cmd` //x')));
+const procSub = bc('tee <(cmd //c ver) //x');
+check('B: <(cmd //c) then //x untouched', procSub === 'tee <(cmd /c ver) //x', JSON.stringify(procSub));
+// a separator kills the flag zone: garbage after ";" is not a flag position
+check('B: cmd //c; //x untouched', bc('cmd //c; //x') === 'cmd /c; //x', JSON.stringify(bc('cmd //c; //x')));
+
+// assignment-prefix forms: bash RUNS cmd there (measured:
+// "x=`echo hi` cmd /c ver" prints ver's line), so these are command
+// positions and get the rewrite -- the restore-at-close rules bring them
+// back without touching the data-position cases above
+check('B: count=$(cat f) cmd //c fixed', bc('count=$(cat f) cmd //c ver') === 'count=$(cat f) cmd /c ver', JSON.stringify(bc('count=$(cat f) cmd //c ver')));
+check('B: x=`y` cmd //c fixed', bc('x=`y` cmd //c ver') === 'x=`y` cmd /c ver', JSON.stringify(bc('x=`y` cmd //c ver')));
+check('B: x=$((1+1)) cmd //c fixed', bc('x=$((1+1)) cmd //c ver') === 'x=$((1+1)) cmd /c ver', JSON.stringify(bc('x=$((1+1)) cmd //c ver')));
 
 // --- heredoc delimiters are bash WORDS, not just [A-Za-z0-9_]: dashes, dots
 // and quoted delimiters with spaces must delimit the body correctly
@@ -276,6 +300,39 @@ check('B: <<EOF; same-line cmd still fixed', sameLine === 'cat <<EOF; cmd /c ver
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();
 check('P: findBash finds an MSYS bash on this machine', !!bash, String(bash));
+
+// --- probe expansion semantics: MSYS_NO_PATHCONV is presence-based
+// (measured: "0", "" and "yes" all disable conversion, so the probe tests
+// set-at-all via ${VAR+x}, never the literal value) ---
+if (bash) {
+  const probeOut = (mutate) => {
+    const env = { ...process.env, BASH_ENV: '' };
+    mutate(env);
+    const r = spawnSync(bash, ['-c', 'printf %s "${MSYS_NO_PATHCONV+x}"'], {
+      env, timeout: 5000, windowsHide: true,
+    });
+    return r.stdout?.toString() ?? '';
+  };
+  check('P: probe x-expansion: unset is empty', probeOut((e) => { delete e.MSYS_NO_PATHCONV; }) === '', 'probe unset');
+  check('P: probe x-expansion: set-empty is x', probeOut((e) => { e.MSYS_NO_PATHCONV = ''; }) === 'x', 'probe set-empty');
+  check('P: probe x-expansion: set-0 is x', probeOut((e) => { e.MSYS_NO_PATHCONV = '0'; }) === 'x', 'probe set-0');
+  check('P: probe x-expansion: set-1 is x', probeOut((e) => { e.MSYS_NO_PATHCONV = '1'; }) === 'x', 'probe set-1');
+}
+
+// --- full pipe (gate ON only): the rewritten command must actually run in
+// real bash -- no interactive banner, the payload reaches stdout ---
+if (bash && gateOn) {
+  const sent = bc('cmd //c echo GUARD_OK');
+  const r = spawnSync(bash, ['-c', sent], { timeout: 15000, windowsHide: true });
+  check('E: rewritten command executes (GUARD_OK, exit 0)',
+    r.status === 0 && (r.stdout?.toString() ?? '').includes('GUARD_OK'),
+    JSON.stringify({ sent, status: r.status, out: (r.stdout?.toString() ?? '').slice(0, 80) }));
+  const sentAssign = bc('x=`echo hi` cmd //c echo GUARD_OK2');
+  const r2 = spawnSync(bash, ['-c', sentAssign], { timeout: 15000, windowsHide: true });
+  check('E: assignment-prefix rewrite executes (GUARD_OK2, exit 0)',
+    r2.status === 0 && (r2.stdout?.toString() ?? '').includes('GUARD_OK2'),
+    JSON.stringify({ sent: sentAssign, status: r2.status, out: (r2.stdout?.toString() ?? '').slice(0, 80) }));
+}
 
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== oc unit battery: ${pass} passed, ${failures.length} failed ===`);

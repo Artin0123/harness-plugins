@@ -229,7 +229,7 @@ function isMsysShell(shell: string): boolean {
   return cand !== null && verifyMsysBash(cand);
 }
 
-function pathConvDisabled(shell: string): boolean {
+export function pathConvDisabled(shell: string): boolean {
   const cand = shellCandidate(shell);
   if (!cand || !verifyMsysBash(cand)) return false;
   const key = cand.toLowerCase();
@@ -394,10 +394,11 @@ function scanBash(command: string): string {
   let cmdPosNext = true;
   let cmdFlagZone = false; // after cmd, /flags keep the zone alive (cmd //q //c)
   let inBacktick = false; // flat backtick nesting (\` is eaten by the escape branch)
-  // what the pending open parens close: "subst" = $(, "func" = foo(,
-  // "case" = "in (", "group" = everything else; a ")" pops and restores the
-  // command position accordingly
-  const parenStack: string[] = [];
+  const btPos: boolean[] = []; // outer command position to restore at each closing backtick
+  // open parens, each remembering the OUTER command position at open time:
+  // "subst" = $(, "func" = foo(, "case" = "in (", "group" = everything else;
+  // a ")" restores accordingly (func/case always keep the position)
+  const parenStack: { kind: string; pos: boolean }[] = [];
 
   // A cmd token is recognised by basename, so an explicit path
   // (C:\Windows\System32\cmd.exe) is the same command as `cmd`. Quoted
@@ -416,6 +417,15 @@ function scanBash(command: string): string {
     "case", "esac", "in", "select", "function", "time", "exec", "command",
     "builtin", "env", "!", "{", "}",
   ]);
+
+  // a close or separator starts a fresh token context: tokens from INSIDE a
+  // substitution must not authorize a rewrite outside it ("echo $(cmd) //x"
+  // -- //x is echo's argument, not a cmd flag)
+  const clearTok = () => {
+    prevTok = "";
+    prevTokCmdPos = false;
+    cmdFlagZone = false;
+  };
 
   const commitTok = () => {
     if (!curTok) return;
@@ -465,21 +475,26 @@ function scanBash(command: string): string {
   };
 
   while (i < n) {
-    // heredoc bodies are data: copy verbatim; the delimiter line ends the body
+    // heredoc bodies are data: copy verbatim; the delimiter line ends the
+    // body. (Unquoted bodies still undergo $( )/backtick expansion in bash;
+    // those inner commands are deliberately NOT rewritten -- a loud miss
+    // beats scanning inside body data.)
     if (pendingDelim !== null && !inHeader) {
       let lineEnd = command.indexOf("\n", i);
       if (lineEnd === -1) lineEnd = n;
       // bash matches the terminator line EXACTLY (<<- strips leading tabs
-      // only, nothing else); a trim() here would end the body early and
-      // rewrite its lines. "EOF " / "  EOF" / "EOF\r" are BODY in bash.
-      const raw = command.slice(i, lineEnd);
+      // only, nothing else) -- a trim() here would end the body early and
+      // rewrite its lines ("EOF " / "  EOF" are BODY) -- except that ONE
+      // trailing \r is ignored: measured, both a full-CRLF text and a clean
+      // delimiter followed by an "EOF\r" line terminate the body here.
+      const raw = command.slice(i, lineEnd).replace(/\r$/, "");
       if ((pendingDash ? raw.replace(/^\t+/, "") : raw) === pendingDelim) {
         out += command.slice(i, Math.min(lineEnd + 1, n));
         i = lineEnd + 1;
         pendingDelim = null;
         pendingDash = false;
         curTok = "";
-        prevTok = "";
+        clearTok();
         cmdPosNext = true; // a fresh command line follows
         continue;
       }
@@ -493,7 +508,7 @@ function scanBash(command: string): string {
       i++;
       inHeader = false;
       curTok = "";
-      prevTok = "";
+      clearTok();
       continue;
     }
     if (ch === "\\") {
@@ -564,36 +579,46 @@ function scanBash(command: string): string {
     }
     if (ch === " " || ch === "\t" || ch === "\n") {
       commitTok();
-      if (ch === "\n") cmdPosNext = true;
+      if (ch === "\n") {
+        cmdPosNext = true;
+        clearTok(); // a new command line: no token authorizes anything
+      }
       out += ch;
       i++;
       continue;
     }
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
-      cmdPosNext = true; // separators open a new command position
       if (ch === "(") {
-        // classify the paren so its ")" restores the right position:
-        // $( opens a substitution (a word right after it is an ARGUMENT),
-        // foo( is a function definition ("{ cmd" follows), "in (" opens a
-        // case pattern, anything else is a group / subshell opener.
-        parenStack.push(
+        // classify the paren and remember the OUTER command position at open
+        // time: $( opens a substitution, foo( is a function definition
+        // ("{ cmd" follows), "in (" opens a case pattern, anything else is
+        // a group / subshell opener. The saved position decides what the
+        // closing ")" restores: "count=$(...) cmd" opened from an assignment
+        // prefix (position alive -- bash runs cmd), while "echo $(...) cmd"
+        // opened from an argument (cmd is data).
+        const kind =
           command[i - 1] === "$"
             ? "subst"
             : /[A-Za-z0-9_]/.test(command[i - 1] ?? "")
               ? "func"
               : prevTok === "in"
                 ? "case"
-                : "group",
-        );
+                : "group";
+        parenStack.push({ kind, pos: cmdPosNext });
       }
+      clearTok();
+      cmdPosNext = true; // separators open a new command position
       out += ch;
       i++;
       continue;
     }
     if (ch === "&") {
       commitTok();
-      if (command[i - 1] !== ">" && command[i - 1] !== "<") cmdPosNext = true; // 2>&1's & is no separator
+      if (command[i - 1] !== ">" && command[i - 1] !== "<") {
+        cmdPosNext = true; // 2>&1's & is no separator
+        clearTok();
+      }
       out += ch;
       i++;
       continue;
@@ -601,30 +626,47 @@ function scanBash(command: string): string {
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
       if (ch === ")") {
-        // close what the matching "(" opened. A bare ")" (case pattern
-        // "x)"), "foo()" and "in (x)" keep the command position -- cmd
-        // still runs after them; a closed $( )/group ends it, because the
-        // next word is an ARGUMENT ("echo $(pwd) cmd //c ver" -- data).
-        const kind = parenStack.pop();
-        cmdPosNext = kind === undefined || kind === "func" || kind === "case";
+        // close what the matching "(" opened, restoring the OUTER command
+        // position it saved: "count=$(...) cmd //c" (assignment prefix --
+        // bash runs cmd) keeps the position, "echo $(...) cmd //c" (cmd is
+        // an argument) ends it. A bare ")" (case "x)"), "foo()" and
+        // "in (x)" keep the position -- cmd runs after them.
+        const fr = parenStack.pop();
+        cmdPosNext =
+          fr === undefined || fr.kind === "func" || fr.kind === "case"
+            ? true
+            : fr.pos;
+        clearTok();
       } else {
         // a redirect target is not a command position and must not authorize
         // one either: "cmd > //out" -- the target is bash's own path syntax
         // and native "> //x" is a loud failure we leave alone
         cmdPosNext = false;
-        prevTokCmdPos = false;
-        cmdFlagZone = false;
+        clearTok();
       }
       out += ch;
       i++;
       continue;
     }
     if (ch === "`") {
+      // a mid-word backtick (x=`y`) vs a standalone word (`echo `y``): the
+      // words after a standalone substitution are its command's ARGUMENTS,
+      // while a substitution inside an assignment word (x=`y`) is followed
+      // by a real command position
+      const inWord = curTok !== "";
       commitTok();
-      inBacktick = !inBacktick;
-      // the opening backtick starts a command position inside; the closing
-      // one ends it (the word after `...` is an argument: data, not command)
-      cmdPosNext = inBacktick;
+      if (!inBacktick) {
+        // opening: command position inside; remember whether the enclosing
+        // word is an assignment prefix ("x=`y` cmd //c" -- bash runs cmd)
+        btPos.push(inWord && cmdPosNext);
+        inBacktick = true;
+        cmdPosNext = true;
+      } else {
+        // closing: restore what the enclosing word deserves
+        inBacktick = false;
+        cmdPosNext = btPos.length ? btPos.pop()! : false;
+      }
+      clearTok();
       out += ch;
       i++;
       continue;
