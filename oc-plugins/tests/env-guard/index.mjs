@@ -18,17 +18,29 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const selfPath = fileURLToPath(import.meta.url);
 // The plugin imports `Plugin` from @opencode/plugin (a runtime dep only the
 // host resolves). The unit battery targets the exported pure functions, so
 // the import is swapped for a passthrough stub and the source is imported
 // from a throwaway copy in the system temp dir (nothing added to the repo).
+// The --noanchor worker reuses this scratch via EG_SCRATCH (its scrubbed
+// env makes mkdtempSync itself impossible, so the parent provides the dir).
 const srcPath = join(here, '..', '..', 'env-guard', 'index.ts');
 const src = readFileSync(srcPath, 'utf8')
   .replace('import { Plugin } from "@opencode/plugin"', 'const Plugin = { define: (p) => p };');
-const scratch = mkdtempSync(join(tmpdir(), 'env-guard-oc-'));
+const scratch = process.env.EG_SCRATCH ?? mkdtempSync(join(tmpdir(), 'env-guard-oc-'));
 const loadPath = join(scratch, 'index.ts');
 writeFileSync(loadPath, src, 'utf8');
 const mod = await import(pathToFileURL(loadPath).href);
+
+// Worker mode (own process: module-level caches pin each scenario): runs
+// with a scrubbed environment (PATH without any MSYS bash, fake program
+// roots, a non-drive TEMP) and reports what the plugin does without an
+// anchor -- it must go inert, never guess a layout.
+if (process.argv.includes('--noanchor')) {
+  console.log(JSON.stringify({ temp: mod.realTempDir(), path: mod.rewritePath('/tmp/x') }));
+  process.exit(0);
+}
 
 let pass = 0; const failures = [];
 const check = (name, ok, detail) => { if (ok) pass++; else failures.push(`${name} -> ${detail}`); };
@@ -264,6 +276,15 @@ const caseSubst = bc('echo $(case 1 in 1) x;; esac) cmd //c ver');
 check('B: case-pattern ")" in substitution keeps the stack', caseSubst === 'echo $(case 1 in 1) x;; esac) cmd //c ver', JSON.stringify(caseSubst));
 // ... while a top-level case pattern still opens command position
 check('B: top-level case pattern still fixed', bc('case x in a) cmd //c ver;; esac') === 'case x in a) cmd /c ver;; esac', JSON.stringify(bc('case x in a) cmd //c ver;; esac')));
+// a $( ) in the case BODY is an ordinary paren: its ")" must pop, so the
+// word after it stays echo's argument. (The caseDepth variant of the
+// previous fix rewrote these -- the whole case..esac was treated as the
+// pattern region; caught by the pi sibling's review, measured here first.)
+check('B: case body $( ) then cmd untouched', bc('case $x in a) echo $(pwd) cmd //c ver;; esac') === 'case $x in a) echo $(pwd) cmd //c ver;; esac', JSON.stringify(bc('case $x in a) echo $(pwd) cmd //c ver;; esac')));
+check('B: case body "; " then $( ) then cmd untouched', bc('case $x in a) echo hi; echo $(pwd) cmd //c ver;; esac') === 'case $x in a) echo hi; echo $(pwd) cmd //c ver;; esac', JSON.stringify(bc('case $x in a) echo hi; echo $(pwd) cmd //c ver;; esac')));
+check('B: case body $( ) then //x untouched', bc('case $x in a) echo $(pwd) //x;; esac') === 'case $x in a) echo $(pwd) //x;; esac', JSON.stringify(bc('case $x in a) echo $(pwd) //x;; esac')));
+// the substitution output IS the body's command word: cmd is its argument
+check('B: case body substitution-as-command, cmd is data', bc('case x in a) $(pwd) cmd //c ver;; esac') === 'case x in a) $(pwd) cmd //c ver;; esac', JSON.stringify(bc('case x in a) $(pwd) cmd //c ver;; esac')));
 check('B: echo $((1+1)) cmd //c ver untouched', bc('echo $((1+1)) cmd //c ver') === 'echo $((1+1)) cmd //c ver', JSON.stringify(bc('echo $((1+1)) cmd //c ver')));
 check('B: quoted $(...) then cmd untouched', bc('echo "result: $(date)" cmd //c ver') === 'echo "result: $(date)" cmd //c ver', JSON.stringify(bc('echo "result: $(date)" cmd //c ver')));
 
@@ -330,6 +351,48 @@ const anchor = mod.realTempDir();
 check('P: temp anchor is a drive path equal to tmpdir()',
   typeof anchor === 'string' && /^[A-Za-z]:[\\/]/.test(anchor) && anchor === normalize(tmpdir()),
   JSON.stringify(anchor));
+
+// --- no measured anchor -> inert (worker process, scrubbed environment:
+// PATH without any MSYS bash, fake program roots, a non-drive TEMP) ---
+const noAnchor = JSON.parse(
+  spawnSync(process.execPath, [selfPath, '--noanchor'], {
+    env: {
+      ...process.env,
+      EG_SCRATCH: scratch,
+      PATH: 'C:\\Windows\\system32',
+      ProgramFiles: 'C:\\nope',
+      'ProgramFiles(x86)': 'C:\\nope',
+      LOCALAPPDATA: 'C:\\nope',
+      TEMP: '\\\\tmp',
+      TMP: '\\\\tmp',
+    },
+    encoding: 'utf8',
+  }).stdout.trim(),
+);
+check('P: no anchor -> temp is null (no layout guess)', noAnchor.temp === null, JSON.stringify(noAnchor));
+check('P: no anchor -> /tmp untouched', noAnchor.path === '/tmp/x', JSON.stringify(noAnchor));
+
+// --- non-win32: the fault point is the Windows tool layer, /tmp and $TEMP
+// are native semantics elsewhere, so nothing may fire and no hook may
+// register (the platform check is at call time, pinned via an override) ---
+const realPlatform = process.platform;
+let unixPath, unixSplit;
+let unixHooks = 0;
+const linuxCtx = {
+  tool: { hook: () => { unixHooks++; return Promise.resolve({ dispose: async () => {} }); } },
+  shell: { hook: () => { unixHooks++; return Promise.resolve({ dispose: async () => {} }); } },
+};
+try {
+  Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+  unixPath = rt('/tmp/x');
+  unixSplit = split('/tmp/*.txt');
+  await mod.default.setup(linuxCtx);
+} finally {
+  Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+}
+check('P: non-win32 leaves /tmp untouched', unixPath === '/tmp/x', JSON.stringify(unixPath));
+check('P: non-win32 leaves the glob pattern alone', unixSplit === null, JSON.stringify(unixSplit));
+check('P: non-win32 registers no hooks', unixHooks === 0, String(unixHooks));
 
 // --- probe expansion semantics: MSYS_NO_PATHCONV is presence-based
 // (measured: "0", "" and "yes" all disable conversion, so the probe tests

@@ -73,8 +73,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { Plugin } from "@opencode/plugin";
 
-const IS_WINDOWS = process.platform === "win32";
-
 // ---- bash detection (scan + verify identity; no install paths hardcoded) --
 // C:\Windows\System32\bash.exe is the WSL launcher and always sits on PATH, so
 // every candidate must answer `uname -s` with an MSYS/MINGW prefix (WSL
@@ -322,7 +320,9 @@ const TEMP_FORM = /^(?:\/tmp|\$(?:tmpdir|temp|tmp)|\$\{(?:tmpdir|temp|tmp)\}|%(?
 // /tmp and $TEMP are native semantics and rewriting them would BE the side
 // effect. No measured anchor -> inert (no guessed layout).
 export function rewritePath(p: string): string {
-  if (!IS_WINDOWS) return p;
+  // checked at call time (not a captured const) so the battery can pin the
+  // non-Windows behaviour with a platform override
+  if (process.platform !== "win32") return p;
   const head = TEMP_FORM.exec(p);
   if (!head) return p;
   const rest = p.slice(head[0].length);
@@ -363,7 +363,7 @@ export function rewritePatchText(text: string): string {
 // `path` and the rest stays the pattern. Only used when the call has no path,
 // so a call that works today is never reshaped.
 export function splitTempPrefix(pattern: string): { dir: string; rest: string } | null {
-  if (!IS_WINDOWS) return null;
+  if (process.platform !== "win32") return null;
   const head = TEMP_FORM.exec(pattern);
   if (!head) return null;
   const rest = pattern.slice(head[0].length);
@@ -405,10 +405,18 @@ function scanBash(command: string): string {
   let inBacktick = false; // flat backtick nesting (\` is eaten by the escape branch)
   const btPos: boolean[] = []; // outer command position to restore at each closing backtick
   // open parens, each remembering the OUTER command position at open time:
-  // "subst" = $(, "func" = foo(, "case" = "in (", "group" = everything else;
-  // a ")" restores accordingly (func/case always keep the position)
+  // "subst" = $(, "func" = foo(, "case" = a "( pattern" wrapper inside a case
+  // pattern region, "group" = everything else; a ")" restores accordingly
+  // (func/case always keep the position)
   const parenStack: { kind: string; pos: boolean }[] = [];
-  let caseDepth = 0; // inside a case ... esac: a pattern ")" closes nothing
+  // case tracking: "case" (command position) arms it, the case's "in" starts
+  // the PATTERN region -- its ")" terminates the pattern and opens the body
+  // -- ";;" returns to the pattern region and "esac" ends it. The region
+  // decides what a ")" closes: a pattern ")" has no matching "(" (popping on
+  // it steals the enclosing substitution's stack entry), while a $( ) in the
+  // BODY is an ordinary paren and must pop normally.
+  let caseRegion: "none" | "pattern" | "body" = "none";
+  let casePending = false; // saw "case", waiting for the case's "in"
 
   // A cmd token is recognised by basename, so an explicit path
   // (C:\Windows\System32\cmd.exe) is the same command as `cmd`. Quoted
@@ -445,13 +453,15 @@ function scanBash(command: string): string {
       cmdPosNext =
         /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok) || SHELL_KEYWORDS.has(curTok.toLowerCase());
     }
-    // case/esac depth: a case-PATTERN ")" has no matching "(", so it must not
-    // pop the paren stack (it would steal the enclosing $( 's entry and
-    // desync the stack -- "echo $(case 1 in 1) x;; esac) cmd //c ver")
-    if (prevTokCmdPos) {
-      const low = curTok.toLowerCase();
-      if (low === "case") caseDepth++;
-      else if (low === "esac") caseDepth = Math.max(0, caseDepth - 1);
+    // case-region tracking (see the declaration above for the grammar)
+    const low = curTok.toLowerCase();
+    if (low === "case" && prevTokCmdPos) casePending = true;
+    else if (low === "in" && casePending) {
+      caseRegion = "pattern";
+      casePending = false;
+    } else if (low === "esac") {
+      caseRegion = "none";
+      casePending = false;
     }
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
@@ -607,21 +617,25 @@ function scanBash(command: string): string {
     }
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
+      if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") {
+        caseRegion = "pattern"; // ";;" ends the body: the next pattern follows
+      }
       if (ch === "(") {
         // classify the paren and remember the OUTER command position at open
         // time: $( opens a substitution, foo( is a function definition
-        // ("{ cmd" follows), "in (" opens a case pattern, anything else is
-        // a group / subshell opener. The saved position decides what the
-        // closing ")" restores: "count=$(...) cmd" opened from an assignment
-        // prefix (position alive -- bash runs cmd), while "echo $(...) cmd"
-        // opened from an argument (cmd is data).
+        // ("{ cmd" follows), a "( pattern" wrapper inside a case PATTERN
+        // region is closed by the pattern's ")", anything else is a group /
+        // subshell opener. The saved position decides what the closing ")"
+        // restores: "count=$(...) cmd" opened from an assignment prefix
+        // (position alive -- bash runs cmd), while "echo $(...) cmd" opened
+        // from an argument (cmd is data).
         const kind =
-          command[i - 1] === "$"
-            ? "subst"
-            : /[A-Za-z0-9_]/.test(command[i - 1] ?? "")
-              ? "func"
-              : prevTok === "in"
-                ? "case"
+          caseRegion === "pattern"
+            ? "case"
+            : command[i - 1] === "$"
+              ? "subst"
+              : /[A-Za-z0-9_]/.test(command[i - 1] ?? "")
+                ? "func"
                 : "group";
         parenStack.push({ kind, pos: cmdPosNext });
       }
@@ -644,26 +658,24 @@ function scanBash(command: string): string {
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
       if (ch === ")") {
-        const top = parenStack.length
-          ? parenStack[parenStack.length - 1]
-          : undefined;
-        if (top?.kind === "case") {
-          // closes the "in (" opener: command position resumes after the pattern
-          parenStack.pop();
+        if (caseRegion === "pattern") {
+          // the case-PATTERN terminator: no matching "(" of its own, so it
+          // must not pop the paren stack (that would steal the ENCLOSING
+          // substitution's entry -- "echo $(case 1 in 1) x;; esac) cmd //c
+          // ver", where cmd is echo's argument). It closes the optional
+          // "( pattern" wrapper only, and the body (a command list) starts:
+          // command position.
+          if (parenStack.length && parenStack[parenStack.length - 1]!.kind === "case") {
+            parenStack.pop();
+          }
           cmdPosNext = true;
-        } else if (caseDepth > 0) {
-          // a bare case-PATTERN ")" (no opener of its own): it must not pop
-          // the paren stack -- that would steal the ENCLOSING substitution's
-          // entry and leave the real closer to hit an empty stack, wrongly
-          // reopening command position ("echo $(case 1 in 1) x;; esac)
-          // cmd //c ver" -- cmd is echo's argument there)
-          cmdPosNext = true;
+          caseRegion = "body";
         } else {
-          // close what the matching "(" opened, restoring the OUTER command
-          // position it saved: "count=$(...) cmd //c" (assignment prefix --
-          // bash runs cmd) keeps the position, "echo $(...) cmd //c" (cmd is
-          // an argument) ends it. A bare ")" (top-level case "x)"), "foo()"
-          // and "in (x)" keep the position -- cmd runs after them.
+          // an ordinary paren close -- also inside a case BODY: the ")" of
+          // "case x in a) echo $(pwd) cmd" must pop, leaving cmd as echo's
+          // argument. Restore what the matching "(" saved: "count=$(...)
+          // cmd" (assignment prefix -- bash runs cmd) keeps the position,
+          // "echo $(...) cmd" ends it; "foo()" and a stray ")" keep it.
           const fr = parenStack.pop();
           cmdPosNext =
             fr === undefined || fr.kind === "func" || fr.kind === "case"
@@ -756,7 +768,7 @@ const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
 export default Plugin.define({
   id: "env.guard",
   async setup(ctx) {
-    if (!IS_WINDOWS) return;
+    if (process.platform !== "win32") return;
     if (!findBash()) return; // no MSYS bash: stay inert
 
     await ctx.tool.hook("execute.before", (event) => {
