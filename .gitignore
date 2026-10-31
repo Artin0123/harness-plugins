@@ -1,2 +1,5 @@
 # Command Code project-local state (mods disable/enable records etc.)
 .commandcode/
+
+# firecrawl skill scratch output
+.firecrawl/

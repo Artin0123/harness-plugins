@@ -49,6 +49,10 @@ check('P: $TMPDIR/x', rt('$TMPDIR/x') === N + 'x', JSON.stringify(rt('$TMPDIR/x'
 check('P: bare $TEMP', rt('$TEMP') === T, JSON.stringify(rt('$TEMP')));
 check('P: %TEMP%/x', rt('%TEMP%/x') === N + 'x', JSON.stringify(rt('%TEMP%/x')));
 check('P: %tmp%\\x', rt('%tmp%\\x') === N + 'x', JSON.stringify(rt('%tmp%\\x')));
+check('P: ${TEMP}/x braced', rt('${TEMP}/x') === N + 'x', JSON.stringify(rt('${TEMP}/x')));
+check('P: ${tmpdir} bare braced', rt('${tmpdir}') === T, JSON.stringify(rt('${tmpdir}')));
+check('P: trailing separator trimmed', rt('/tmp/') === T, JSON.stringify(rt('/tmp/')));
+check('P: /tmp\\ trailing trimmed', rt('/tmp\\') === T, JSON.stringify(rt('/tmp\\')));
 
 // --- rewritePath: deliberate non-fixes ---
 check('P: C:\\tmp untouched (native write ok)', rt('C:\\tmp\\x') === 'C:\\tmp\\x', JSON.stringify(rt('C:\\tmp\\x')));
@@ -132,9 +136,18 @@ const p2 = evPath('read', 'C:\\tmp\\x'); toolBefore(p2);
 check('H: hook keeps deliberate non-fix', p2.input.path === 'C:\\tmp\\x', JSON.stringify(p2.input));
 const p3 = evPath('bash', '/tmp/x'); toolBefore(p3);
 check('H: hook ignores non-path tool', p3.input.path === '/tmp/x', JSON.stringify(p3.input));
+const p4 = { tool: 'glob', input: { pattern: '/tmp/*.txt' } };
+toolBefore(p4);
+check('H: glob pattern prefix becomes path', p4.input.pattern === '*.txt' && p4.input.path === T, JSON.stringify(p4.input));
+const p5 = { tool: 'glob', input: { pattern: '${TEMP}/*.txt', path: 'src' } };
+toolBefore(p5);
+check('H: glob with explicit path left alone', p5.input.pattern === '${TEMP}/*.txt' && p5.input.path === 'src', JSON.stringify(p5.input));
+const p6 = { tool: 'patch', input: { patchText: '*** Add File: /tmp/z.txt\n+x\n' } };
+toolBefore(p6);
+check('H: patch text rewritten', p6.input.patchText.includes(N + 'z.txt'), JSON.stringify(p6.input));
 
 const bashPath = mod.findBash();
-const evShell = (command, shell) => ({ command, cwd: '', timeout: 0, shell, env: {} });
+const evShell = (command, shell, cwd = '') => ({ command, cwd, timeout: 0, shell, env: {} });
 const s1 = evShell('echo cmd //c ver', bashPath); shellBefore(s1);
 check('H: shell hook keeps data position', s1.command === 'echo cmd //c ver', JSON.stringify(s1.command));
 const s2 = evShell('cmd //c ver', bashPath); shellBefore(s2);
@@ -143,6 +156,40 @@ const s3 = evShell('cmd //c ver', process.execPath); shellBefore(s3);
 check('H: shell hook ignores a non-bash shell', s3.command === 'cmd //c ver', JSON.stringify(s3.command));
 const s4 = evShell('cmd //c ver', 'pwsh'); shellBefore(s4);
 check('H: shell hook ignores an unresolvable shell', s4.command === 'cmd //c ver', JSON.stringify(s4.command));
+
+const s5 = evShell('pwd', bashPath, '/tmp'); shellBefore(s5);
+check('H: shell hook rewrites workdir /tmp', s5.cwd === T, JSON.stringify(s5.cwd));
+const s6 = evShell('pwd', bashPath, '$TEMP'); shellBefore(s6);
+check('H: shell hook rewrites workdir $TEMP', s6.cwd === T, JSON.stringify(s6.cwd));
+const s7 = evShell('pwd', bashPath, 'C:\\tmp'); shellBefore(s7);
+check('H: shell hook keeps workdir C:\\tmp', s7.cwd === 'C:\\tmp', JSON.stringify(s7.cwd));
+const s8 = evShell('pwd', process.execPath, '/tmp'); shellBefore(s8);
+check('H: shell hook keeps workdir for non-bash', s8.cwd === '/tmp', JSON.stringify(s8.cwd));
+
+// --- patch text: only directive lines are paths ---
+const patchAdd = mod.rewritePatchText('*** Begin Patch\n*** Add File: ${TEMP}/p.txt\n+hello\n*** End Patch');
+check('P: patch Add File rewritten', patchAdd.includes('*** Add File: ' + N + 'p.txt'), JSON.stringify(patchAdd));
+const patchUpd = mod.rewritePatchText('*** Update File: /tmp/u.txt\r\n@@\r\n-old\r\n+new\r\n');
+check('P: patch Update File rewritten, CRLF kept', patchUpd.startsWith('*** Update File: ' + N + 'u.txt\r\n'), JSON.stringify(patchUpd));
+const patchMove = mod.rewritePatchText('*** Update File: /tmp/a.txt\n*** Move to: ${TMPDIR}/b.txt\n');
+check('P: patch Move to rewritten', patchMove.includes('*** Move to: ' + N + 'b.txt'), JSON.stringify(patchMove));
+const patchDel = mod.rewritePatchText('*** Delete File: %TEMP%/d.txt\n');
+check('P: patch Delete File rewritten', patchDel === '*** Delete File: ' + N + 'd.txt\n', JSON.stringify(patchDel));
+const patchContent = mod.rewritePatchText('*** Add File: /tmp/c.txt\n+*** Add File: /tmp/not-a-path.txt\n+*** Move to: /tmp/nope\n');
+check('P: patch content lines untouched', patchContent.includes('+*** Add File: /tmp/not-a-path.txt') && patchContent.includes('+*** Move to: /tmp/nope'), JSON.stringify(patchContent));
+const patchKeep = mod.rewritePatchText('*** Add File: src/x.ts\n+a\n');
+check('P: patch non-temp path untouched', patchKeep === '*** Add File: src/x.ts\n+a\n', JSON.stringify(patchKeep));
+
+// --- glob: temp prefix inside the pattern moves into path ---
+const split = (p) => mod.splitTempPrefix(p);
+const gp = split('${TEMP}/*.txt');
+check('P: glob ${TEMP}/*.txt splits', !!gp && gp.dir === T && gp.rest === '*.txt', JSON.stringify(gp));
+const gp2 = split('/tmp/**/*.log');
+check('P: glob /tmp/**/*.log splits', !!gp2 && gp2.rest === '**/*.log', JSON.stringify(gp2));
+const gp3 = split('$TMP/a\\b.txt');
+check('P: glob $TMP backslash splits', !!gp3 && gp3.rest === 'a/b.txt', JSON.stringify(gp3));
+check('P: glob unrelated pattern untouched', split('src/**/*.ts') === null, JSON.stringify(split('src/**/*.ts')));
+check('P: glob bare $TEMP untouched', split('$TEMP') === null, JSON.stringify(split('$TEMP')));
 
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();

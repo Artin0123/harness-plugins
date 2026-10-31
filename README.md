@@ -260,31 +260,57 @@ agent 可用 `cygpath -w` 自癒。全面改寫 argv 會誤傷依賴 posix 形�
 ## env-guard (oc-plugins)
 
 `id: env.guard` — **只影響 Windows**（MSYS/MINGW bash）。與 cmdc / pi 版同一套判準，
-但 OpenCode 的執行層不同，修法與接線跟著不同：
+但 OpenCode 的執行層不同：凡是「host 自己解析、不經 MSYS 映射、不展開變數」的路徑
+都壞，所以修在 host 的兩個邊界上（工具輸入與 shell 建立）。
 
-| 故障                                                                          | OpenCode 版做法                                                                                                                                                                                                                                     |
-| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 檔案工具路徑（`read`/`write`/`edit`/`glob`/`grep` 的 `path`）                 | host 解析、不經 MSYS 映射、不展開變數 → `/tmp`、`$TEMP`/`$TMP`/`$TMPDIR`、`%TEMP%`/`%TMP%` 開頭改寫到偵測到的 bash 自己回報的 temp 錨點（`cygpath -w /tmp`），檔案工具與 bash 的 `/tmp` 因此是同一個目錄                             |
-| `cmd //c` / `//k`                                                             | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（GBK banner、命令沒跑、exit 0，靜默失敗）。只在**指令位置**改寫成 `/c`，含巢狀 `$( )`／反引號／雙引號與貼緊的 `cmd//c`；資料位置（`echo cmd //c`）不動。以真實 bash 探測 `$MSYS_NO_PATHCONV`，確認關閉才啟用 |
+### 修復範圍（每一列都在 v2.2.5 實測過）
 
-接線（v2.2.5 實測）：路徑改寫掛 `ctx.tool.hook("execute.before")`（改 `event.input.path`）；
-指令改寫掛 `ctx.shell.hook("create.before")`（改 `event.command`），並先用 `uname -s`
-確認 `event.shell` 真的是 MSYS bash（按執行檔快取）。任何閘門失敗 → 整體不動
-（漏修是大聲失敗、agent 可自癒；誤修是靜默破壞正確語法）。
+| 工具 / 欄位 | 症狀（實測） | 做法 |
+| --- | --- | --- |
+| `read` / `write` / `edit` 的 `path` | `$TEMP/x` 在專案下建字面 `$TEMP` 資料夾；`${TEMP}/x` 同樣字面；`/tmp/x` 找不到檔案 | `/tmp`、`$TEMP`/`$TMP`/`$TMPDIR`、`${TEMP}`（大括號）、`%TEMP%`/`%TMP%` 開頭改寫成 bash 自己回報的 temp 錨點（`cygpath -w /tmp`）；`~` 由 host 自己展開成家目錄（實測，不動） |
+| `glob` / `grep` 的 `path` | 同上（`$TEMP` 進不去真 temp） | 同一個 `path` 改寫 |
+| `glob` 的 `pattern` 內嵌路徑 | `pattern: "${TEMP}/*.txt"` 靜默回 0 筆（假陰性） | 只在**沒有另給 `path`** 時，把前綴 temp 目錄拆到 `path`、其餘留給 `pattern`；有給 `path` 就完全不動 |
+| `patch` 的 `patchText` | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾 | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動 |
+| `shell` 的 `workdir` | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp` | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`） |
+| `shell` 的 `command` | bashrc 的 `MSYS_NO_PATHCONV=1` 讓 `cmd //c` 原樣抵達 cmd → 進互動模式（GBK banner、命令沒跑、exit 0，靜默失敗） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、貼緊的 `cmd//c` 都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動 |
 
 **刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
-（OpenCode 工具層自己解析正確）、`nul` 重導向（bash 原生行為）、cmd 的非 ASCII 亂碼
-（無忠實改寫，亂碼本身就是可見、可自矯正的訊號）。
+（OpenCode 工具層自己解析正確，`workdir` 也實測可用）、`nul` 重導向（bash 原生行為）、
+cmd 的非 ASCII 亂碼（無忠實改寫，亂碼本身就是可見、可自矯正的訊號）。
 
-**實測（v2.2.5，乾淨啟動）**：`write` 寫 `$TEMP/...` 落在真實
-`%LOCALAPPDATA%\Temp`，專案底下不會出現字面 `$TEMP` 資料夾；`cmd //c ver` 的 spawn 行
-為 `-c "cmd /c ver"` 並實際輸出 `Microsoft Windows [版本 10.0.19045.7725]`；對照的
-`echo cmd //c ver` 原樣不動。
+**不適用／未涵蓋**：`experimental_image_generate` 的 `path`——本機沒有接上任何 image
+model，工具根本不會出現，無從實測（不猜、不加）；`session_move` 的 `directory` 是 Code
+Mode 的 session 工具、不是檔案路徑消費者，未列管。
 
-本機提醒：用 bash 啟動 host 時**不要** `export PWD='C:\...'`——Windows 形式（`C:\...`
-或 `C:/...`）的 `PWD` 會讓 MSYS bash 子代啟動即死鎖：命令不執行、零輸出、還會複製子代
-（任何 host 都一樣；清掉 `PWD` 恢復約 0.3 秒啟動）。要從 bash 啟動時改用 cmd 啟動器先
-`set "PWD="` 再 `cd /d` 呼叫。
+### 接線與閘門
+
+- 路徑類：`ctx.tool.hook("execute.before")` 改 `event.input`（`path` / `patchText` /
+  `glob` 的 `pattern`）。
+- 指令類：`ctx.shell.hook("create.before")` 改 `event.command` 與 `event.cwd`。
+- 兩者都先驗證 `event.shell` 真的是 MSYS bash（`uname -s`，按執行檔快取），`//c`
+  改寫再加一道 `$MSYS_NO_PATHCONV` 探測（同樣按 shell 快取）。任何閘門失敗 → 整體不動
+  （漏修是大聲失敗、agent 可自癒；誤修是靜默破壞正確語法）。
+
+### 實測（v2.2.5，一次乾淨對話）
+
+模型的原始輸入（外掛在 `execute.before` 之前記到的原值）與最終落點：
+
+| 步驟 | 模型送出的原值 | 結果 |
+| --- | --- | --- |
+| write | `path: $TEMP/oc-g2.txt` | 落在真實 `C:\Users\artin\AppData\Local\Temp`，專案下無字面 `$TEMP` |
+| write | `path: ${TEMP}/oc-g4.txt` | 同上（大括號形式） |
+| write | `path: $TMPDIR/oc-g8.txt` | 同上 |
+| write | `path: ~/oc-g6.txt` | `C:/Users/artin/oc-g6.txt`（host 原生展開 `~`，不動） |
+| read | `path: /tmp` | 列出真實 temp 的 1951 個項目 |
+| glob | `pattern: ${TEMP}/*.txt`（無 path） | 修正前 0 筆；修正後 100+ 筆（含真 temp 的 txt） |
+| patch | `*** Add File: ${TEMP}/oc-g9.txt` | 修正前建字面 `${TEMP}` 資料夾；修正後落在真實 temp |
+| shell | `workdir: /tmp`、`command: pwd` | 修正前 `Working directory does not exist: C:\tmp`；修正後 `pwd` = `/tmp` |
+| shell | `cmd //c ver` | spawn 行為 `-c "cmd /c ver"`，輸出 `Microsoft Windows [版本 10.0.19045.7725]` |
+| shell | `cmd //c "echo hello world"` | `hello world`（引號與 payload 原樣抵達 cmd） |
+| shell | `cmd //c "echo one" && cmd //c "echo two"` | `one` / `two`（兩段都改寫、`&&` 交由 bash） |
+| shell | `v=$(cmd //c echo sub); echo "got:$v"` | `got:sub`（`$( )` 內也改寫） |
+| shell | `cmd //c dir /b \| head -2` | 正常列出（管線後段是 bash 原生） |
+| shell | `echo cmd //c ver` | 原樣 `cmd //c ver`（資料位置不動） |
 
 ---
 

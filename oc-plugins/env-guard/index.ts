@@ -5,14 +5,19 @@
 // Windows 2.56.0 / MINGW64; path failures on opencode v2.2.1, hook wiring
 // verified on v2.2.5):
 //
-//   1. file tools resolve paths host-side (no MSYS mapping): read '/tmp/x'
-//      fails "File not found", write '$TEMP/x' creates a literal '$TEMP'
-//      folder under the project (both measured) -> /tmp, $TEMP/$TMP/$TMPDIR,
-//      %TEMP%/%TMP% (any case, either separator) rewrite to the directory the
-//      detected bash itself reports for /tmp (cygpath -w /tmp), so file tools
-//      and bash agree on one temp anchor. bash-side /tmp is untouched (MSYS
-//      mounts it correctly) and os.tmpdir() is guarded against MSYS-mapped
-//      TEMP values ('/tmp' on this machine).
+//   1. every path this host resolves WITHOUT MSYS mapping: file-tool `path`,
+//      the shell tool's `workdir`, a temp prefix inside a `glob` pattern, and
+//      the paths in `patch` directives (all measured). read '/tmp/x' fails
+//      "File not found", write '$TEMP/x' (or '${TEMP}/x') creates a literal
+//      '$TEMP' folder under the project, glob '${TEMP}/*.txt' silently finds
+//      nothing, patch '*** Add File: ${TEMP}/x' makes a literal folder, and
+//      workdir '/tmp' fails "Working directory does not exist: C:\tmp".
+//      -> /tmp, $TEMP/$TMP/$TMPDIR (bare and ${...}), %TEMP%/%TMP%
+//      (any case, either separator) rewrite to the directory the detected bash
+//      itself reports for /tmp (cygpath -w /tmp), so path consumers and bash
+//      agree on one temp anchor. bash-side /tmp is untouched (MSYS mounts it
+//      correctly) and os.tmpdir() is guarded against MSYS-mapped TEMP values
+//      ('/tmp' on this machine).
 //   2. this machine's bashrc sets MSYS_NO_PATHCONV=1, so the MSYS-doubled
 //      flag spelling `cmd //c` reaches cmd.exe literally and starts an
 //      INTERACTIVE cmd: measured live -- GBK banner, command never ran,
@@ -42,17 +47,6 @@
 //   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled (measured);
 //     there is no faithful rewrite (the pi sibling only warns) and the
 //     mojibake itself is the visible, self-correcting signal.
-//   - bash startup deadlock -- NOT an opencode, shell-tool or plugin defect
-//     (root-caused 2026-11-01): a Windows-form PWD in the environment
-//     (PWD=C:\... or C:/...) makes MSYS bash deadlock before it runs
-//     anything: the command body never executes, there is no output at all,
-//     and it forks self-copies of itself. Reproduced with git 2.55.0 and
-//     2.56.0, and under both Bun and node; clearing PWD restores ~0.3 s
-//     startup. The probe harnesses here exported PWD='C:\...' to work around
-//     opencode's MSYS boot, which poisoned every bash child, and that was
-//     misread for a while as a fork bug in bash.EXE. Environment-side, so the
-//     plugin leaves it alone: just do not launch the host with a drive-letter
-//     PWD (a cmd launcher that clears PWD works).
 //
 // Scope discipline: NATIVE EXECUTION WINS -- agent errors and syntax that
 // fails under its own native execution are left loud. Uncertainty resolves to
@@ -308,20 +302,60 @@ function matchParen(s: string, from: number): number {
 // relative paths, other drives, drive-letter MSYS paths (handled natively by
 // OpenCode's tool layer) -- passes through untouched.
 export function rewritePath(p: string): string {
-  const norm = (rest: string) => realTemp + rest.replace(/\//g, "\\");
+  const norm = (rest: string) => {
+    const tail = rest.replace(/\//g, "\\").replace(/\\+$/, "");
+    return tail ? realTemp + tail : realTemp;
+  };
   let m: RegExpExecArray | null;
   // POSIX /tmp (case-insensitive, mixed separators: /tmp, /TMP/x, /tmp\foo)
   m = /^\/tmp([\\/].*)?$/i.exec(p);
   if (m) return norm(m[1] ?? "");
   // bash-style temp variables: file tools expand nothing, so $TEMP once
-  // created a literal "$TEMP" folder (measured)
-  m = /^\$(?:temp|tmp|tmpdir)([\\/].*)?$/i.exec(p);
+  // created a literal "$TEMP" folder (measured); the braced ${TEMP} form is
+  // equally literal (measured) and lands in the same place
+  m = /^\$(?:temp|tmp|tmpdir)([\\/].*)?$/i.exec(p) ?? /^\$\{(?:temp|tmp|tmpdir)\}([\\/].*)?$/i.exec(p);
   if (m) return norm(m[1] ?? "");
   // cmd-style %TEMP%/%TMP%: same non-expansion
   m = /^%(?:temp|tmp)%([\\/].*)?$/i.exec(p);
   if (m) return norm(m[1] ?? "");
   // C:\tmp: native write succeeds (legal path) -- deliberately untouched
   return p;
+}
+
+// ---- patch text: same host-side paths, written as patch directives ---------
+// `patch` takes no path field: paths live inside `patchText` as `*** Add File:`,
+// `*** Update File:`, `*** Delete File:` and `*** Move to:` lines. The host
+// resolves those with the same Windows semantics (measured: an added
+// "${TEMP}/x" landed in a literal "${TEMP}" directory under the project), so
+// the same temp forms rewrite -- and only on directive lines, so patch content
+// (whose lines start with ' ', '+' or '-') is never touched.
+
+const PATCH_PATH_LINE = /^(\*\*\* (?:Add|Update|Delete) File: |\*\*\* Move to: )([^\r\n]+?)(\r?)$/;
+
+export function rewritePatchText(text: string): string {
+  if (!text.includes("*** ")) return text;
+  return text
+    .split("\n")
+    .map((line) => {
+      const m = PATCH_PATH_LINE.exec(line);
+      if (!m) return line;
+      const rewritten = rewritePath(m[2]!);
+      return rewritten === m[2] ? line : m[1]! + rewritten + m[3]!;
+    })
+    .join("\n");
+}
+
+// A glob pattern may carry the directory itself ("${TEMP}/*.txt"). glob has no
+// implicit path handling here: the literal prefix matched nothing (measured,
+// 0 results -- a silent false negative), so the leading temp form moves into
+// `path` and the rest stays the pattern. Only used when the call has no path,
+// so a call that works today is never reshaped.
+const TEMP_PREFIX = /^(?:\/tmp|\$(?:temp|tmp|tmpdir)|\$\{(?:temp|tmp|tmpdir)\}|%(?:temp|tmp)%)[\\/](.+)$/i;
+
+export function splitTempPrefix(pattern: string): { dir: string; rest: string } | null {
+  const m = TEMP_PREFIX.exec(pattern);
+  if (!m) return null;
+  return { dir: realTemp, rest: m[1]!.replace(/\\/g, "/") };
 }
 
 // ---- shell command scan: cmd doubled flags, position-aware ----------------
@@ -589,17 +623,19 @@ function scanBash(
 
 // ---- OpenCode hook wiring -------------------------------------------------
 // Two hooks, each on the boundary where the environment breaks the command:
-//   ctx.shell.hook("create.before") -> event.command, the exact string the
-//     host hands to the shell. `shell` names the executable it will spawn, so
-//     the rewrite is gated on that shell being a verified MSYS bash AND on the
-//     MSYS_NO_PATHCONV probe; a cmd/pwsh/WSL shell or an unknown value leaves
-//     the command untouched.
-//   ctx.tool.hook("execute.before") -> event.input.path for the file tools.
-//     The host resolves these paths itself (no MSYS mapping), so the rewrite
-//     belongs on that side; `input` is mutable in this hook and the mutation
-//     reaches execution. A missing tool name or key fails safe: nothing is
-//     rewritten, which is the pre-plugin status quo, and loud failures
-//     self-correct.
+//   ctx.shell.hook("create.before") -> event.command (the exact string the host
+//     hands to the shell) and event.cwd (the shell's `workdir`, still
+//     unresolved here). `shell` names the executable it will spawn, so both
+//     rewrites are gated on that shell being a verified MSYS bash; the //c
+//     rewrite additionally needs the MSYS_NO_PATHCONV probe. A cmd/pwsh/WSL
+//     shell or an unknown value leaves everything untouched.
+//   ctx.tool.hook("execute.before") -> event.input for the file tools: `path`,
+//     plus `patch.patchText` (paths live in its directive lines) and a
+//     `glob.pattern` whose temp prefix becomes `path`. The host resolves these
+//     paths itself (no MSYS mapping), so the rewrite belongs on that side;
+//     `input` is mutable in this hook and the mutation reaches execution. A
+//     missing tool name or key fails safe: nothing is rewritten, which is the
+//     pre-plugin status quo, and loud failures self-correct.
 // Measured on v2.2.5: both mutations land on the spawned command line.
 
 const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
@@ -611,9 +647,28 @@ export default Plugin.define({
     if (!findBash()) return; // no MSYS bash: stay inert
 
     await ctx.tool.hook("execute.before", (event) => {
-      if (!PATH_TOOLS.has(event.tool.toLowerCase())) return;
       const input = event.input as Record<string, unknown> | null;
       if (!input || typeof input !== "object") return;
+      const tool = event.tool.toLowerCase();
+      if (tool === "patch") {
+        if (typeof input.patchText === "string") {
+          const rewritten = rewritePatchText(input.patchText);
+          if (rewritten !== input.patchText) input.patchText = rewritten;
+        }
+        return;
+      }
+      if (!PATH_TOOLS.has(tool)) return;
+      // glob: a temp-prefixed pattern carries its own directory
+      if (tool === "glob" && typeof input.pattern === "string") {
+        const hasPath = typeof input.path === "string" && input.path !== "";
+        if (!hasPath) {
+          const split = splitTempPrefix(input.pattern);
+          if (split) {
+            input.pattern = split.rest;
+            input.path = split.dir;
+          }
+        }
+      }
       if (typeof input.path !== "string") return;
       const rewritten = rewritePath(input.path);
       if (rewritten !== input.path) input.path = rewritten;
@@ -621,6 +676,14 @@ export default Plugin.define({
 
     await ctx.shell.hook("create.before", (event) => {
       if (!isMsysShell(event.shell)) return;
+      // `workdir` reaches this hook unresolved (`/tmp`) and the host checks it
+      // with Windows semantics afterwards ("Working directory does not exist:
+      // C:\tmp" -- measured), so the same temp forms rewrite to the anchor
+      // bash itself uses. Independent of the //c gate below.
+      if (typeof event.cwd === "string") {
+        const cwd = rewritePath(event.cwd);
+        if (cwd !== event.cwd) event.cwd = cwd;
+      }
       if (!pathConvDisabled(event.shell)) return;
       const r = rewriteBashCommand(event.command, true);
       if (r.command !== event.command) event.command = r.command;
