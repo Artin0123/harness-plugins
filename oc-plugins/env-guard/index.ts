@@ -33,11 +33,13 @@
 //      quotes, shell keywords ({ } if/then/do ...) and the tight `cmd//c`
 //      form; data positions are untouched (`echo cmd //c`, redirect targets
 //      (`cmd > //out` -- native "> //x" is a loud failure), heredoc bodies
-//      (exact terminator match, <<\EOF included) and the word after a closed
-//      `$( )`/backtick (`echo $(pwd) cmd //c ver`)). The rewrite is
-//      GATED on a probe of that environment (bash -c 'printf %s
-//      "$MSYS_NO_PATHCONV"', which sources .bashrc through BASH_ENV): with
-//      path conversion ON, `//c` is the spelling that works and rewriting it
+//      (exact terminator match, <<\EOF and non-word delimiters included) and
+//      the word after a closed `$( )`/backtick (`echo $(pwd) cmd //c ver`)).
+//      The rewrite is GATED on a probe of that environment (bash -c 'printf
+//      %s "${MSYS_NO_PATHCONV+x}"', which sources .bashrc through BASH_ENV;
+//      the variable is presence-based in the MSYS runtime -- "0" and "" also
+//      disable conversion, measured): with path conversion ON, `//c` is the
+//      spelling that works and rewriting it
 //      would BE the side effect; a failed or inconclusive probe leaves
 //      everything alone (uncertainty never enables side effects; `/c` works in
 //      both configurations).
@@ -242,12 +244,16 @@ function pathConvDisabled(shell: string): boolean {
 function probeNoPathConv(bash: string): boolean {
   try {
     // bash -c sources the user's bashrc (BASH_ENV), so the child reports
-    // exactly what spawned commands will see.
-    const p = spawnSync(bash, ["-c", 'printf %s "$MSYS_NO_PATHCONV"'], {
+    // exactly what spawned commands will see. MSYS_NO_PATHCONV is
+    // PRESENCE-based in the MSYS runtime: set to anything -- "1", "0", even
+    // the empty string -- disables path conversion (measured: "=0" and "="
+    // behave exactly like "=1"), so the probe tests set-at-all via ${VAR+x}
+    // rather than the literal "1".
+    const p = spawnSync(bash, ["-c", 'printf %s "${MSYS_NO_PATHCONV+x}"'], {
       timeout: 5000,
       windowsHide: true,
     });
-    return !p.error && p.stdout?.toString().trim() === "1";
+    return !p.error && p.stdout?.toString().trim() === "x";
   } catch {
     return false; // uncertainty resolves to "do not rewrite"
   }
@@ -368,8 +374,11 @@ export function rewriteBashCommand(command: string): string {
 
 function scanBash(command: string): string {
   // group 1: the <<- dash; group 2: the backslash of <<\EOF (literal body);
-  // group 3: an optional quote; group 4: the delimiter (backref \3 closes it)
-  const heredoc = /<<(-?)[ \t]*(\\?)(["']?)([A-Za-z_][A-Za-z0-9_]*)\3/y; // sticky, anchored at lastIndex
+  // the delimiter is a bash WORD, quoted (any content, quotes stripped --
+  // the terminator line compares bare, like bash) or unquoted starting with
+  // a letter and free of shell metacharacters; the letter gate keeps
+  // $((1<<2)) arithmetic out of the heredoc path
+  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([A-Za-z_][^\s"'><;&|()\\`]*))/y; // sticky, anchored at lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd flags are alphabetic; /v:on keeps its colon tail
   let out = "";
   let i = 0;
@@ -545,7 +554,7 @@ function scanBash(command: string): string {
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
-        pendingDelim = m[4];
+        pendingDelim = m[3] ?? m[4] ?? m[5];
         pendingDash = m[1] === "-";
         inHeader = true;
         out += m[0];

@@ -254,6 +254,25 @@ check('B: multiline $( ) still fixed', bc('x=$(\ncmd //c ver\n)') === 'x=$(\ncmd
 check('B: count=$(...) cmd //c is a pinned miss', bc('count=$(cat f) cmd //c ver') === 'count=$(cat f) cmd //c ver', JSON.stringify(bc('count=$(cat f) cmd //c ver')));
 check('B: x=`y` cmd //c is a pinned miss', bc('x=`y` cmd //c ver') === 'x=`y` cmd //c ver', JSON.stringify(bc('x=`y` cmd //c ver')));
 
+// --- heredoc delimiters are bash WORDS, not just [A-Za-z0-9_]: dashes, dots
+// and quoted delimiters with spaces must delimit the body correctly
+// (measured before the fix: '<<'E-O-F'' / '<<'END OF FILE'' bodies were
+// rewritten -- the regex did not recognize the delimiter at all)
+const dashDelim = bc('cat <<E-O-F\ncmd //c ver\nE-O-F\ncmd //c ver');
+check('B: <<E-O-F body data, post-terminator command fixed', dashDelim === 'cat <<E-O-F\ncmd //c ver\nE-O-F\ncmd /c ver', JSON.stringify(dashDelim));
+check('B: <<\'E-O-F\' body untouched', bc("cat <<'E-O-F'\ncmd //c ver\nE-O-F") === "cat <<'E-O-F'\ncmd //c ver\nE-O-F", JSON.stringify(bc("cat <<'E-O-F'\ncmd //c ver\nE-O-F")));
+check('B: <<\'END OF FILE\' body untouched', bc("cat <<'END OF FILE'\ncmd //c ver\nEND OF FILE") === "cat <<'END OF FILE'\ncmd //c ver\nEND OF FILE", JSON.stringify(bc("cat <<'END OF FILE'\ncmd //c ver\nEND OF FILE")));
+check('B: <<EOF.v2 body untouched', bc('cat <<EOF.v2\ncmd //c ver\nEOF.v2') === 'cat <<EOF.v2\ncmd //c ver\nEOF.v2', JSON.stringify(bc('cat <<EOF.v2\ncmd //c ver\nEOF.v2')));
+// a quoted delimiter with a space still terminates on the bare line
+const spDelim = bc("cat <<'A B'\ncmd //c ver\nA B\ncmd //c ver");
+check('B: quoted space delimiter terminates on the bare line', spDelim === "cat <<'A B'\ncmd //c ver\nA B\ncmd /c ver", JSON.stringify(spDelim));
+// arithmetic left shift must not open a heredoc (letter-first gate)
+check('B: $((1<<2)); cmd still fixed', bc('x=$((1<<2)); cmd //c ver') === 'x=$((1<<2)); cmd /c ver', JSON.stringify(bc('x=$((1<<2)); cmd //c ver')));
+check('B: $((a<<b)); cmd still fixed', bc('x=$((a<<b)); cmd //c ver') === 'x=$((a<<b)); cmd /c ver', JSON.stringify(bc('x=$((a<<b)); cmd //c ver')));
+// a same-line separator after the heredoc word is still scanned
+const sameLine = bc('cat <<EOF; cmd //c ver\nbody\nEOF');
+check('B: <<EOF; same-line cmd still fixed', sameLine === 'cat <<EOF; cmd /c ver\nbody\nEOF', JSON.stringify(sameLine));
+
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();
 check('P: findBash finds an MSYS bash on this machine', !!bash, String(bash));
