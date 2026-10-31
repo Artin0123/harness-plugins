@@ -220,28 +220,47 @@ flagCase('CRLF terminator ends body', 'cat <<EOF\nbody\nEOF\r\ncmd //c ver', 'ca
 flagCase('all-CRLF terminator ends body', 'cat <<EOF\r\nbody\r\nEOF\r\ncmd //c ver', 'cat <<EOF\r\nbody\r\nEOF\r\ncmd /c ver');
 
 // --- case 樣式的 `)` 沒有對應的 `(`（bash 語法上沒這個括號對） ---
-// 它會把外層 `$(` 的堆疊項偷走。實測結果只落在漏修側（資料不動），所以維持
-// 不追蹤 case/in/esac 狀態；下面兩組釘樁分別鎖住「資料不動」與「已知漏修」，
-// 將來任何人動 `)` 處理而把資料改壞，這裡會立即亮紅。
+// 語法：case（命令位置）備位 → 該 case 的 `in` 開樣式區 → 樣式 `)` 終止樣式
+//（不 pop 外層堆疊）並開 body → `;;` 回樣式區 → `esac` 結束；body 內的 `)`
+// 一律普通括號。所以 `in` 的 gate 是「看過 case」（它在參數位置），且只有 `;;`
+// 會回拋（單一 `;` 是 body 內的指令分隔）。
+// 下面兩組：翻正形（bash 實測真的執行 cmd）與資料形（echo 的參數，必須不動）——
+// 後者正是 oc 第一版狀態機把資料改壞的形。
+const caseFixes = [
+  ['case $x in a) cmd //c ver;; esac', 'case $x in a) cmd /c ver;; esac'],
+  ['case x in (a) cmd //c ver;; esac', 'case x in (a) cmd /c ver;; esac'],
+  ['case x in a|b) cmd //c ver;; esac', 'case x in a|b) cmd /c ver;; esac'],
+  ['case x in *) cmd //c ver;; esac', 'case x in *) cmd /c ver;; esac'],
+  ['case $a in 1) case $b in x) cmd //c ver;; esac;; esac', 'case $a in 1) case $b in x) cmd /c ver;; esac;; esac'],
+  ['case x in a) x=$(pwd) cmd //c ver;; esac', 'case x in a) x=$(pwd) cmd /c ver;; esac'],
+  ['case x in a) true;; b) cmd //c ver;; esac', 'case x in a) true;; b) cmd /c ver;; esac'],
+  ['case x in a) echo 1;;& b) cmd //c ver;; esac', 'case x in a) echo 1;;& b) cmd /c ver;; esac'],
+  ['echo $(case $x in a) cmd //c ver;; esac)', 'echo $(case $x in a) cmd /c ver;; esac)'],
+  ['x=$(case 1 in 1) x;; esac) cmd //c ver', 'x=$(case 1 in 1) x;; esac) cmd /c ver'],
+  ['case x in a) echo $(case y in b) cmd //c ver;; esac);; esac', 'case x in a) echo $(case y in b) cmd /c ver;; esac);; esac'],
+  ['case x in a) y=$(case 1 in 1) z;; esac) cmd //c ver;; esac', 'case x in a) y=$(case 1 in 1) z;; esac) cmd /c ver;; esac'],
+];
+for (const [input, expected] of caseFixes) flagCase(`case region: ${input}`, input, expected);
+
 const caseData = [
+  // oc 第一版狀態機踩到的誤修形：body 裡的 $( ) 是普通括號，cmd 是 echo 的參數
+  'case $x in a) echo $(pwd) cmd //c ver;; esac',
+  'case $x in a) echo "$(pwd)" cmd //c ver;; esac',
+  // case 包在 $( ) 裡時，替換內部的 cmd 是 echo 的資料
   'echo $(case 1 in 1) x;; esac) cmd //c ver',
   'echo $(case 1 in 1) fi;; esac) cmd //c ver',
   'echo $(case 1 in 1) done;; esac) cmd //c ver',
   'echo $(case 1 in (a) x;; esac) cmd //c ver',
+  'x=$(case 1 in 1) y;; esac) echo cmd //c ver',
+  'case $x in a) echo hi;; esac; echo cmd //c ver',
+  // body 內單一 `;` 只是指令分隔，不能把樣式區拉回來
+  'case $x in a) echo x; echo cmd //c ver;; esac',
+  // body 裡的重導向目標是 bash 自己解析的路徑
+  'case x in a) echo hi > //out;; esac',
 ];
 for (const c of caseData) {
   const r = bc(c);
   check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
-}
-// 已知漏修（bash 實測 cmd 真的會執行；pi 不動，漏修方向安全）
-const caseMisses = [
-  'case $x in a) cmd //c ver;; esac',
-  'echo $(case $x in a) cmd //c ver;; esac)',
-  'x=$(case 1 in 1) x;; esac) cmd //c ver',
-];
-for (const c of caseMisses) {
-  const r = bc(c);
-  check(`P: known miss ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
 }
 
 // --- rewriteBashCommand: deliberate misses (same in both gate states) ---

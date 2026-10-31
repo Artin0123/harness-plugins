@@ -460,12 +460,18 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
   //   $(    → 還原 commit 後的位置：賦值前綴（count=$(…)）→ true，bash 真的跑 cmd；
   //           獨立替換（$(…)）→ false，替換結果本身就是指令名，後面的 cmd 只是參數
   //   群組 ( → false（`( … ) word` 原生就是語法錯誤，不改寫）
-  // 注意：case 樣式的 `)`（`case x in a) …`）在 bash 語法上沒有對應的 `(`，
-  // 所以它會把外層 `$(` 的堆疊項偷走。實測後果只落在漏修側（資料不會被改寫：
-  // `echo $(case 1 in 1) x;; esac) cmd //c ver` 的 cmd 是 echo 的參數，pi 不動）。
-  // 要把它修成正確改寫得追蹤 case/in/esac 狀態，而 case body 裡合法的 `$( )`
-  // 一旦誤判（該 pop 變成不 pop）就會把資料改壞——寧可漏修，不可誤修，故不追蹤。
   const parenRestore: boolean[] = [];
+  // case 樣式的 `)`（`case x in a) …`）在 bash 語法上沒有對應的 `(`：它終止樣式、
+  // 開 body，若讓它 pop 就會偷走外層 $( 的堆疊項。所以照 bash 語法追蹤區段
+  //（這段註解是唯一防腐劑，別當不明狀態碼刪）：
+  //   case（在命令位置）備位 → 該 case 的 `in` 開「樣式區」
+  //   樣式區的 `)`：無對應 (、**不 pop 外層堆疊**（只收選配的 `( 樣式 )` 包裹）、
+  //                  重開命令位置並進入 body
+  //   `;;`（只有 ;;；單一 ; 是 body 內的指令分隔）→ 回樣式區；`esac` → 結束
+  //   body 內的 `)` 一律是普通括號、照常 pop 還原——否則 case body 裡的 $( )
+  //   會被誤判成樣式 `)`，把 echo 的參數當命令改寫（實測踩過）
+  let caseRegion: "none" | "pattern" | "body" = "none";
+  let casePending = false; // 看過 `case`、還沒看到它的 `in`
 
   const isCmdTok = (t: string) => {
     const l = t.toLowerCase();
@@ -488,6 +494,12 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
       // FOO=bar 環境變數前綴、與 if/while/{/! 等語法關鍵字都不結束指令位置
       cmdPosNext = RESERVED_WORD.test(curTok) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok);
     }
+    // case 區段追蹤（語法見上方註解）：`case` 要在命令位置才算；`in` 在參數位置，
+    // 位置 gate 不適用，所以只認「看過 case」（casePending）
+    const lowTok = curTok.toLowerCase();
+    if (lowTok === "case" && prevTokCmdPos) casePending = true;
+    else if (lowTok === "in" && casePending) { caseRegion = "pattern"; casePending = false; }
+    else if (lowTok === "esac") { caseRegion = "none"; casePending = false; }
     // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
@@ -663,11 +675,15 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     }
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
+      // 只有 `;;` 會把 body 拉回樣式區；單一 `;` 只是 body 內的指令分隔
+      if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") caseRegion = "pattern";
       if (ch === "(") {
         // cmdPosNext 此時是 commit 後的值：`count=$(` 會被 assignment 前綴保
         // 留在 true，`$(` 則已被 commit 成一個普通 word → false（天然分流）
+        // 樣式區裡的 `(`（`case x in (a) …` 的選配包裹）不推堆疊：它的 `)` 就是
+        // 樣式終止符，由下面的 region 分支處理
         const prev = command[i - 1] ?? "";
-        parenRestore.push(prev === "$" ? cmdPosNext : /[A-Za-z0-9_]/.test(prev));
+        if (caseRegion !== "pattern") parenRestore.push(prev === "$" ? cmdPosNext : /[A-Za-z0-9_]/.test(prev));
       }
       clearTok();
       cmdPosNext = true; // 分隔符後是新的指令位置（含 $( 與反引號開頭）
@@ -688,9 +704,15 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
       if (ch === ")") {
-        // 還原這個括號對應的位置；stack 空（case 的 `x)`）就維持現況
-        const restore = parenRestore.pop();
-        if (restore !== undefined) cmdPosNext = restore;
+        if (caseRegion === "pattern") {
+          // 樣式終止：不 pop（防止偷走外層 $( 的堆疊項），重開命令位置並進 body
+          cmdPosNext = true;
+          caseRegion = "body";
+        } else {
+          // 還原這個括號對應的位置；stack 空就維持現況
+          const restore = parenRestore.pop();
+          if (restore !== undefined) cmdPosNext = restore;
+        }
       }
       // 重導向目標由 bash 自己開檔（不經被關掉的 argv 轉換層），`)` 也結束該指令：
       // 兩者都清掉指令上下文，否則下一個詞會被當旗標改寫成資料/路徑
