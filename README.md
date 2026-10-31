@@ -270,7 +270,7 @@ agent 可用 `cygpath -w` 自癒。全面改寫 argv 會誤傷依賴 posix 形�
 | `read` / `write` / `edit` 的 `path` | `$TEMP/x` 在專案下建字面 `$TEMP` 資料夾；`${TEMP}/x` 同樣字面；`/tmp/x` 找不到檔案 | `/tmp`、`$TEMP`/`$TMP`/`$TMPDIR`、`${TEMP}`（大括號）、`%TEMP%`/`%TMP%` 開頭改寫成 bash 自己回報的 temp 錨點（`cygpath -w /tmp`）；`~` 由 host 自己展開成家目錄（實測，不動） |
 | `glob` / `grep` 的 `path` | 同上（`$TEMP` 進不去真 temp） | 同一個 `path` 改寫 |
 | `glob` 的 `pattern` 內嵌路徑 | `pattern: "${TEMP}/*.txt"` 靜默回 0 筆（假陰性） | 只在**沒有另給 `path`** 時，把前綴 temp 目錄拆到 `path`、其餘留給 `pattern`；有給 `path` 就完全不動 |
-| `patch` 的 `patchText` | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾 | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動 |
+| `patch` 的 `patchText` | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾 | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動。四種都實測過（含改名與刪除） |
 | `shell` 的 `workdir` | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp` | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`） |
 | `shell` 的 `command` | bashrc 的 `MSYS_NO_PATHCONV=1` 讓 `cmd //c` 原樣抵達 cmd → 進互動模式（GBK banner、命令沒跑、exit 0，靜默失敗） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、貼緊的 `cmd//c` 都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動 |
 
@@ -304,6 +304,8 @@ Mode 的 session 工具、不是檔案路徑消費者，未列管。
 | read | `path: /tmp` | 列出真實 temp 的 1951 個項目 |
 | glob | `pattern: ${TEMP}/*.txt`（無 path） | 修正前 0 筆；修正後 100+ 筆（含真 temp 的 txt） |
 | patch | `*** Add File: ${TEMP}/oc-g9.txt` | 修正前建字面 `${TEMP}` 資料夾；修正後落在真實 temp |
+| patch | `*** Update File: ${TEMP}/oc-m1.txt` + `*** Move to: ${TEMP}/oc-m2.txt` + hunk | 改名成功到真實 temp（內容 `alpha`/`gamma`/`beta`）；`Move to` 與 Add 是同一條 host 解析，未改寫會落到字面 `${TEMP}`（Add 已實測） |
+| patch | `*** Delete File: ${TEMP}/oc-m2.txt` | 刪掉真實 temp 的檔案；後續 `read` 回報該真實路徑 not found |
 | shell | `workdir: /tmp`、`command: pwd` | 修正前 `Working directory does not exist: C:\tmp`；修正後 `pwd` = `/tmp` |
 | shell | `cmd //c ver` | spawn 行為 `-c "cmd /c ver"`，輸出 `Microsoft Windows [版本 10.0.19045.7725]` |
 | shell | `cmd //c "echo hello world"` | `hello world`（引號與 payload 原樣抵達 cmd） |
