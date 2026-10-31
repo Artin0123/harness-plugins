@@ -3,19 +3,18 @@
 //   node oc-plugins/tests/env-guard/index.mjs
 //
 // Imports the plugin's TypeScript directly (type stripping, no build step)
-// and asserts every documented guard plus every deliberately-not-fixed form,
-// so the "刻意不修" decisions stay pinned instead of drifting back.
-// Run from a shell whose TEMP is a real Windows path (cmd / powershell /
-// non-bash): assertions compare against os.tmpdir() as the fallback anchor,
-// while the plugin's primary anchor is `cygpath -w /tmp` from the detected
-// bash -- the two agree on this machine only when TEMP is a Windows path.
+// and asserts every documented guard, every deliberately-not-fixed form, the
+// hook wiring, and the boundary cases that must NOT rewrite.
+//
+// Expected values use os.tmpdir(); the plugin's anchor is `cygpath -w /tmp`
+// from the detected bash. On this machine both resolve to the same Windows
+// temp dir, so the two can be compared directly.
 //
 // Needs Node >= 22.6 (type stripping default from 23.6).
 import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
-import {tmpdir} from 'node:os';
 import {readFileSync, writeFileSync, mkdtempSync, rmSync} from 'node:fs';
-import {tmpdir as _tt} from 'node:os';
+import {tmpdir} from 'node:os';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The plugin imports `Plugin` from @opencode/plugin (a runtime dep only the
@@ -25,7 +24,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const srcPath = join(here, '..', '..', 'env-guard', 'index.ts');
 const src = readFileSync(srcPath, 'utf8')
   .replace('import { Plugin } from "@opencode/plugin"', 'const Plugin = { define: (p) => p };');
-const scratch = mkdtempSync(join(_tt(), 'env-guard-oc-'));
+const scratch = mkdtempSync(join(tmpdir(), 'env-guard-oc-'));
 const loadPath = join(scratch, 'index.ts');
 writeFileSync(loadPath, src, 'utf8');
 const mod = await import(pathToFileURL(loadPath).href);
@@ -76,53 +75,45 @@ check('P: bare %TEMP%', rt('%TEMP%') === T, JSON.stringify(rt('%TEMP%')));
 // spawned bash actually reports MSYS_NO_PATHCONV=1; on a machine without the
 // bashrc setting, or when the probe fails, these MUST NOT rewrite) ---
 const noConv = bc('cmd //c ver');
-check('P: cmd //c -> /c', noConv.command === 'cmd /c ver' && noConv.cmdFlagFixed, JSON.stringify(noConv));
-check('P: cmd //k -> /k', bc('cmd //k dir').cmdFlagFixed, JSON.stringify(bc('cmd //k dir')));
+check('P: cmd //c -> /c', noConv === 'cmd /c ver', JSON.stringify(noConv));
+check('P: cmd //k -> /k', bc('cmd //k dir') === 'cmd /k dir', JSON.stringify(bc('cmd //k dir')));
 const multi = bc('cmd //q //c ver');
-check('P: multi-flag //q //c both fixed', multi.command === 'cmd /q /c ver', JSON.stringify(multi));
+check('P: multi-flag //q //c both fixed', multi === 'cmd /q /c ver', JSON.stringify(multi));
 const tight = bc('cmd//c ver');
-check('P: tight cmd//c form', tight.command === 'cmd /c ver', JSON.stringify(tight));
+check('P: tight cmd//c form', tight === 'cmd /c ver', JSON.stringify(tight));
 const tightInSeq = bc('FOO=1 cmd//c ver');
-check('P: tight form after env prefix', tightInSeq.command === 'FOO=1 cmd /c ver', JSON.stringify(tightInSeq));
+check('P: tight form after env prefix', tightInSeq === 'FOO=1 cmd /c ver', JSON.stringify(tightInSeq));
 
 // --- rewriteBashCommand: position awareness ---
-check('P: data position untouched', bc('echo cmd //c ver').command === 'echo cmd //c ver', JSON.stringify(bc('echo cmd //c ver')));
+check('P: data position untouched', bc('echo cmd //c ver') === 'echo cmd //c ver', JSON.stringify(bc('echo cmd //c ver')));
 const afterSemi = bc('ls; cmd //c ver');
-check('P: command position after ; fixed', afterSemi.command === 'ls; cmd /c ver', JSON.stringify(afterSemi));
+check('P: command position after ; fixed', afterSemi === 'ls; cmd /c ver', JSON.stringify(afterSemi));
 const nested = bc('echo "v: $(cmd //c ver)"');
-check('P: nested $( ) fixed', nested.command === 'echo "v: $(cmd /c ver)"', JSON.stringify(nested));
+check('P: nested $( ) fixed', nested === 'echo "v: $(cmd /c ver)"', JSON.stringify(nested));
 const backtick = bc('echo v: `cmd //c ver`');
-check('P: backtick nested fixed', backtick.command === 'echo v: `cmd /c ver`', JSON.stringify(backtick));
+check('P: backtick nested fixed', backtick === 'echo v: `cmd /c ver`', JSON.stringify(backtick));
 const dqVar = bc('echo "$V"');
-check('P: plain double-quote var untouched', dqVar.command === 'echo "$V"', JSON.stringify(dqVar));
+check('P: plain double-quote var untouched', dqVar === 'echo "$V"', JSON.stringify(dqVar));
 const redirect = bc('cmd //c ver > out.txt');
-check('P: redirect target not command position', redirect.command === 'cmd /c ver > out.txt', JSON.stringify(redirect));
+check('P: redirect target not command position', redirect === 'cmd /c ver > out.txt', JSON.stringify(redirect));
 const twoAh = bc('cmd //c ver 2>&1');
-check('P: 2>&1 survives', twoAh.command === 'cmd /c ver 2>&1', JSON.stringify(twoAh));
+check('P: 2>&1 survives', twoAh === 'cmd /c ver 2>&1', JSON.stringify(twoAh));
 
 // --- rewriteBashCommand: protected data ---
 const heredoc = bc("cat <<'EOF'\ncmd //c ver\nEOF");
-check('P: heredoc body untouched', heredoc.command.includes('cmd //c ver'), JSON.stringify(heredoc));
+check('P: heredoc body untouched', heredoc.includes('cmd //c ver'), JSON.stringify(heredoc));
 const nul = bc('a 2>nul & b &>nul');
-check('P: nul forms untouched (deliberate)', nul.command === 'a 2>nul & b &>nul' && !nul.cmdFlagFixed, JSON.stringify(nul));
+check('P: nul forms untouched (deliberate)', nul === 'a 2>nul & b &>nul', JSON.stringify(nul));
 const singleQ = bc("echo 'cmd //c ver'");
-check('P: single-quoted data untouched', singleQ.command === "echo 'cmd //c ver'", JSON.stringify(singleQ));
-
-// --- cmd + non-ASCII detection (data only; no fix attempted) ---
-const cn = bc('cmd /c echo 中文');
-check('P: cmd+nonASCII flagged', cn.cmdNonAscii === true, JSON.stringify(cn));
-const noCn = bc('echo 中文');
-check('P: plain nonASCII not flagged', noCn.cmdNonAscii === false, JSON.stringify(noCn));
-const cnData = bc('echo cmd 中文');
-check('P: cmd-in-data not flagged', cnData.cmdNonAscii === false, JSON.stringify(cnData));
+check('P: single-quoted data untouched', singleQ === "echo 'cmd //c ver'", JSON.stringify(singleQ));
 
 // --- //c with quoted payload: flag fixed, payload kept ---
 const quoted = bc('cmd //c "dir > nul"');
-check('P: //c fixed, quoted payload kept', quoted.command === 'cmd /c "dir > nul"', JSON.stringify(quoted));
+check('P: //c fixed, quoted payload kept', quoted === 'cmd /c "dir > nul"', JSON.stringify(quoted));
 
 // --- /flag paths must not be confused with //flags ---
 const single = bc('cmd /c ver');
-check('P: single-slash flag untouched', single.command === 'cmd /c ver' && !single.cmdFlagFixed, JSON.stringify(single));
+check('P: single-slash flag untouched', single === 'cmd /c ver', JSON.stringify(single));
 
 // --- hook wiring: the two mutation boundaries, exercised through a fake ctx ---
 const hooks = {};
@@ -199,28 +190,28 @@ check('P: glob bare $TEMP untouched', split('$TEMP') === null, JSON.stringify(sp
 
 // --- command position: shells keywords, groups, case patterns, path forms ---
 const fullPath = bc('C:\\Windows\\System32\\cmd.exe //c ver');
-check('P: full-path cmd.exe fixed', fullPath.command === 'C:\\Windows\\System32\\cmd.exe /c ver', JSON.stringify(fullPath));
+check('P: full-path cmd.exe fixed', fullPath === 'C:\\Windows\\System32\\cmd.exe /c ver', JSON.stringify(fullPath));
 const thenKw = bc('if true; then cmd //c ver; fi');
-check('P: cmd after then', thenKw.command === 'if true; then cmd /c ver; fi', JSON.stringify(thenKw));
+check('P: cmd after then', thenKw === 'if true; then cmd /c ver; fi', JSON.stringify(thenKw));
 const doKw = bc('for f in a b; do cmd //c ver; done');
-check('P: cmd after do', doKw.command === 'for f in a b; do cmd /c ver; done', JSON.stringify(doKw));
+check('P: cmd after do', doKw === 'for f in a b; do cmd /c ver; done', JSON.stringify(doKw));
 const braceGrp = bc('{ cmd //c ver; }');
-check('P: cmd in brace group', braceGrp.command === '{ cmd /c ver; }', JSON.stringify(braceGrp));
+check('P: cmd in brace group', braceGrp === '{ cmd /c ver; }', JSON.stringify(braceGrp));
 const casePat = bc('case x in a) cmd //c ver;; esac');
-check('P: cmd after case pattern )', casePat.command === 'case x in a) cmd /c ver;; esac', JSON.stringify(casePat));
+check('P: cmd after case pattern )', casePat === 'case x in a) cmd /c ver;; esac', JSON.stringify(casePat));
 const timeKw = bc('time cmd //c ver');
-check('P: cmd after time', timeKw.command === 'time cmd /c ver', JSON.stringify(timeKw));
+check('P: cmd after time', timeKw === 'time cmd /c ver', JSON.stringify(timeKw));
 const bang = bc('! cmd //c ver');
-check('P: cmd after !', bang.command === '! cmd /c ver', JSON.stringify(bang));
+check('P: cmd after !', bang === '! cmd /c ver', JSON.stringify(bang));
 const envCmd = bc('env FOO=1 cmd //c ver');
-check('P: cmd after env', envCmd.command === 'env FOO=1 cmd /c ver', JSON.stringify(envCmd));
-check('P: quoted word in argument position untouched', bc('echo "if" cmd //c ver').command === 'echo "if" cmd //c ver', JSON.stringify(bc('echo "if" cmd //c ver')));
-check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver').command === 'ls | xargs cmd //c ver', JSON.stringify(bc('ls | xargs cmd //c ver')));
+check('P: cmd after env', envCmd === 'env FOO=1 cmd /c ver', JSON.stringify(envCmd));
+check('P: quoted word in argument position untouched', bc('echo "if" cmd //c ver') === 'echo "if" cmd //c ver', JSON.stringify(bc('echo "if" cmd //c ver')));
+check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver') === 'ls | xargs cmd //c ver', JSON.stringify(bc('ls | xargs cmd //c ver')));
 // Known miss, pinned on purpose: a quoted command name ("cmd") is not
 // recognised. It is fixable in principle but has zero organic occurrences
 // (0/508 real commands in this machine's log), so handling it would only add
 // scanner risk. Left as-is: pre-plugin behaviour.
-check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver').command === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
+check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver') === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
 
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();

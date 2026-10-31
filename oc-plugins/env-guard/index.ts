@@ -83,12 +83,16 @@ const GIT_REG_KEYS = [
 ];
 
 function verifyMsysBash(candidate: string): boolean {
+  const key = candidate.toLowerCase();
+  const hit = msysVerified.get(key);
+  if (hit !== undefined) return hit;
+  let ok = false;
   try {
     const p = spawnSync(candidate, ["-c", "uname -s"], { timeout: 5000, windowsHide: true });
-    return !p.error && MSYS_UNAME.test((p.stdout?.toString() ?? "").trim());
-  } catch {
-    return false;
-  }
+    ok = !p.error && MSYS_UNAME.test((p.stdout?.toString() ?? "").trim());
+  } catch { /* not verified */ }
+  msysVerified.set(key, ok);
+  return ok;
 }
 
 function registryBashRoots(): string[] {
@@ -116,26 +120,23 @@ function extraBashRoots(): string[] {
 }
 
 function bashCandidatesFromRoot(root: string, out: string[], seen: Set<string>) {
-  const add = (p: string) => {
-    const k = p.toLowerCase();
-    if (!seen.has(k)) { seen.add(k); out.push(p); }
-  };
-  add(path.join(root, "usr", "bin", "bash.exe"));
-  add(path.join(root, "bin", "bash.exe"));
+  addCandidate(out, seen, path.join(root, "usr", "bin", "bash.exe"));
+  addCandidate(out, seen, path.join(root, "bin", "bash.exe"));
+}
+
+function addCandidate(out: string[], seen: Set<string>, p: string) {
+  const k = p.toLowerCase();
+  if (!seen.has(k)) { seen.add(k); out.push(p); }
 }
 
 export function findBash(): string | null {
   if (bashCache !== undefined) return bashCache;
   const out: string[] = [];
   const seen = new Set<string>();
-  const add = (p: string) => {
-    const k = p.toLowerCase();
-    if (!seen.has(k)) { seen.add(k); out.push(p); }
-  };
   for (const d of (process.env.PATH ?? "").split(";").filter(Boolean)) {
     const base = d.replace(/[\\]+$/, "");
     if (/\\System32(\\|$)/i.test(base)) continue; // WSL launcher stub lives here
-    add(path.join(base, "bash.exe"));
+    addCandidate(out, seen, path.join(base, "bash.exe"));
     const git = path.join(base, "git.exe");
     if (!existsSync(git)) continue;
     let root = path.dirname(git); // usually <install root>\cmd
@@ -151,13 +152,8 @@ export function findBash(): string | null {
     }
     bashCandidatesFromRoot(path.dirname(root), out, seen);
   }
+  for (const root of extraBashRoots()) bashCandidatesFromRoot(root, out, seen);
   for (const c of out) {
-    if (existsSync(c) && verifyMsysBash(c)) { bashCache = c; return c; }
-  }
-  const out2: string[] = [];
-  const seen2 = new Set<string>(out.map((p) => p.toLowerCase()));
-  for (const root of extraBashRoots()) bashCandidatesFromRoot(root, out2, seen2);
-  for (const c of out2) {
     if (existsSync(c) && verifyMsysBash(c)) { bashCache = c; return c; }
   }
   bashCache = null;
@@ -175,7 +171,7 @@ export function findBash(): string | null {
 let bashTmp: string | null = null;
 let bashTmpProbed = false;
 
-export function realTempDir(): string {
+function realTempDir(): string {
   if (!bashTmpProbed) {
     bashTmpProbed = true;
     try {
@@ -201,7 +197,7 @@ const realTemp = realTempDir();
 // anything else (cmd, powershell, pwsh, wsl.exe) is left alone. Results are
 // cached per executable so a hook never re-probes an already-known shell.
 
-const msysShellCache = new Map<string, boolean>();
+const msysVerified = new Map<string, boolean>();
 const pathConvCache = new Map<string, boolean>();
 
 function shellCandidate(shell: string): string | null {
@@ -212,39 +208,35 @@ function shellCandidate(shell: string): string | null {
   return findBash();
 }
 
-export function isMsysShell(shell: string): boolean {
+function isMsysShell(shell: string): boolean {
   const cand = shellCandidate(shell);
-  if (!cand) return false;
-  const key = cand.toLowerCase();
-  let ok = msysShellCache.get(key);
-  if (ok === undefined) {
-    ok = verifyMsysBash(cand);
-    msysShellCache.set(key, ok);
-  }
-  return ok;
+  return cand !== null && verifyMsysBash(cand);
 }
 
 function pathConvDisabled(shell: string): boolean {
   const cand = shellCandidate(shell);
-  if (!cand) return false;
+  if (!cand || !verifyMsysBash(cand)) return false;
   const key = cand.toLowerCase();
   let disabled = pathConvCache.get(key);
   if (disabled === undefined) {
-    disabled = false; // uncertainty resolves to "do not rewrite"
-    try {
-      // bash -c sources the user's bashrc (BASH_ENV), so the child reports
-      // exactly what spawned commands will see.
-      const p = spawnSync(cand, ["-c", 'printf %s "$MSYS_NO_PATHCONV"'], {
-        timeout: 5000,
-        windowsHide: true,
-      });
-      disabled = !p.error && (p.stdout?.toString().trim() === "1");
-    } catch {
-      /* keep false */
-    }
+    disabled = probeNoPathConv(cand);
     pathConvCache.set(key, disabled);
   }
   return disabled;
+}
+
+function probeNoPathConv(bash: string): boolean {
+  try {
+    // bash -c sources the user's bashrc (BASH_ENV), so the child reports
+    // exactly what spawned commands will see.
+    const p = spawnSync(bash, ["-c", 'printf %s "$MSYS_NO_PATHCONV"'], {
+      timeout: 5000,
+      windowsHide: true,
+    });
+    return !p.error && p.stdout?.toString().trim() === "1";
+  } catch {
+    return false; // uncertainty resolves to "do not rewrite"
+  }
 }
 
 // In s, index of the ")" matching the "$(" in front of `from`; -1 if absent.
@@ -298,28 +290,22 @@ function matchParen(s: string, from: number): number {
   return -1;
 }
 
+// The temp forms a host-side path resolver never expands: /tmp and the
+// bash/cmd variables. One list, used by the path rewrite and the glob prefix
+// split so the two can never drift apart.
+const TEMP_FORM = /^(?:\/tmp|\$(?:tmpdir|temp|tmp)|\$\{(?:tmpdir|temp|tmp)\}|%(?:temp|tmp)%)/i;
+
 // File-tool path rewrite: the temp-dir forms only. Everything else --
 // relative paths, other drives, drive-letter MSYS paths (handled natively by
 // OpenCode's tool layer) -- passes through untouched.
 export function rewritePath(p: string): string {
-  const norm = (rest: string) => {
-    const tail = rest.replace(/\//g, "\\").replace(/\\+$/, "");
-    return tail ? realTemp + tail : realTemp;
-  };
-  let m: RegExpExecArray | null;
-  // POSIX /tmp (case-insensitive, mixed separators: /tmp, /TMP/x, /tmp\foo)
-  m = /^\/tmp([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
-  // bash-style temp variables: file tools expand nothing, so $TEMP once
-  // created a literal "$TEMP" folder (measured); the braced ${TEMP} form is
-  // equally literal (measured) and lands in the same place
-  m = /^\$(?:temp|tmp|tmpdir)([\\/].*)?$/i.exec(p) ?? /^\$\{(?:temp|tmp|tmpdir)\}([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
-  // cmd-style %TEMP%/%TMP%: same non-expansion
-  m = /^%(?:temp|tmp)%([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
-  // C:\tmp: native write succeeds (legal path) -- deliberately untouched
-  return p;
+  const head = TEMP_FORM.exec(p);
+  if (!head) return p;
+  const rest = p.slice(head[0].length);
+  // $TEMPFILE/x, /tmpfoo/x and friends are not the temp dir
+  if (rest !== "" && !/^[\\/]/.test(rest)) return p;
+  const tail = rest.replace(/\//g, "\\").replace(/\\+$/, "");
+  return tail ? realTemp + tail : realTemp;
 }
 
 // ---- patch text: same host-side paths, written as patch directives ---------
@@ -350,49 +336,31 @@ export function rewritePatchText(text: string): string {
 // 0 results -- a silent false negative), so the leading temp form moves into
 // `path` and the rest stays the pattern. Only used when the call has no path,
 // so a call that works today is never reshaped.
-const TEMP_PREFIX = /^(?:\/tmp|\$(?:temp|tmp|tmpdir)|\$\{(?:temp|tmp|tmpdir)\}|%(?:temp|tmp)%)[\\/](.+)$/i;
-
 export function splitTempPrefix(pattern: string): { dir: string; rest: string } | null {
-  const m = TEMP_PREFIX.exec(pattern);
-  if (!m) return null;
-  return { dir: realTemp, rest: m[1]!.replace(/\\/g, "/") };
+  const head = TEMP_FORM.exec(pattern);
+  if (!head) return null;
+  const rest = pattern.slice(head[0].length);
+  if (!/^[\\/].+/.test(rest)) return null;
+  return { dir: realTemp, rest: rest.slice(1).replace(/\\/g, "/") };
 }
 
 // ---- shell command scan: cmd doubled flags, position-aware ----------------
 
-export interface BashScanResult {
-  command: string;
-  cmdFlagFixed: boolean;  // cmd //c|//k was rewritten to /c|/k
-  cmdNonAscii: boolean;   // command-position cmd + non-ASCII (data only)
-}
-
 export function rewriteBashCommand(
   command: string,
   allowFlagRewrite: boolean = pathConvDisabled("bash"),
-): BashScanResult {
-  const r = scanBash(command, allowFlagRewrite);
-  return {
-    command: r.command,
-    cmdFlagFixed: r.cmdFlagFixed,
-    cmdNonAscii: r.sawCmd && r.nonAscii,
-  };
+): string {
+  return scanBash(command, allowFlagRewrite);
 }
 
-function scanBash(
-  command: string,
-  allowFlagRewrite: boolean,
-): BashScanResult & { sawCmd: boolean; nonAscii: boolean } {
+function scanBash(command: string, allowFlagRewrite: boolean): string {
   const heredoc = /<<(-?)[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_]*)\2/y; // sticky, anchored at lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd flags are alphabetic; /v:on keeps its colon tail
-  const nonAsciiRe = /[^\x00-\x7F]/;
   let out = "";
   let i = 0;
   const n = command.length;
   let pendingDelim: string | null = null;
   let inHeader = false;
-  let cmdFlagFixed = false;
-  let sawCmd = false;
-  let nonAscii = false;
   // token tracking: only rewrite flags of a cmd in COMMAND position, never
   // literal data (`echo cmd //c` stays verbatim)
   let curTok = "";
@@ -423,7 +391,6 @@ function scanBash(
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
     if (cmdPosNext) {
-      sawCmd = sawCmd || isCmdTok(curTok);
       // FOO=bar env prefixes and shell keywords do not end the command position
       cmdPosNext =
         /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok) || SHELL_KEYWORDS.has(curTok.toLowerCase());
@@ -445,10 +412,7 @@ function scanBash(
         const close = matchParen(seg, k + 2);
         if (close === -1) { s += seg.slice(k); break; }
         const sub = scanBash(seg.slice(k + 2, close), allowFlagRewrite);
-        s += "$(" + sub.command + ")";
-        cmdFlagFixed ||= sub.cmdFlagFixed;
-        sawCmd ||= sub.sawCmd;
-        nonAscii ||= sub.nonAscii;
+        s += "$(" + sub + ")";
         k = close + 1;
         continue;
       }
@@ -460,10 +424,7 @@ function scanBash(
         }
         if (p >= m2) { s += seg.slice(k); break; }
         const sub = scanBash(seg.slice(k + 1, p), allowFlagRewrite);
-        s += "`" + sub.command + "`";
-        cmdFlagFixed ||= sub.cmdFlagFixed;
-        sawCmd ||= sub.sawCmd;
-        nonAscii ||= sub.nonAscii;
+        s += "`" + sub + "`";
         k = p + 1;
         continue;
       }
@@ -502,7 +463,6 @@ function scanBash(
     }
     if (ch === "\\") {
       const seg = command.slice(i, i + 2);
-      if (nonAsciiRe.test(seg)) nonAscii = true;
       out += seg;
       curTok += seg; // escaped chars belong to the token (\> is no operator)
       i += 2;
@@ -513,12 +473,10 @@ function scanBash(
       const end = command.indexOf("'", i + 1);
       if (end === -1) {
         const seg = command.slice(i);
-        if (nonAsciiRe.test(seg)) nonAscii = true;
-        out += seg;
+          out += seg;
         break;
       }
       const seg = command.slice(i, end + 1);
-      if (nonAsciiRe.test(seg)) nonAscii = true; // quoted non-ASCII still reaches cmd
       out += seg;
       i = end + 1;
       continue;
@@ -548,12 +506,10 @@ function scanBash(
       }
       if (j >= n) {
         const seg = command.slice(i);
-        if (nonAsciiRe.test(seg)) nonAscii = true;
-        out += scanDq(seg); // $( ) inside an unclosed quote still executes
+          out += scanDq(seg); // $( ) inside an unclosed quote still executes
         break;
       }
       const seg = command.slice(i, j + 1);
-      if (nonAsciiRe.test(seg)) nonAscii = true;
       out += scanDq(seg);
       i = j + 1;
       continue;
@@ -620,7 +576,6 @@ function scanBash(
           out += (curTok === "" ? "" : " ") + "/" + m[1];
           i += m[0].length;
           curTok = "/" + m[1];
-          cmdFlagFixed = true;
           continue;
         }
       }
@@ -629,12 +584,11 @@ function scanBash(
       i++;
       continue;
     }
-    if (nonAsciiRe.test(ch)) nonAscii = true;
     curTok += ch;
     out += ch;
     i++;
   }
-  return { command: out, cmdFlagFixed, sawCmd, nonAscii };
+  return out;
 }
 
 // ---- OpenCode hook wiring -------------------------------------------------
@@ -701,8 +655,8 @@ export default Plugin.define({
         if (cwd !== event.cwd) event.cwd = cwd;
       }
       if (!pathConvDisabled(event.shell)) return;
-      const r = rewriteBashCommand(event.command, true);
-      if (r.command !== event.command) event.command = r.command;
+      const rewritten = rewriteBashCommand(event.command, true);
+      if (rewritten !== event.command) event.command = rewritten;
     });
   },
 });
