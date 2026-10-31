@@ -25,6 +25,12 @@
 //     原生（轉換開啟）可跑、本機被同一層弄壞，但要在指令位置判定裡跳過
 //     wrapper 的參數，就得知道每個 wrapper 的參數結構——開放集合＋猜測，
 //     違反「只留不變的部分」，故列為刻意漏修（漏修＝原生失敗，方向安全）。
+//   - 原生程式的 POSIX 路徑參數（`git -F /tmp/x`、`git hash-object /tmp/x`、
+//     `python /tmp/x.py`…）：預設 git-bash 靠 argv 轉換才成立，本機轉換關閉就
+//     變成 `could not open '/tmp/…'`（實測；MSYS 程式如 cat/ls 不受影響）。
+//     不修的理由：判斷「哪個參數是路徑」需要各程式自己的參數語義（開放集合
+//     ＋猜測），把所有 /… 參數硬改成 Windows 路徑又會改壞字串／regex
+//     （`echo /tmp`、`grep /tmp`、`sed 's|/tmp|X|'`）；且失敗是大聲的，agent 可自癒。
 //   - 絕對路徑 cmd（C:\…\cmd.exe //c）、引號形式（"cmd" //c）、跳脫（\cmd //c）：
 //     同樣是原生可跑、本機壞，但模型實務不會這樣寫，加了只是多一個作用點。
 //   - 原生就壞的雙斜線形（cmd //?、cmd ///c、cmd //server/share）：實測轉換
