@@ -31,7 +31,10 @@
 //      which is why this is a silent failure. -> rewrite //flags to /flags on
 //      command-position cmd only, including nested $( ) / backticks / double
 //      quotes, shell keywords ({ } if/then/do ...) and the tight `cmd//c`
-//      form; data positions (`echo cmd //c`) are untouched. The rewrite is
+//      form; data positions are untouched (`echo cmd //c`, redirect targets
+//      (`cmd > //out` -- native "> //x" is a loud failure), heredoc bodies
+//      (exact terminator match, <<\EOF included) and the word after a closed
+//      `$( )`/backtick (`echo $(pwd) cmd //c ver`)). The rewrite is
 //      GATED on a probe of that environment (bash -c 'printf %s
 //      "$MSYS_NO_PATHCONV"', which sources .bashrc through BASH_ENV): with
 //      path conversion ON, `//c` is the spelling that works and rewriting it
@@ -364,12 +367,15 @@ export function rewriteBashCommand(command: string): string {
 }
 
 function scanBash(command: string): string {
-  const heredoc = /<<(-?)[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_]*)\2/y; // sticky, anchored at lastIndex
+  // group 1: the <<- dash; group 2: the backslash of <<\EOF (literal body);
+  // group 3: an optional quote; group 4: the delimiter (backref \3 closes it)
+  const heredoc = /<<(-?)[ \t]*(\\?)(["']?)([A-Za-z_][A-Za-z0-9_]*)\3/y; // sticky, anchored at lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd flags are alphabetic; /v:on keeps its colon tail
   let out = "";
   let i = 0;
   const n = command.length;
   let pendingDelim: string | null = null;
+  let pendingDash = false; // <<- (strips leading TABS from terminator lines)
   let inHeader = false;
   // token tracking: only rewrite flags of a cmd in COMMAND position, never
   // literal data (`echo cmd //c` stays verbatim)
@@ -378,6 +384,11 @@ function scanBash(command: string): string {
   let prevTokCmdPos = false;
   let cmdPosNext = true;
   let cmdFlagZone = false; // after cmd, /flags keep the zone alive (cmd //q //c)
+  let inBacktick = false; // flat backtick nesting (\` is eaten by the escape branch)
+  // what the pending open parens close: "subst" = $(, "func" = foo(,
+  // "case" = "in (", "group" = everything else; a ")" pops and restores the
+  // command position accordingly
+  const parenStack: string[] = [];
 
   // A cmd token is recognised by basename, so an explicit path
   // (C:\Windows\System32\cmd.exe) is the same command as `cmd`. Quoted
@@ -449,10 +460,15 @@ function scanBash(command: string): string {
     if (pendingDelim !== null && !inHeader) {
       let lineEnd = command.indexOf("\n", i);
       if (lineEnd === -1) lineEnd = n;
-      if (command.slice(i, lineEnd).trim() === pendingDelim) {
+      // bash matches the terminator line EXACTLY (<<- strips leading tabs
+      // only, nothing else); a trim() here would end the body early and
+      // rewrite its lines. "EOF " / "  EOF" / "EOF\r" are BODY in bash.
+      const raw = command.slice(i, lineEnd);
+      if ((pendingDash ? raw.replace(/^\t+/, "") : raw) === pendingDelim) {
         out += command.slice(i, Math.min(lineEnd + 1, n));
         i = lineEnd + 1;
         pendingDelim = null;
+        pendingDash = false;
         curTok = "";
         prevTok = "";
         cmdPosNext = true; // a fresh command line follows
@@ -529,7 +545,8 @@ function scanBash(command: string): string {
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
-        pendingDelim = m[3];
+        pendingDelim = m[4];
+        pendingDash = m[1] === "-";
         inHeader = true;
         out += m[0];
         i += m[0].length;
@@ -546,6 +563,21 @@ function scanBash(command: string): string {
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
       cmdPosNext = true; // separators open a new command position
+      if (ch === "(") {
+        // classify the paren so its ")" restores the right position:
+        // $( opens a substitution (a word right after it is an ARGUMENT),
+        // foo( is a function definition ("{ cmd" follows), "in (" opens a
+        // case pattern, anything else is a group / subshell opener.
+        parenStack.push(
+          command[i - 1] === "$"
+            ? "subst"
+            : /[A-Za-z0-9_]/.test(command[i - 1] ?? "")
+              ? "func"
+              : prevTok === "in"
+                ? "case"
+                : "group",
+        );
+      }
       out += ch;
       i++;
       continue;
@@ -558,16 +590,32 @@ function scanBash(command: string): string {
       continue;
     }
     if (ch === ")" || ch === ">" || ch === "<") {
-      commitTok(); // a redirect target is not a command position
-      // a case-pattern "x) cmd ..." starts a command list after the ")"
-      if (ch === ")") cmdPosNext = true;
+      commitTok();
+      if (ch === ")") {
+        // close what the matching "(" opened. A bare ")" (case pattern
+        // "x)"), "foo()" and "in (x)" keep the command position -- cmd
+        // still runs after them; a closed $( )/group ends it, because the
+        // next word is an ARGUMENT ("echo $(pwd) cmd //c ver" -- data).
+        const kind = parenStack.pop();
+        cmdPosNext = kind === undefined || kind === "func" || kind === "case";
+      } else {
+        // a redirect target is not a command position and must not authorize
+        // one either: "cmd > //out" -- the target is bash's own path syntax
+        // and native "> //x" is a loud failure we leave alone
+        cmdPosNext = false;
+        prevTokCmdPos = false;
+        cmdFlagZone = false;
+      }
       out += ch;
       i++;
       continue;
     }
     if (ch === "`") {
       commitTok();
-      cmdPosNext = true; // backtick contents are command positions
+      inBacktick = !inBacktick;
+      // the opening backtick starts a command position inside; the closing
+      // one ends it (the word after `...` is an argument: data, not command)
+      cmdPosNext = inBacktick;
       out += ch;
       i++;
       continue;

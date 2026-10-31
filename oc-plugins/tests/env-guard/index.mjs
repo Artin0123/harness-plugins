@@ -213,6 +213,47 @@ check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver') === 'ls
 // scanner risk. Left as-is: pre-plugin behaviour.
 check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver') === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
 
+// --- misfix regressions: these silently rewrote correct syntax before the
+// position rules were tightened (each verified against real bash first) ---
+// redirect targets are bash-internal path syntax: native "> //x" fails loudly
+// ("Is a directory") and the rewrite would have silently written to the MSYS
+// root instead -- out of scope, leave the failure alone
+check('B: cmd > //out untouched', bc('cmd > //out') === 'cmd > //out', JSON.stringify(bc('cmd > //out')));
+check('B: cmd < //in untouched', bc('cmd < //in') === 'cmd < //in', JSON.stringify(bc('cmd < //in')));
+check('B: cmd >> //log untouched', bc('cmd >> //log') === 'cmd >> //log', JSON.stringify(bc('cmd >> //log')));
+const redirAfterFlag = bc('cmd //c < //in');
+check('B: flag fixed, redirect target kept', redirAfterFlag === 'cmd /c < //in', JSON.stringify(redirAfterFlag));
+
+// heredoc: <<\EOF (escaped delimiter) is a literal body in bash; the
+// terminator line must match EXACTLY (<<- strips leading tabs only), so
+// "EOF " / "  EOF" / "EOF\r" terminator look-alikes are BODY
+check('B: <<\\EOF body untouched', bc('cat <<\\EOF\ncmd //c ver\nEOF') === 'cat <<\\EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<\\EOF\ncmd //c ver\nEOF')));
+check('B: trailing-space terminator is body', bc('cat <<EOF\nbody\nEOF \ncmd //c ver') === 'cat <<EOF\nbody\nEOF \ncmd //c ver', JSON.stringify(bc('cat <<EOF\nbody\nEOF \ncmd //c ver')));
+check('B: leading-space terminator is body', bc('cat <<EOF\na\n  EOF\ncmd //c ver\nEOF') === 'cat <<EOF\na\n  EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<EOF\na\n  EOF\ncmd //c ver\nEOF')));
+check('B: CRLF terminator is body', bc('cat <<EOF\nbody\nEOF\r\ncmd //c ver') === 'cat <<EOF\nbody\nEOF\r\ncmd //c ver', JSON.stringify(bc('cat <<EOF\nbody\nEOF\r\ncmd //c ver')));
+const dashOk = bc('cat <<-EOF\n\tx\n\tEOF\ncmd //c ver');
+check('B: <<- tab terminator recognized, next line is a command', dashOk === 'cat <<-EOF\n\tx\n\tEOF\ncmd /c ver', JSON.stringify(dashOk));
+check('B: <<- space-indented line is body', bc('cat <<-EOF\n  EOF\ncmd //c ver\nEOF') === 'cat <<-EOF\n  EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<-EOF\n  EOF\ncmd //c ver\nEOF')));
+
+// a closed $( ) / `...` / group ends the command position: the next word is
+// an ARGUMENT of the outer command, never rewritten
+check('B: echo $(pwd) cmd //c ver untouched', bc('echo $(pwd) cmd //c ver') === 'echo $(pwd) cmd //c ver', JSON.stringify(bc('echo $(pwd) cmd //c ver')));
+check('B: echo `pwd` cmd //c ver untouched', bc('echo `pwd` cmd //c ver') === 'echo `pwd` cmd //c ver', JSON.stringify(bc('echo `pwd` cmd //c ver')));
+check('B: echo $((1+1)) cmd //c ver untouched', bc('echo $((1+1)) cmd //c ver') === 'echo $((1+1)) cmd //c ver', JSON.stringify(bc('echo $((1+1)) cmd //c ver')));
+check('B: quoted $(...) then cmd untouched', bc('echo "result: $(date)" cmd //c ver') === 'echo "result: $(date)" cmd //c ver', JSON.stringify(bc('echo "result: $(date)" cmd //c ver')));
+
+// the position rules must keep every legitimately-command-position form:
+check('B: case (a) cmd still fixed', bc('case x in (a) cmd //c ver;; esac') === 'case x in (a) cmd /c ver;; esac', JSON.stringify(bc('case x in (a) cmd //c ver;; esac')));
+check('B: function body cmd still fixed', bc('foo() { cmd //c ver; }') === 'foo() { cmd /c ver; }', JSON.stringify(bc('foo() { cmd //c ver; }')));
+check('B: process substitution still fixed', bc('tee <(cmd //c ver)') === 'tee <(cmd /c ver)', JSON.stringify(bc('tee <(cmd //c ver)')));
+check('B: subshell cmd still fixed', bc('(cmd //c ver)') === '(cmd /c ver)', JSON.stringify(bc('(cmd //c ver)')));
+check('B: multiline $( ) still fixed', bc('x=$(\ncmd //c ver\n)') === 'x=$(\ncmd /c ver\n)', JSON.stringify(bc('x=$(\ncmd //c ver\n)')));
+
+// pinned conservative misses (assignment-prefix after a substitution used to
+// be rewritten correctly-by-accident; miss beats a silent misfix)
+check('B: count=$(...) cmd //c is a pinned miss', bc('count=$(cat f) cmd //c ver') === 'count=$(cat f) cmd //c ver', JSON.stringify(bc('count=$(cat f) cmd //c ver')));
+check('B: x=`y` cmd //c is a pinned miss', bc('x=`y` cmd //c ver') === 'x=`y` cmd //c ver', JSON.stringify(bc('x=`y` cmd //c ver')));
+
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();
 check('P: findBash finds an MSYS bash on this machine', !!bash, String(bash));
