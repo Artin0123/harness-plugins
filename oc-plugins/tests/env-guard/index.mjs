@@ -251,6 +251,19 @@ check('B: <<- space-indented line is body', bc('cat <<-EOF\n  EOF\ncmd //c ver\n
 // an ARGUMENT of the outer command, never rewritten
 check('B: echo $(pwd) cmd //c ver untouched', bc('echo $(pwd) cmd //c ver') === 'echo $(pwd) cmd //c ver', JSON.stringify(bc('echo $(pwd) cmd //c ver')));
 check('B: echo `pwd` cmd //c ver untouched', bc('echo `pwd` cmd //c ver') === 'echo `pwd` cmd //c ver', JSON.stringify(bc('echo `pwd` cmd //c ver')));
+
+// keyword-final substitutions: the LAST token inside $( ) being fi/done/}/esac
+// must not leak command position past the close (found on the pi sibling;
+// oc's stack restore already handled the plain forms, but a case PATTERN ")"
+// inside a substitution used to steal the $( 's stack entry, leaving the real
+// closer to hit an empty stack and reopen command position)
+check('B: echo $(if...fi) cmd //c ver untouched', bc('echo $(if true; then 1; fi) cmd //c ver') === 'echo $(if true; then 1; fi) cmd //c ver', JSON.stringify(bc('echo $(if true; then 1; fi) cmd //c ver')));
+check('B: echo $(for...done) cmd //c ver untouched', bc('echo $(for i in 1; do echo $i; done) cmd //c ver') === 'echo $(for i in 1; do echo $i; done) cmd //c ver', JSON.stringify(bc('echo $(for i in 1; do echo $i; done) cmd //c ver')));
+check('B: echo $( { x; } ) cmd //c ver untouched', bc('echo $( { x; } ) cmd //c ver') === 'echo $( { x; } ) cmd //c ver', JSON.stringify(bc('echo $( { x; } ) cmd //c ver')));
+const caseSubst = bc('echo $(case 1 in 1) x;; esac) cmd //c ver');
+check('B: case-pattern ")" in substitution keeps the stack', caseSubst === 'echo $(case 1 in 1) x;; esac) cmd //c ver', JSON.stringify(caseSubst));
+// ... while a top-level case pattern still opens command position
+check('B: top-level case pattern still fixed', bc('case x in a) cmd //c ver;; esac') === 'case x in a) cmd /c ver;; esac', JSON.stringify(bc('case x in a) cmd //c ver;; esac')));
 check('B: echo $((1+1)) cmd //c ver untouched', bc('echo $((1+1)) cmd //c ver') === 'echo $((1+1)) cmd //c ver', JSON.stringify(bc('echo $((1+1)) cmd //c ver')));
 check('B: quoted $(...) then cmd untouched', bc('echo "result: $(date)" cmd //c ver') === 'echo "result: $(date)" cmd //c ver', JSON.stringify(bc('echo "result: $(date)" cmd //c ver')));
 

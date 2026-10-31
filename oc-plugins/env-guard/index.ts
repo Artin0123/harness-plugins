@@ -408,6 +408,7 @@ function scanBash(command: string): string {
   // "subst" = $(, "func" = foo(, "case" = "in (", "group" = everything else;
   // a ")" restores accordingly (func/case always keep the position)
   const parenStack: { kind: string; pos: boolean }[] = [];
+  let caseDepth = 0; // inside a case ... esac: a pattern ")" closes nothing
 
   // A cmd token is recognised by basename, so an explicit path
   // (C:\Windows\System32\cmd.exe) is the same command as `cmd`. Quoted
@@ -443,6 +444,14 @@ function scanBash(command: string): string {
       // FOO=bar env prefixes and shell keywords do not end the command position
       cmdPosNext =
         /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok) || SHELL_KEYWORDS.has(curTok.toLowerCase());
+    }
+    // case/esac depth: a case-PATTERN ")" has no matching "(", so it must not
+    // pop the paren stack (it would steal the enclosing $( 's entry and
+    // desync the stack -- "echo $(case 1 in 1) x;; esac) cmd //c ver")
+    if (prevTokCmdPos) {
+      const low = curTok.toLowerCase();
+      if (low === "case") caseDepth++;
+      else if (low === "esac") caseDepth = Math.max(0, caseDepth - 1);
     }
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
@@ -635,16 +644,32 @@ function scanBash(command: string): string {
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
       if (ch === ")") {
-        // close what the matching "(" opened, restoring the OUTER command
-        // position it saved: "count=$(...) cmd //c" (assignment prefix --
-        // bash runs cmd) keeps the position, "echo $(...) cmd //c" (cmd is
-        // an argument) ends it. A bare ")" (case "x)"), "foo()" and
-        // "in (x)" keep the position -- cmd runs after them.
-        const fr = parenStack.pop();
-        cmdPosNext =
-          fr === undefined || fr.kind === "func" || fr.kind === "case"
-            ? true
-            : fr.pos;
+        const top = parenStack.length
+          ? parenStack[parenStack.length - 1]
+          : undefined;
+        if (top?.kind === "case") {
+          // closes the "in (" opener: command position resumes after the pattern
+          parenStack.pop();
+          cmdPosNext = true;
+        } else if (caseDepth > 0) {
+          // a bare case-PATTERN ")" (no opener of its own): it must not pop
+          // the paren stack -- that would steal the ENCLOSING substitution's
+          // entry and leave the real closer to hit an empty stack, wrongly
+          // reopening command position ("echo $(case 1 in 1) x;; esac)
+          // cmd //c ver" -- cmd is echo's argument there)
+          cmdPosNext = true;
+        } else {
+          // close what the matching "(" opened, restoring the OUTER command
+          // position it saved: "count=$(...) cmd //c" (assignment prefix --
+          // bash runs cmd) keeps the position, "echo $(...) cmd //c" (cmd is
+          // an argument) ends it. A bare ")" (top-level case "x)"), "foo()"
+          // and "in (x)" keep the position -- cmd runs after them.
+          const fr = parenStack.pop();
+          cmdPosNext =
+            fr === undefined || fr.kind === "func" || fr.kind === "case"
+              ? true
+              : fr.pos;
+        }
         clearTok();
       } else {
         // a redirect target is not a command position and must not authorize
