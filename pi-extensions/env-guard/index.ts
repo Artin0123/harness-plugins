@@ -10,13 +10,33 @@
 //     在 host 端解析，不經 MSYS 映射、不展開變數 → 寫入建成 C:\tmp 或
 //     字面 "$TEMP" 資料夾，搜尋類直接報錯（~ 工具自身會正確展開，不需管）。
 //     變數形式全擋：$TEMP/$TMP/$TMPDIR、%TEMP%/%TMP%，不分大小寫與分隔符。
+//     故障點只在 Windows 的 tool 解析層，所以整段改寫只在 win32 生效；且必須
+//     先問到 bash 的 /tmp 錨點（cygpath -w /tmp），問不到就不改寫（不猜佈局）。
 //   - cmd //c|//k：原生 git-bash（預設開啟路徑轉換）下 //c 是唯一能用的寫法，
-//     但本機 ~/.bashrc 設了 MSYS_NO_PATHCONV=1，//c 原樣抵達 cmd → 進互動模式
-//     （印橫幅、指令沒跑、exit 0）。bashrc 對擴充不可見，故以子 bash 探測實際值
+//     但本機 ~/.bashrc 設了 MSYS_NO_PATHCONV（MSYS 只看變數「存在」，實測值
+//     0／空字串／false 也一樣停用轉換），//c 原樣抵達 cmd → 進互動模式
+//     （印橫幅、指令沒跑、exit 0）。bashrc 對擴充不可見，故以子 bash 探測
 //     （見下方 pathConvDisabled），確認轉換關閉才啟用改寫——探測失敗一律不改寫。
-//     適用 cmd 與 cmd.exe、指令位置的全部 //字母旗標（含多旗標 cmd //q //c）。
+//     適用 cmd 與 cmd.exe、指令位置（含 if/while/{/!/time 等 POSIX 語法關鍵字
+//     之後）的全部 //字母旗標（含多旗標 cmd //q //c）。
 //
 // 【刻意不修】原生行為或模型自身錯誤，一概讓它壞：
+//   - wrapper 指令後的 cmd（timeout 5 cmd //c …、env cmd //c …、xargs …）：
+//     原生（轉換開啟）可跑、本機被同一層弄壞，但要在指令位置判定裡跳過
+//     wrapper 的參數，就得知道每個 wrapper 的參數結構——開放集合＋猜測，
+//     違反「只留不變的部分」，故列為刻意漏修（漏修＝原生失敗，方向安全）。
+//   - 絕對路徑 cmd（C:\…\cmd.exe //c）、引號形式（"cmd" //c）、跳脫（\cmd //c）：
+//     同樣是原生可跑、本機壞，但模型實務不會這樣寫，加了只是多一個作用點。
+//   - 原生就壞的雙斜線形（cmd //?、cmd ///c、cmd //server/share）：實測轉換
+//     開啟時一樣進互動模式 → 模型自己寫錯，不修。
+//   - case 樣式的 `)`（`case $x in a) cmd //c ver;; esac`、以及它包在 `$( )` 裡的
+//     形）：bash 語法上這個 `)` 沒有對應的 `(`，要修得追蹤 case/in/esac 狀態，
+//     而 case body 裡合法的 `$( )` 一旦誤判（該 pop 變成不 pop）就會把資料改壞
+//     ——實測目前只落在漏修側（資料不會被改寫），故維持不追蹤（已釘樁）。
+//   - 重導向目標的雙斜線（`cmd //c "x" > //out`）：目標路徑是 bash 自己開檔時
+//     解析的，根本不經被 MSYS_NO_PATHCONV 關掉的 argv 轉換層——沒有故障點；
+//     原生就是大聲失敗（`//out: Is a directory`），改寫它反而會靜默寫到
+//     別的位置（`> /tmp/eg.log` 真的建檔），所以目標原樣不動。
 //   - C:\tmp：write 工具寫 C:\tmp 原生會成功（合法 Windows 路徑）——原生不壞就不修，
 //     模型真寫 C:\tmp 就讓它寫。
 //   - nul 重導向（> nul、2>nul…）：實測 bash（與 pi spawn 同一顆）把裸 nul 映射到
@@ -41,41 +61,77 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // 不直接信 os.tmpdir()：若 pi 是從 git-bash 啟動，TEMP 可能是 "/tmp" 這種
 // MSYS 映射值，Node 直接拿去用會再踩同樣的坑。但也不要預設 AppData 佈局：
 // bash 的 /tmp 靠 /etc/fstab 掛載（Git for Windows 預設 usertemp，但自訂 fstab
-// 可指向任何地方）。正確解：問偵測到的 bash 本身 `cygpath -w /tmp`——那才是
-// bash 的 `> /tmp/x` 與檔案工具看同一個目錄的錨點。探不到才退回 os.tmpdir()
-//（磁碟路徑時），再退回家目錄慣例位置。
-let bashTmp: string | null = null;
-let bashTmpProbed = false;
+// 可指向任何地方）。正確解：問「pi 實際會 spawn 的 bash」本身 `cygpath -w /tmp`
+// ——那才是 bash 的 `> /tmp/x` 與檔案工具看同一個目錄的錨點；探不到就用
+// os.tmpdir()（它讀 TEMP，是環境事實；但只有磁碟路徑才算數），兩者都拿不到
+// 就回 null（＝不改寫：依「找不到就整體停用」，不去猜 AppData 這類佈局慣例）。
+//
+// 惰性求值：探測要 spawn 兩顆行程（uname + cygpath，實測 ~370ms），不能在
+// 模組載入時就付（pi 也不會用到檔案工具的命令照樣載入擴充）。
+let tempAnchor: string | null | undefined; // undefined＝尚未探測；null＝探不到錨點
 // bash 偵測結果快取（findBash 會被 realTempDir 與 pathConvDisabled 多次呼叫，
 // 掃描+uname 驗證有成本，結果算一次就定）
 let bashCache: string | null | undefined;
 
-export function realTempDir(): string {
-  if (!bashTmpProbed) {
-    bashTmpProbed = true;
-    try {
-      const bash = findBash();
-      if (bash) {
-        const p = spawnSync(bash, ["-c", "cygpath -w /tmp"], { timeout: 5000, windowsHide: true });
-        const out = (p.stdout?.toString() ?? "").trim();
-        if (!p.error && /^[A-Za-z]:[\\/]/.test(out)) bashTmp = out;
-      }
-    } catch { /* 退回下方備援 */ }
-  }
-  if (bashTmp) return bashTmp;
-  const t = os.tmpdir();
-  if (/^[A-Za-z]:[\\/]/.test(t)) return path.normalize(t);
-  return path.join(os.homedir(), "AppData", "Local", "Temp");
+// ===== 探測對象：pi 實際會 spawn 的 shell =====
+// 兩項改寫（/tmp 錨點、MSYS_NO_PATHCONV 閘門）都盡量問「真的會執行命令的那顆
+// shell」，否則就是猜。pi 的設定值（settings.shellPath）由 factory 注入：
+//   有設 → 只信它：驗證是 MSYS bash 才拿來探測；不是（pwsh/cmd/WSL/Cygwin）→ null，
+//          cmd 旗標改寫直接停用（`//c` 的故障點是 MSYS 轉換層的事）；temp 錨點
+//          則退回 os.tmpdir() 這個環境事實（有的話）——檔案工具不管 shell 是什麼
+//          都在 host 端解析，`/tmp` 一樣會錯位，所以不全面停用。
+//   沒設 → pi 自己會去挑 git-bash，用 findBash() 的掃描+驗證結果
+let configuredShell: (() => string | undefined) | null = null;
+let probeShellCache: string | null | undefined;
+
+export function setConfiguredShell(fn: () => string | undefined): void {
+  configuredShell = fn;
 }
-const realTemp = realTempDir();
+
+function probeShell(): string | null {
+  if (probeShellCache !== undefined) return probeShellCache;
+  probeShellCache = null;
+  try {
+    const configured = configuredShell?.();
+    if (configured) {
+      if (existsSync(configured) && verifyMsysBash(configured)) probeShellCache = configured;
+      return probeShellCache; // 設定值存在就只信它（非 MSYS → gate 停用）
+    }
+  } catch { /* 讀不到設定 → 退回偵測 */ }
+  probeShellCache = findBash();
+  return probeShellCache;
+}
+
+export function realTempDir(): string | null {
+  if (tempAnchor !== undefined) return tempAnchor;
+  tempAnchor = null;
+  try {
+    const bash = probeShell();
+    if (bash) {
+      const p = spawnSync(bash, ["-c", "cygpath -w /tmp"], { timeout: 5000, windowsHide: true });
+      const out = (p.stdout?.toString() ?? "").trim();
+      if (!p.error && /^[A-Za-z]:[\\/]/.test(out)) tempAnchor = out;
+    }
+  } catch { /* 保持 null */ }
+  if (tempAnchor === null) {
+    const t = os.tmpdir();
+    if (/^[A-Za-z]:[\\/]/.test(t)) tempAnchor = path.normalize(t);
+  }
+  return tempAnchor;
+}
 
 // ===== MSYS 路徑轉換探測（決定 cmd //c 是否該改寫成 /c）=====
 // 改寫方向取決於 bashrc 的 MSYS_NO_PATHCONV，而 bashrc 對本擴充不可見。
 // 但 bash -c 會 source 它（BASH_ENV），所以探測子 shell 看到的實際值，結果快取一次：
-//   轉換關閉（=1）→ //c 原樣抵達 cmd、進互動模式 → 啟用改寫
-//   轉換開啟（預設 git-bash）→ //c 是唯一能動的拼法，改寫它本身就是副作用 → 不改寫
-//   探測失敗／找不到 bash → 不改寫（fail-safe：漏修的話 cmd 會印橫幅大聲失敗，
+//   轉換關閉（MSYS_NO_PATHCONV 存在，不論值）→ //c 原樣抵達 cmd、進互動模式 → 啟用改寫
+//   轉換開啟（預設 git-bash，變數不存在）→ //c 是唯一能動的拼法，改寫它本身就是副作用 → 不改寫
+//   探測失敗／找不到 bash → 不改寫（fail-safe：漏修的話 cmd 會印橫幅失敗，
 //   模型可自行修正；誤修則是沉默破壞正確語法——寧可漏修，不可誤修）
+// MSYS 的判定是「變數存在即停用」（實測 //c 在 0／空字串／false 下都原樣抵達
+// 原生程式），所以探測只問存在性，不比對值。
+// 前提：探測對象現在是 pi 自己的設定值（settings.shellPath，由 factory 注入；
+// 沒設才退回 findBash() 的掃描）。設定值是 MSYS bash 才探測、否則整體 inert，
+// 所以不再存在「探測的 bash ≠ 實際 spawn 的 bash」這種漂移。
 let noPathConvCache: boolean | null = null;
 
 // ---- bash 自動偵測（掃描 + 驗證身份，不寫死任何安裝路徑）----
@@ -194,17 +250,18 @@ export function findBash(): string | null {
   return null;
 }
 
-function pathConvDisabled(): boolean {
+export function pathConvDisabled(): boolean {
   if (noPathConvCache === null) {
     noPathConvCache = false; // 失敗時維持「不改寫」
     try {
-      const bash = findBash();
+      const bash = probeShell();
       if (bash) {
-        const p = spawnSync(bash, ["-c", 'printf %s "$MSYS_NO_PATHCONV"'], {
+        // 問存在性而非值：${VAR+set} 在變數已設（含空字串）時輸出 "set"
+        const p = spawnSync(bash, ["-c", 'printf %s "${MSYS_NO_PATHCONV+set}"'], {
           timeout: 5000,
           windowsHide: true,
         });
-        noPathConvCache = !p.error && (p.stdout?.toString().trim() === "1");
+        noPathConvCache = !p.error && p.stdout?.toString().trim() === "set";
       }
     } catch {
       /* keep false */
@@ -275,6 +332,12 @@ function matchParen(s: string, from: number): number {
 }
 
 export function rewritePath(p: string): string {
+  // 故障點只在 Windows 的 tool 解析層（host 端不經 MSYS 映射、不展開變數）；
+  // 其他平台的 /tmp、$TEMP 本來就是它們的語意，動它就是誤修。
+  if (process.platform !== "win32") return p;
+  // 拿不到 bash 的 /tmp 錨點 → 不改寫（不猜佈局，見上方 realTempDir）
+  const realTemp = realTempDir();
+  if (!realTemp) return p;
   // 接續部分統一用反斜線，避免混合分隔符（Windows API 雖兩者通吃，但輸出乾淨一致）
   const norm = (rest: string) => realTemp + rest.replace(/\//g, "\\");
   let m: RegExpExecArray | null;
@@ -286,8 +349,12 @@ export function rewritePath(p: string): string {
   // C:\Users\x（含 /mnt/d、/cygdrive/e），實測 e2e 無 C:\c 錯位。盤符修復只在
   // 沒有這層正規化的 host（cmdc）才合理；在 pi 是重複防護＝純副作用。
   // bash/cmd 風格的暫存變數：工具不展開任何變數，$TEMP 曾實際建成字面資料夾。
-  // $TEMP/$TMP/$TMPDIR 不分大小寫與分隔符全擋（工具語境下任何寫法都不可能展開）
+  // $TEMP/$TMP/$TMPDIR（含 bash 的 ${TEMP} 大括號形式）不分大小寫與分隔符全擋
+  //（工具語境下任何寫法都不可能展開；實測 write '${TEMP}/x' 會在專案裡
+  // 建出字面 ${TEMP} 資料夾）
   m = /^\$(?:temp|tmp|tmpdir)([\\/].*)?$/i.exec(p);
+  if (m) return norm(m[1] ?? "");
+  m = /^\$\{(?:temp|tmp|tmpdir)\}([\\/].*)?$/i.exec(p);
   if (m) return norm(m[1] ?? "");
   // cmd 風格 %TEMP%/%TMP%：同樣不被展開 → 字面 %TEMP% 資料夾
   m = /^%(?:temp|tmp)%([\\/].*)?$/i.exec(p);
@@ -307,17 +374,39 @@ export function rewritePath(p: string): string {
 //      沒有可觀察影響——不是選擇性不修，是它們沒有這個故障模式。雙斜線慣用
 //      語法只存在於以 / 為 switch 前綴的程式，Windows 上即 cmd.exe（OS shell，
 //      bash 到不了的 OS 設施都得經它，e2e 實測自然觸發）。判準是故障點所在層：
-//      此故障在「本機轉換層被 MSYS_NO_PATHCONV=1 關閉」，模型語法（git-bash
+//      此故障在「本機轉換層被 MSYS_NO_PATHCONV 關閉（存在即停用）」，模型語法（git-bash
 //      官方慣用法）與 cmd.exe 本身都無錯。將來若有別的工具出現「自然使用＋
 //      故障可歸因於本機環境層＋靜默失敗」三條全中的實例，再按同一標準納入。
-//   2. 偵測「cmd + 非 ASCII」：實測 cmd 的中文輸出非 UTF-8、且輸入端在
-//      ANSI 轉換時就已毀損（連 PowerShell 包裝都救不回），無法忠實改寫，只能發警告
+//   2. 偵測「cmd + 非 ASCII」：只警告、不改寫。實測機制：cmd 的輸出照 console
+//      code page（本機 936＝GBK）編碼，pi 的 bash-executor 一律以 UTF-8 解碼 stdout
+//      → 中文變亂碼；argv 反而會正確送達（`type 中文.txt` 讀得到、`dir /b 中文*`
+//      匹配得到），只有該 code page 表示不了的字（emoji）變 '?'。不可在命令層修：
+//      注入 `chcp 65001` 實測不忠實（同一條命令有時輸出 UTF-8、有時仍是 GBK，
+//      且會把內建訊息語言切掉：ver 的「版本」變 "Version"）；tool_result 拿到的
+//      又是 host 解碼後的文字（原始 bytes 已遺失）→ 正確修法在 host 的解碼層（權限
+//      外），所以維持只警告。
 // 語法感知規則：
 //   - 單引號/雙引號內的字面「> nul」是資料，不動（cmd //c "dir > nul" 引號內交給 cmd）
 //   - heredoc 本體是資料，不動；結束標記行整行原樣跳過（同列殘字非標記，bash 會視為本體）
 //   - 反斜線跳脫的字元不構成運算子
 //   - 反引號與 $( ) 內是指令位置（會真的執行）；FOO=bar 前綴不結束指令位置
+//   - POSIX 語法關鍵字（if/then/elif/else/fi/while/until/do/done/time、{、}、!）
+//     在指令位置時不結束指令位置，所以 `if cmd //c ver; then …` 的 cmd 仍算
+//     指令位置；wrapper 指令（timeout/env/xargs…）刻意不列（見檔頭「刻意不修」）
+//   - 重導向/`<`/`)` 之後不延續 cmd 旗標區：目標是 bash 自己解析的路徑，不是 argv
+//   - heredoc 終止符按 bash 規則整行等值比對（`<<-` 先去掉前導 tab），不用 trim()
+//   - heredoc 定界符是 bash 的 word：`<<'END OF FILE'`（引號內任意內容）、
+//     `<<\EOF`（跳脫＝字面化）都算；辨識不到就會把本體當指令改寫
+//   - 替換/分隔符收尾要清 token 狀態：`echo `y` cmd`、`echo $(cmd) //x` 的
+//     cmd 與 //x 都是 echo 的參數，不能授權改寫；`x=`y` cmd` 相反的
+//     （替換是賦值內容）則仍是指令位置，bash 真的跑 cmd
+//   - 括號收尾也要還原外層位置（反引號的 btPos 同理）：`count=$(…) cmd` 是
+//     賦值值（cmd 會執行）而 `$(…) cmd` 的替換本身就是指令名（cmd 只是參數）
+//     ——由「`(` 前一字元」與 commit 後的指令位置天然分流；`foo( … )` 函式
+//     定義維持 true；群組 `( … ) word` 原生就是語法錯誤 → false
 //   - 2>&1 的 & 不是分隔符（前一字元是 > ）
+//   - cmdNonAscii 是全命令掃描（不是只看 cmd 的 argv）：`echo 中文; cmd /c ver`
+//     也會報警告。只是提示、不改命令，所以容忍這個誤報而不另做區間追蹤。
 export interface BashScanResult {
   command: string;
   cmdFlagFixed: boolean;  // cmd //c|//k 被改寫為 /c|/k
@@ -334,13 +423,20 @@ export function rewriteBashCommand(command: string): BashScanResult {
 }
 
 function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii: boolean } {
-  const heredoc = /<<(-?)[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_]*)\2/y; // sticky 已錨定 lastIndex
+  // heredoc 定界符是 bash 的 word：加引號時可含任意內容（`<<'END OF FILE'`，
+  // 終止行去引號比對），也可寫成 `<<\EOF`（跳脫＝字面化，定界符是 EOF）。
+  // 辨識不到就會把本體當指令掃描（＝改到資料）；起始字仍限字母/底線，
+  // 避免把 `$((1<<2))` 這種算術位移誤當 heredoc。
+  const heredoc = /<<(-?)[ \t]*(?:(["'])([^\r\n]+?)\2|\\?([A-Za-z_][A-Za-z0-9_.-]*))/y; // sticky 已錨定 lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
+  // POSIX 語法關鍵字：固定集合（bash 語法），不是「猜哪些程式會轉發指令」
+  const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|[{}!])$/;
   const nonAsciiRe = /[^\x00-\x7F]/;
   let out = "";
   let i = 0;
   const n = command.length;
   let pendingDelim: string | null = null;
+  let pendingStripTabs = false; // <<- ：終止符行先去掉前導 tab 再比（bash 只去 tab，不去空白）
   let inHeader = false;
   let cmdFlagFixed = false;
   let sawCmd = false;
@@ -351,10 +447,31 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
   let prevTokCmdPos = false;
   let cmdPosNext = true;
   let cmdFlagZone = false; // cmd 之後的旗標區（cmd //q //c 的第二個旗標也要改）
+  let inBacktick = false; // 反引號開/關（\` 由跳脫分支吃掉，所以是單層）
+  const btPos: boolean[] = []; // 每層反引號開頭的「外層是否在指令位置」
+  // 括號堆疊：每個 ( 記下「收尾時要還原的指令位置」
+  //   foo(  → true（函式定義，後面接 { … } 群組，cmd 仍在指令位置）
+  //   $(    → 還原 commit 後的位置：賦值前綴（count=$(…)）→ true，bash 真的跑 cmd；
+  //           獨立替換（$(…)）→ false，替換結果本身就是指令名，後面的 cmd 只是參數
+  //   群組 ( → false（`( … ) word` 原生就是語法錯誤，不改寫）
+  // 注意：case 樣式的 `)`（`case x in a) …`）在 bash 語法上沒有對應的 `(`，
+  // 所以它會把外層 `$(` 的堆疊項偷走。實測後果只落在漏修側（資料不會被改寫：
+  // `echo $(case 1 in 1) x;; esac) cmd //c ver` 的 cmd 是 echo 的參數，pi 不動）。
+  // 要把它修成正確改寫得追蹤 case/in/esac 狀態，而 case body 裡合法的 `$( )`
+  // 一旦誤判（該 pop 變成不 pop）就會把資料改壞——寧可漏修，不可誤修，故不追蹤。
+  const parenRestore: boolean[] = [];
 
   const isCmdTok = (t: string) => {
     const l = t.toLowerCase();
     return l === "cmd" || l === "cmd.exe";
+  };
+
+  // 收尾/分隔符要把 token 狀態一起清掉：替換內累積的 prevTok（如 `echo $(cmd) //x`
+  // 的 cmd）不能授權外面的改寫，否則 //x 這種 echo 的參數會被當 cmd 旗標改寫。
+  const clearTok = () => {
+    prevTok = "";
+    prevTokCmdPos = false;
+    cmdFlagZone = false;
   };
 
   const commitTok = () => {
@@ -362,8 +479,8 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     prevTokCmdPos = cmdPosNext;
     if (cmdPosNext) {
       sawCmd = sawCmd || isCmdTok(curTok);
-      // FOO=bar 環境變數前綴不結束指令位置（FOO=bar cmd …）
-      cmdPosNext = /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok);
+      // FOO=bar 環境變數前綴、與 if/while/{/! 等語法關鍵字都不結束指令位置
+      cmdPosNext = RESERVED_WORD.test(curTok) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok);
     }
     // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
@@ -420,15 +537,21 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
 
   while (i < n) {
     // heredoc 本體：逐行原樣複製；結束標記行整行跳過（標記行殘字視為本體，同 bash）
+    // 終止符照 bash 規則比：<< 要整行等於 delimiter；<<- 先去掉前導 tab 再比。
+    // 不能用 trim()——bash 不把空白差異當終止符，提早結束會讓「仍是本體」的資料
+    // 被當指令掃描、進而改寫（`cat <<'EOF'` 後一行 `  EOF` 就是這種案例）。
+    // 只容許行尾一個 \r：CRLF 文字下 bash 的 delimiter 也帶 \r，兩邊一起去掉才等價。
     if (pendingDelim !== null && !inHeader) {
       let lineEnd = command.indexOf("\n", i);
       if (lineEnd === -1) lineEnd = n;
-      if (command.slice(i, lineEnd).trim() === pendingDelim) {
+      const rawLine = command.slice(i, lineEnd);
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if ((pendingStripTabs ? line.replace(/^\t+/, "") : line) === pendingDelim) {
         out += command.slice(i, Math.min(lineEnd + 1, n));
         i = lineEnd + 1;
         pendingDelim = null;
         curTok = "";
-        prevTok = "";
+        clearTok();
         cmdPosNext = true; // 標記行後是新指令列
         continue;
       }
@@ -442,7 +565,7 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
       i++;
       inHeader = false;
       curTok = "";
-      prevTok = "";
+      clearTok();
       continue;
     }
     if (ch === "\\") {
@@ -514,7 +637,8 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
-        pendingDelim = m[3];
+        pendingDelim = m[3] ?? m[4]!;
+        pendingStripTabs = m[1] === "-";
         inHeader = true;
         out += m[0];
         i += m[0].length;
@@ -523,13 +647,23 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     }
     if (ch === " " || ch === "\t" || ch === "\n") {
       commitTok();
-      if (ch === "\n") cmdPosNext = true;
+      if (ch === "\n") {
+        cmdPosNext = true; // 新的一行：上一行的 cmd 不能授權本行的改寫
+        clearTok();
+      }
       out += ch;
       i++;
       continue;
     }
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
+      if (ch === "(") {
+        // cmdPosNext 此時是 commit 後的值：`count=$(` 會被 assignment 前綴保
+        // 留在 true，`$(` 則已被 commit 成一個普通 word → false（天然分流）
+        const prev = command[i - 1] ?? "";
+        parenRestore.push(prev === "$" ? cmdPosNext : /[A-Za-z0-9_]/.test(prev));
+      }
+      clearTok();
       cmdPosNext = true; // 分隔符後是新的指令位置（含 $( 與反引號開頭）
       out += ch;
       i++;
@@ -537,20 +671,44 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     }
     if (ch === "&") {
       commitTok();
-      if (command[i - 1] !== ">" && command[i - 1] !== "<") cmdPosNext = true; // 2>&1 的 & 不是分隔符
+      if (command[i - 1] !== ">" && command[i - 1] !== "<") {
+        clearTok();
+        cmdPosNext = true; // 2>&1 的 & 不是分隔符
+      }
       out += ch;
       i++;
       continue;
     }
     if (ch === ")" || ch === ">" || ch === "<") {
-      commitTok(); // 重定向目標不是指令位置
+      commitTok();
+      if (ch === ")") {
+        // 還原這個括號對應的位置；stack 空（case 的 `x)`）就維持現況
+        const restore = parenRestore.pop();
+        if (restore !== undefined) cmdPosNext = restore;
+      }
+      // 重導向目標由 bash 自己開檔（不經被關掉的 argv 轉換層），`)` 也結束該指令：
+      // 兩者都清掉指令上下文，否則下一個詞會被當旗標改寫成資料/路徑
+      clearTok();
       out += ch;
       i++;
       continue;
     }
     if (ch === "`") {
+      // 同一個 ` 分支兼管開/關：開的時候指令位置從頭算（內容是會執行的指令），
+      // 關的時候還原外層該有的位置——`x=``y`` cmd` 這種「替換是賦值內容」
+      // 後面仍是指令位置（bash 真的跑 cmd）；`echo ``y`` cmd`、`FOO=bar ``y`` cmd`
+      // 的替換本身就是指令名，cmd 只是它的參數 → 不再是指令位置。
+      const inWord = curTok !== "";
       commitTok();
-      cmdPosNext = true; // 反引號內是指令位置（關閉反引號後不設，保守不誤判）
+      if (!inBacktick) {
+        btPos.push(inWord && cmdPosNext);
+        inBacktick = true;
+        cmdPosNext = true;
+      } else {
+        inBacktick = false;
+        cmdPosNext = btPos.length ? btPos.pop()! : false;
+      }
+      clearTok();
       out += ch;
       i++;
       continue;
@@ -586,11 +744,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
   return { command: out, cmdFlagFixed, sawCmd, nonAscii };
 }
 
-// 給只需要純字串結果的舊呼叫端相容用
-export function rewriteNulRedirects(command: string): string {
-  return rewriteBashCommand(command).command;
-}
-
 const notifyUI = (ctx: { hasUI: boolean; ui: { notify: (msg: string, level?: string) => void } }, msg: string, level: string) => {
   if (!ctx.hasUI) return;
   try {
@@ -605,6 +758,19 @@ const notifyUI = (ctx: { hasUI: boolean; ui: { notify: (msg: string, level?: str
 };
 
 export default function (pi: ExtensionAPI) {
+  // 故障點全部是 Windows 的（host 端路徑解析、MSYS 轉換層）：非 Windows 整個擴充
+  // 停用，連 cmd+非 ASCII 警告也不發（那種機器上沒有 cmd.exe）
+  if (process.platform !== "win32") return;
+  // 探測對象＝ pi 自己配置的 shell（settings.shellPath）；有設就只信它，
+  // 沒設才退回 findBash() 的掃描。這樣就不必「假設」pi 會 spawn 哪顆 bash。
+  setConfiguredShell(() => {
+    try {
+      const s = pi.getSettings?.();
+      return typeof s?.shellPath === "string" && s.shellPath ? s.shellPath : undefined;
+    } catch {
+      return undefined;
+    }
+  });
   pi.on("tool_call", (event, ctx) => {
     const name = event.toolName;
 
@@ -640,14 +806,14 @@ export default function (pi: ExtensionAPI) {
         if (r.cmdFlagFixed) {
           notifyUI(
             ctx,
-            "env-guard: cmd //c flag rewritten to /c (MSYS_NO_PATHCONV=1 detected; //c would start an interactive cmd)",
+            "env-guard: cmd //c flag rewritten to /c (MSYS_NO_PATHCONV is set, so msys path conversion is off and //c would start an interactive cmd)",
             "info",
           );
         }
         if (r.cmdNonAscii) {
           notifyUI(
             ctx,
-            "env-guard: command mixes cmd with non-ASCII text - measured: cmd input is mangled by ANSI conversion and output is not UTF-8 (PowerShell wrapping cannot recover it); results unreliable, prefer bash-native tools or PowerShell-native commands",
+            "env-guard: cmd + non-ASCII - measured: cmd writes output in the console code page (936/GBK here) while pi decodes stdout as UTF-8, so it arrives as mojibake; characters outside that code page become '?'. No faithful rewrite exists (injecting chcp 65001 is non-deterministic and switches built-in messages to English), so prefer bash-native tools or PowerShell-native commands for non-ASCII work",
             "warning",
           );
         }

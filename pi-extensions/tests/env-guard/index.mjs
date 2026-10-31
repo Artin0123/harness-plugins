@@ -6,19 +6,54 @@
 // and asserts every documented guard plus every deliberately-not-fixed form,
 // so the "刻意不修" decisions stay pinned instead of drifting back.
 //
+// The cmd //c rewrite is gated on a probe of MSYS_NO_PATHCONV inside a spawned
+// bash, so its expected result depends on the machine: this box's bashrc sets
+// the variable (conversion off -> rewrite), a stock git-bash does not
+// (conversion on -> inert, //c is then the only working spelling). Both
+// directions are asserted instead of assuming one, so the battery means the
+// same thing anywhere.
+//
 // Needs Node >= 22.6 (type stripping default from 23.6).
 import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
+import {spawnSync} from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const selfPath = fileURLToPath(import.meta.url);
 const mod = await import(pathToFileURL(join(here, '..', '..', 'env-guard', 'index.ts')).href);
+
+// Probe/machine worker modes: cached results mean each scenario needs its own
+// process.
+if (process.argv.includes('--probe')) {
+  console.log(mod.pathConvDisabled() ? 'true' : 'false');
+  process.exit(0);
+}
+if (process.argv.includes('--noanchor')) {
+  // Runs with a scrubbed env (see below); prints what the extension would do
+  // when it cannot learn bash's /tmp anchor.
+  console.log(JSON.stringify({temp: mod.realTempDir(), rewritten: mod.rewritePath('/tmp/x')}));
+  process.exit(0);
+}
+if (process.argv.includes('--shellpath')) {
+  // Configured shell (pi's settings.shellPath) decides the probe target.
+  const p = process.argv[process.argv.indexOf('--shellpath') + 1] ?? '';
+  mod.setConfiguredShell(() => p);
+  console.log(JSON.stringify({
+    gate: mod.pathConvDisabled(),
+    temp: mod.realTempDir(),
+    cmd: mod.rewriteBashCommand('cmd //c ver').command,
+    path: mod.rewritePath('/tmp/x'),
+  }));
+  process.exit(0);
+}
 
 let pass = 0; const failures = [];
 const check = (name, ok, detail) => { if (ok) pass++; else failures.push(`${name} -> ${detail}`); };
 const rt = (p) => mod.rewritePath(p);
 const bc = (c) => mod.rewriteBashCommand(c);
 const T = tmpdir();
+const gateOn = mod.pathConvDisabled();
 
 // --- rewritePath: /tmp family ---
 check('P: /tmp bare', rt('/tmp') === T, JSON.stringify(rt('/tmp')));
@@ -32,6 +67,12 @@ check('P: $TMPDIR/x', rt('$TMPDIR/x') === T + '\\x', JSON.stringify(rt('$TMPDIR/
 check('P: bare $TEMP', rt('$TEMP') === T, JSON.stringify(rt('$TEMP')));
 check('P: %TEMP%/x', rt('%TEMP%/x') === T + '\\x', JSON.stringify(rt('%TEMP%/x')));
 check('P: %tmp%\\x', rt('%tmp%\\x') === T + '\\x', JSON.stringify(rt('%tmp%\\x')));
+check('P: ${TEMP}/x braced', rt('${TEMP}/x') === T + '\\x', JSON.stringify(rt('${TEMP}/x')));
+check('P: ${TMPDIR}/x braced', rt('${TMPDIR}/x') === T + '\\x', JSON.stringify(rt('${TMPDIR}/x')));
+check('P: bare ${tmp} braced', rt('${tmp}') === T, JSON.stringify(rt('${tmp}')));
+check('P: $TEMPFILE/x untouched', rt('$TEMPFILE/x') === '$TEMPFILE/x', JSON.stringify(rt('$TEMPFILE/x')));
+check('P: $TMPDIRX/x untouched', rt('$TMPDIRX/x') === '$TMPDIRX/x', JSON.stringify(rt('$TMPDIRX/x')));
+check('P: /tmpfoo (prefix, not the dir) untouched', rt('/tmpfoo/x') === '/tmpfoo/x', JSON.stringify(rt('/tmpfoo/x')));
 
 // --- rewritePath: deliberate non-fixes ---
 check('P: C:\\tmp untouched (native write ok)', rt('C:\\tmp\\x') === 'C:\\tmp\\x', JSON.stringify(rt('C:\\tmp\\x')));
@@ -47,30 +88,195 @@ check('P: ~ untouched (tool expands)', rt('~/x') === '~/x', JSON.stringify(rt('~
 check('P: /c/Users passes through (pi natively maps)', rt('/c/Users/a') === '/c/Users/a', JSON.stringify(rt('/c/Users/a')));
 check('P: /c/tmp passes through', rt('/c/tmp/x') === '/c/tmp/x', JSON.stringify(rt('/c/tmp/x')));
 
-// --- rewriteBashCommand: doubled flags (probe-gated: only when the spawned
-// bash actually reports MSYS_NO_PATHCONV=1) ---
-const noConv = bc('cmd //c ver');
-check('P: cmd //c -> /c', noConv.command === 'cmd /c ver' && noConv.cmdFlagFixed, JSON.stringify(noConv));
-check('P: cmd //k -> /k', bc('cmd //k dir').cmdFlagFixed, JSON.stringify(bc('cmd //k dir')));
-const multi = bc('cmd //q //c ver');
-check('P: multi-flag //q //c both fixed', multi.command === 'cmd /q /c ver', JSON.stringify(multi));
-const tight = bc('cmd//c ver');
-check('P: tight cmd//c form', tight.command === 'cmd /c ver', JSON.stringify(tight));
+// --- rewritePath: the fault point only exists on Windows ---
+// On Linux/macOS /tmp and $TEMP are already correct, so the rewrite must not
+// fire at all (measured before the gate: /tmp/x became <home>/AppData/Local/Temp/x).
+const realPlatform = process.platform;
+let unixPath;
+try {
+  Object.defineProperty(process, 'platform', {value: 'linux', configurable: true});
+  unixPath = rt('/tmp/x');
+} finally {
+  Object.defineProperty(process, 'platform', {value: realPlatform, configurable: true});
+}
+check('P: non-win32 leaves /tmp untouched', unixPath === '/tmp/x', JSON.stringify(unixPath));
 
-// --- rewriteBashCommand: position awareness ---
-check('P: data position untouched', bc('echo cmd //c ver').command === 'echo cmd //c ver', JSON.stringify(bc('echo cmd //c ver')));
-const afterSemi = bc('ls; cmd //c ver');
-check('P: command position after ; fixed', afterSemi.command === 'ls; cmd /c ver', JSON.stringify(afterSemi));
-const nested = bc('echo "v: $(cmd //c ver)"');
-check('P: nested $( ) fixed', nested.command === 'echo "v: $(cmd /c ver)"', JSON.stringify(nested));
-const backtick = bc('echo v: `cmd //c ver`');
-check('P: backtick nested fixed', backtick.command === 'echo v: `cmd /c ver`', JSON.stringify(backtick));
+// --- rewriteBashCommand: doubled flags (probe-gated, both directions pinned) ---
+const flagCase = (label, input, expectedWhenOn) => {
+  const r = bc(input);
+  if (gateOn) check(`P: ${label}`, r.command === expectedWhenOn && r.cmdFlagFixed, JSON.stringify(r));
+  else check(`P: ${label} [gate off: untouched]`, r.command === input && !r.cmdFlagFixed, JSON.stringify(r));
+};
+flagCase('cmd //c -> /c', 'cmd //c ver', 'cmd /c ver');
+flagCase('cmd //k -> /k', 'cmd //k dir', 'cmd /k dir');
+flagCase('multi-flag //q //c both fixed', 'cmd //q //c ver', 'cmd /q /c ver');
+flagCase('tight cmd//c form', 'cmd//c ver', 'cmd /c ver');
+flagCase('command position after ;', 'ls; cmd //c ver', 'ls; cmd /c ver');
+flagCase('nested $( ) fixed', 'echo "v: $(cmd //c ver)"', 'echo "v: $(cmd /c ver)"');
+flagCase('backtick nested fixed', 'echo v: `cmd //c ver`', 'echo v: `cmd /c ver`');
+flagCase('//c fixed, quoted payload kept', 'cmd //c "dir > nul"', 'cmd /c "dir > nul"');
+flagCase('env-assignment prefix keeps position', 'x=1 cmd //c ver', 'x=1 cmd /c ver');
+
+// --- rewriteBashCommand: POSIX reserved words keep cmd at command position ---
+// `if cmd //c ver; then …` is native-correct git-bash syntax (measured: the
+// conversion layer turns //c into /c and `ver` runs) and is broken here only
+// because this box disables that layer, so the same fault point applies.
+// The keyword list is fixed bash grammar — not a guess about which wrappers
+// forward a command (see the deliberate-miss list below).
+flagCase('after if', 'if cmd //c ver; then echo y; fi', 'if cmd /c ver; then echo y; fi');
+flagCase('after {', '{ cmd //c ver; }', '{ cmd /c ver; }');
+flagCase('after !', '! cmd //c ver', '! cmd /c ver');
+flagCase('after while', 'while cmd //c ver; do break; done', 'while cmd /c ver; do break; done');
+flagCase('after do (for-loop body)', 'for i in 1; do cmd //c ver; done', 'for i in 1; do cmd /c ver; done');
+flagCase('after time', 'time cmd //c ver', 'time cmd /c ver');
+
+// --- rewriteBashCommand: redirect targets are bash's own path, not argv ---
+// Measured: `> //out` fails loudly (`Is a directory`) and `> //tmp/x` fails
+// (`No such file or directory`) without creating anything; the double-slash
+// idiom only exists to protect arguments that cross the msys argv conversion,
+// and a redirect target never does. Rewriting it would silently write
+// somewhere else (e.g. `/tmp/eg.log` does get created), so the flag is fixed
+// but the target stays exactly as written.
+flagCase('redirect target untouched', 'cmd //c "echo hi" > //out', 'cmd /c "echo hi" > //out');
+flagCase('redirect target after flag only', 'cmd //c > //out', 'cmd /c > //out');
+flagCase('stderr redirect target untouched', 'cmd //c "echo hi" 2> //out', 'cmd /c "echo hi" 2> //out');
+flagCase('append redirect target untouched', 'cmd //c "echo hi" >> //out/x', 'cmd /c "echo hi" >> //out/x');
+flagCase('input redirect target untouched', 'cmd //c "echo hi" < //in', 'cmd /c "echo hi" < //in');
+flagCase('plain redirect target kept', 'cmd //c "echo hi" > out.txt', 'cmd /c "echo hi" > out.txt');
+
+// --- rewriteBashCommand: heredoc terminator follows bash, not trim() ---
+// Measured with `bash script.sh`: for `<<'EOF'` the body is sent verbatim, so a
+// line that differs only by whitespace is *not* the terminator; `<<-` strips
+// leading tabs only. Getting this wrong ends the body early and rewrites lines
+// that are still data.
+const hdIndented = "cat <<'EOF'\n  EOF\ncmd //c ver\nEOF";
+check('P: whitespace-indented EOF is body', bc(hdIndented).command === hdIndented, JSON.stringify(bc(hdIndented).command));
+const hdTrailing = "cat <<'EOF'\nEOF  \ncmd //c ver\nEOF";
+check('P: trailing-space EOF is body', bc(hdTrailing).command === hdTrailing, JSON.stringify(bc(hdTrailing).command));
+const hdDashSpace = 'cat <<-EOF\n  EOF\ncmd //c ver\nEOF';
+check('P: <<- does not strip spaces from terminator', bc(hdDashSpace).command === hdDashSpace, JSON.stringify(bc(hdDashSpace).command));
+flagCase('<<- tab terminator ends body (bash agrees)', 'cat <<-EOF\n\tEOF\ncmd //c ver\nEOF', 'cat <<-EOF\n\tEOF\ncmd /c ver\nEOF');
+// `.` `-` 在 delimiter 裡合法（bash word）；辨識不到＝本體會被當指令改寫
+const hdHyphenQ = "cat <<'E-O'\ncmd //c ver\nE-O";
+check('P: quoted hyphen delimiter recognised', bc(hdHyphenQ).command === hdHyphenQ, JSON.stringify(bc(hdHyphenQ).command));
+const hdHyphen = 'cat <<E-O\ncmd //c ver\nE-O';
+check('P: bare hyphen delimiter recognised', bc(hdHyphen).command === hdHyphen, JSON.stringify(bc(hdHyphen).command));
+const hdDot = 'cat <<EOF.v2\ncmd //c ver\nEOF.v2';
+check('P: dotted delimiter recognised', bc(hdDot).command === hdDot, JSON.stringify(bc(hdDot).command));
+const shift = 'echo $((1<<2))';
+check('P: arithmetic shift is not a heredoc', bc(shift).command === shift, JSON.stringify(bc(shift)));
+// 定界符是 bash 的 word：引號內可含任意內容、也可是跳脫形式（<<\EOF）
+const hdEscaped = String.raw`cat <<\EOF` + '\ncmd //c ver\nEOF';
+check('P: <<\\EOF delimiter recognised', bc(hdEscaped).command === hdEscaped, JSON.stringify(bc(hdEscaped).command));
+const hdSpacesSq = "cat <<'END OF FILE'\ncmd //c ver\nEND OF FILE";
+check('P: quoted delimiter with spaces recognised', bc(hdSpacesSq).command === hdSpacesSq, JSON.stringify(bc(hdSpacesSq).command));
+const hdSpacesDq = 'cat <<"END OF FILE"\ncmd //c ver\nEND OF FILE';
+check('P: double-quoted delimiter recognised', bc(hdSpacesDq).command === hdSpacesDq, JSON.stringify(bc(hdSpacesDq).command));
+
+// --- rewriteBashCommand: token state must not leak out of substitutions ---
+// Measured in bash: in `echo `y` cmd …` the substitution IS the command word, so
+// `cmd` is only an argument; same for `FOO=bar `y` cmd …` and for `echo hi`y` …`.
+// `//x` after a substitution is echo's argument, not a cmd flag.
+const tokenLeaks = [
+  'echo `cmd` //x',
+  'echo $(cmd) //x',
+  'echo `y` cmd //c ver',
+  'FOO=bar `y` cmd //c ver',
+  'echo hi`y` cmd //c ver',
+  'echo "$(cmd)" //x',
+];
+for (const c of tokenLeaks) {
+  const r = bc(c);
+  check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+flagCase('separator ends flag context (quoted payload)', 'cmd //c "x" ; //y', 'cmd /c "x" ; //y');
+flagCase('separator ends flag context (bare)', 'cmd //c; //x', 'cmd /c; //x');
+flagCase('newline ends flag context', 'cmd //c "x"\n//y', 'cmd /c "x"\n//y');
+flagCase('substitution as assignment value keeps position', 'x=a`y` cmd //c ver', 'x=a`y` cmd /c ver');
+
+// --- rewriteBashCommand: command-substitution parens restore the outer position ---
+// Measured in bash: after a substitution the next word is an argument when the
+// substitution itself was the command word (`echo $(ls) cmd …` prints
+// `hi cmd //c ver`), and is the real command when the substitution was an
+// assignment value (`count=$(echo hi) cmd /c ver` runs cmd). A function
+// definition `foo(` followed by `{ … }` keeps the command position too.
+flagCase('assignment-prefix substitution keeps position', 'count=$(ls) cmd //c ver', 'count=$(ls) cmd /c ver');
+flagCase('arithmetic assignment prefix keeps position', 'x=$((1+1)) cmd //c ver', 'x=$((1+1)) cmd /c ver');
+flagCase('substitution value assignment keeps position', 'x=$(echo hi) cmd //c ver', 'x=$(echo hi) cmd /c ver');
+flagCase('function definition body', 'foo() { cmd //c ver; }', 'foo() { cmd /c ver; }');
+const subLeaks = [
+  'echo $(ls) cmd //c ver',
+  'echo $(pwd) cmd //c ver',
+  'echo $(if true; then 1; fi) cmd //c ver',
+  'echo $(for i in 1; do echo $i; done) cmd //c ver',
+  'echo $( { x; } ) cmd //c ver',
+  '( echo x ) cmd //c ver',
+];
+for (const c of subLeaks) {
+  const r = bc(c);
+  check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+flagCase('CRLF terminator ends body', 'cat <<EOF\nbody\nEOF\r\ncmd //c ver', 'cat <<EOF\nbody\nEOF\r\ncmd /c ver');
+flagCase('all-CRLF terminator ends body', 'cat <<EOF\r\nbody\r\nEOF\r\ncmd //c ver', 'cat <<EOF\r\nbody\r\nEOF\r\ncmd /c ver');
+
+// --- case 樣式的 `)` 沒有對應的 `(`（bash 語法上沒這個括號對） ---
+// 它會把外層 `$(` 的堆疊項偷走。實測結果只落在漏修側（資料不動），所以維持
+// 不追蹤 case/in/esac 狀態；下面兩組釘樁分別鎖住「資料不動」與「已知漏修」，
+// 將來任何人動 `)` 處理而把資料改壞，這裡會立即亮紅。
+const caseData = [
+  'echo $(case 1 in 1) x;; esac) cmd //c ver',
+  'echo $(case 1 in 1) fi;; esac) cmd //c ver',
+  'echo $(case 1 in 1) done;; esac) cmd //c ver',
+  'echo $(case 1 in (a) x;; esac) cmd //c ver',
+];
+for (const c of caseData) {
+  const r = bc(c);
+  check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+// 已知漏修（bash 實測 cmd 真的會執行；pi 不動，漏修方向安全）
+const caseMisses = [
+  'case $x in a) cmd //c ver;; esac',
+  'echo $(case $x in a) cmd //c ver;; esac)',
+  'x=$(case 1 in 1) x;; esac) cmd //c ver',
+];
+for (const c of caseMisses) {
+  const r = bc(c);
+  check(`P: known miss ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+
+// --- rewriteBashCommand: deliberate misses (same in both gate states) ---
+// Wrappers would need per-program argument layouts (open-ended guessing);
+// absolute/quoted/escaped cmd is native-correct here but never written in
+// practice; `cmd //?`, `cmd ///c` also fail on stock git-bash (model error).
+const misses = [
+  'echo cmd //c ver',
+  'echo if cmd //c ver',
+  'echo "$(pwd)" cmd //c ver',
+  'timeout 5 cmd //c ver',
+  'env cmd //c ver',
+  '/c/Windows/System32/cmd.exe //c ver',
+  '"cmd" //c ver',
+  '\\cmd //c ver',
+  'cmd //?',
+  'cmd ///c ver',
+  'printf %s cmd //c',
+];
+for (const c of misses) {
+  const r = bc(c);
+  check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+
+// A substitution that yields a word, followed by the command: here `cmd` really
+// is at command position (`x=`y` cmd …` executes cmd), so this one is fixed.
+flagCase('after backtick substitution', 'x=`y` cmd //c ver', 'x=`y` cmd /c ver');
 
 // --- rewriteBashCommand: protected data ---
 const heredoc = bc("cat <<'EOF'\ncmd //c ver\nEOF");
 check('P: heredoc body untouched', heredoc.command.includes('cmd //c ver'), JSON.stringify(heredoc));
 const nul = bc('a 2>nul & b &>nul');
 check('P: nul forms untouched (deliberate)', nul.command === 'a 2>nul & b &>nul' && !nul.cmdFlagFixed, JSON.stringify(nul));
+const paramExp = bc('echo "${x//c/d}"');
+check('P: ${x//c/d} untouched', paramExp.command === 'echo "${x//c/d}"', JSON.stringify(paramExp));
 
 // --- cmd + non-ASCII detection ---
 const cn = bc('cmd /c echo 中文');
@@ -80,10 +286,91 @@ check('P: plain nonASCII not flagged', noCn.cmdNonAscii === false, JSON.stringif
 const cnData = bc('echo cmd 中文');
 check('P: cmd-in-data not flagged', cnData.cmdNonAscii === false, JSON.stringify(cnData));
 
-// --- //c with quoted payload: flag fixed, payload kept ---
-const quoted = bc('cmd //c "dir > nul"');
-check('P: //c fixed, quoted payload kept', quoted.command === 'cmd /c "dir > nul"', JSON.stringify(quoted));
+// --- pathConvDisabled: MSYS disables conversion when the variable is *set* ---
+// Measured with a native Windows program's argv: //c arrives as /c when the
+// variable is unset (conversion on) and stays //c when it is set to 1, 0, ""
+// or false. The probe therefore tests presence, not the value. BASH_ENV is
+// removed so the scenarios do not depend on this machine's bashrc.
+const envWithout = (...keys) => {
+  const env = {...process.env};
+  for (const k of keys) {
+    for (const name of Object.keys(env)) {
+      if (name.toLowerCase() === k.toLowerCase()) delete env[name];
+    }
+  }
+  return env;
+};
+const probe = (env) => {
+  const r = spawnSync(process.execPath, [selfPath, '--probe'], {env, encoding: 'utf8'});
+  return (r.stdout ?? '').trim();
+};
+check('P: probe false when MSYS_NO_PATHCONV unset', probe(envWithout('BASH_ENV', 'MSYS_NO_PATHCONV')) === 'false', probe(envWithout('BASH_ENV', 'MSYS_NO_PATHCONV')));
+check('P: probe true when MSYS_NO_PATHCONV=1', probe({...envWithout('BASH_ENV'), MSYS_NO_PATHCONV: '1'}) === 'true', probe({...envWithout('BASH_ENV'), MSYS_NO_PATHCONV: '1'}));
+check('P: probe true when MSYS_NO_PATHCONV=0 (MSYS: presence wins)', probe({...envWithout('BASH_ENV'), MSYS_NO_PATHCONV: '0'}) === 'true', probe({...envWithout('BASH_ENV'), MSYS_NO_PATHCONV: '0'}));
+check('P: probe true when MSYS_NO_PATHCONV="" (set but empty)', probe({...envWithout('BASH_ENV'), MSYS_NO_PATHCONV: ''}) === 'true', probe({...envWithout('BASH_ENV'), MSYS_NO_PATHCONV: ''}));
+
+// --- realTempDir: no anchor -> no rewriting (never guess a layout) ---
+// Scrubbed env: PATH without any MSYS bash, no Git roots, non-drive TEMP. The
+// anchor must then be null (or a real drive path if this machine still resolves
+// bash some other way) — never a hardcoded AppData convention.
+const noAnchor = JSON.parse(
+  spawnSync(process.execPath, [selfPath, '--noanchor'], {
+    env: {
+      ...envWithout('BASH_ENV', 'MSYS_NO_PATHCONV'),
+      PATH: 'C:\\Windows\\system32',
+      ProgramFiles: 'C:\\nope',
+      'ProgramFiles(x86)': 'C:\\nope',
+      LOCALAPPDATA: 'C:\\nope',
+      TEMP: '\\\\tmp',
+      TMP: '\\\\tmp',
+    },
+    encoding: 'utf8',
+  }).stdout.trim(),
+);
+check('P: anchor is null or a drive path (no layout guess)', noAnchor.temp === null || /^[A-Za-z]:[\\/]/.test(noAnchor.temp), JSON.stringify(noAnchor.temp));
+check(
+  'P: no anchor -> /tmp untouched',
+  noAnchor.rewritten === (noAnchor.temp === null ? '/tmp/x' : noAnchor.temp + '\\x'),
+  JSON.stringify(noAnchor),
+);
+
+// --- configured shell (pi settings.shellPath) is the probe target ---
+// Reading the host's own value is exact, not a guess: a configured non-MSYS
+// shell (pwsh/cmd/WSL) means neither rewrite applies at all.
+const shellRun = (shellPath) => JSON.parse(
+  spawnSync(process.execPath, [selfPath, '--shellpath', shellPath], {encoding: 'utf8'}).stdout.trim(),
+);
+const nonMsys = (process.env.SystemRoot ?? 'C:\\Windows') + '\\System32\\cmd.exe';
+const cfgNonMsys = shellRun(nonMsys);
+check('P: configured non-MSYS shell -> gate off', cfgNonMsys.gate === false, JSON.stringify(cfgNonMsys));
+check('P: configured non-MSYS shell -> cmd untouched', cfgNonMsys.cmd === 'cmd //c ver', JSON.stringify(cfgNonMsys));
+check(
+  'P: configured non-MSYS shell -> /tmp uses the tmpdir fact only',
+  cfgNonMsys.path === (cfgNonMsys.temp === null ? '/tmp/x' : cfgNonMsys.temp + '\\x'),
+  JSON.stringify(cfgNonMsys),
+);
+check('P: configured non-MSYS shell -> anchor is null or a drive path', cfgNonMsys.temp === null || /^[A-Za-z]:[\\/]/.test(cfgNonMsys.temp), JSON.stringify(cfgNonMsys.temp));
+const msysBash = mod.findBash();
+if (msysBash) {
+  const cfgMsys = shellRun(msysBash);
+  check('P: configured MSYS bash -> gate matches bashrc', cfgMsys.gate === gateOn, JSON.stringify(cfgMsys));
+  check('P: configured MSYS bash -> anchor is a drive path', typeof cfgMsys.temp === 'string' && /^[A-Za-z]:[\\/]/.test(cfgMsys.temp), JSON.stringify(cfgMsys));
+  check('P: configured MSYS bash -> cmd rewritten like the default path', cfgMsys.cmd === bc('cmd //c ver').command, JSON.stringify(cfgMsys));
+} else {
+  check('P: configured MSYS bash (skipped: no MSYS bash on this machine)', true, '');
+}
+
+// --- non-Windows: the whole extension registers nothing ---
+const realPlatformHook = process.platform;
+let hookRegistrations = 0;
+try {
+  Object.defineProperty(process, 'platform', {value: 'linux', configurable: true});
+  mod.default({on: () => { hookRegistrations++; }, getSettings: () => ({})});
+} finally {
+  Object.defineProperty(process, 'platform', {value: realPlatformHook, configurable: true});
+}
+check('P: non-win32 registers no hook', hookRegistrations === 0, String(hookRegistrations));
 
 for (const f of failures) console.log('  FAIL ' + f);
-console.log(`=== pi unit battery: ${pass} passed, ${failures.length} failed ===`);
+console.log(`=== pi unit battery: ${pass} passed, ${failures.length} failed (gate ${gateOn ? 'ON: path conversion disabled' : 'OFF: conversion enabled'}) ===`);
 process.exit(failures.length === 0 ? 0 : 1);
