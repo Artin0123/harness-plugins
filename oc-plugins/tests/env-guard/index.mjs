@@ -278,6 +278,15 @@ check('B: count=$(cat f) cmd //c fixed', bc('count=$(cat f) cmd //c ver') === 'c
 check('B: x=`y` cmd //c fixed', bc('x=`y` cmd //c ver') === 'x=`y` cmd /c ver', JSON.stringify(bc('x=`y` cmd //c ver')));
 check('B: x=$((1+1)) cmd //c fixed', bc('x=$((1+1)) cmd //c ver') === 'x=$((1+1)) cmd /c ver', JSON.stringify(bc('x=$((1+1)) cmd //c ver')));
 
+// cross-review disputed cases (measured against real bash before pinning):
+// when the substitution's OUTPUT is the command word, the following cmd is
+// an ARGUMENT -- never rewritten. The paren rule captures the position AFTER
+// the opening commit, which is exactly this distinction; a cruder
+// "restore the outer position" port WOULD misfix these.
+check('B: $(ls) cmd //c ver untouched', bc('$(ls) cmd //c ver') === '$(ls) cmd //c ver', JSON.stringify(bc('$(ls) cmd //c ver')));
+check('B: FOO=bar `y` cmd //c ver untouched', bc('FOO=bar `y` cmd //c ver') === 'FOO=bar `y` cmd //c ver', JSON.stringify(bc('FOO=bar `y` cmd //c ver')));
+check('B: echo hi`y` cmd //c ver untouched', bc('echo hi`y` cmd //c ver') === 'echo hi`y` cmd //c ver', JSON.stringify(bc('echo hi`y` cmd //c ver')));
+
 // --- heredoc delimiters are bash WORDS, not just [A-Za-z0-9_]: dashes, dots
 // and quoted delimiters with spaces must delimit the body correctly
 // (measured before the fix: '<<'E-O-F'' / '<<'END OF FILE'' bodies were
