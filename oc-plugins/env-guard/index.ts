@@ -1,50 +1,59 @@
 // env-guard -- protects OpenCode's Windows shell and file tools from this
 // machine's measured environment failures. Same judgement framework as the
-// pi-extensions and cmdc-mods siblings in Artin0123/cmdc-mods; every fix below
-// is anchored to a failure MEASURED on this machine (2026-10-31, Git for
-// Windows 2.56.0 / MINGW64; path failures on opencode v2.2.1, hook wiring
-// verified on v2.2.5):
+// pi-extensions and cmdc-mods siblings in Artin0123/harness-plugins; every fix
+// below is anchored to a failure MEASURED on this machine (Git for Windows
+// 2.56.0 / MINGW64, opencode v2.2.5 -- the old read '/tmp/x' failure was
+// first seen on v2.2.1):
 //
 //   1. every path this host resolves WITHOUT MSYS mapping: file-tool `path`,
 //      the shell tool's `workdir`, a temp prefix inside a `glob` pattern, and
-//      the paths in `patch` directives (all measured). read '/tmp/x' fails
-//      "File not found", write '$TEMP/x' (or '${TEMP}/x') creates a literal
-//      '$TEMP' folder under the project, glob '${TEMP}/*.txt' silently finds
-//      nothing, patch '*** Add File: ${TEMP}/x' makes a literal folder, and
-//      workdir '/tmp' fails "Working directory does not exist: C:\tmp".
+//      the paths in `patch` directives (all measured). read '/tmp/x' looks at
+//      C:\tmp (host normalization: workdir '/tmp' fails with "Working
+//      directory does not exist: C:\tmp"), write '$TEMP/x' (or '${TEMP}/x')
+//      creates a literal '$TEMP' folder under the project, glob
+//      '${TEMP}/*.txt' silently finds nothing, and patch
+//      '*** Add File: ${TEMP}/x' makes a literal folder.
 //      -> /tmp, $TEMP/$TMP/$TMPDIR (bare and ${...}), %TEMP%/%TMP%
 //      (any case, either separator) rewrite to the directory the detected bash
-//      itself reports for /tmp (cygpath -w /tmp), so path consumers and bash
-//      agree on one temp anchor. bash-side /tmp is untouched (MSYS mounts it
-//      correctly) and os.tmpdir() is guarded against MSYS-mapped TEMP values
-//      ('/tmp' on this machine).
-//   2. this machine's bashrc sets MSYS_NO_PATHCONV=1, so the MSYS-doubled
-//      flag spelling `cmd //c` reaches cmd.exe literally and starts an
-//      INTERACTIVE cmd: measured live -- GBK banner, command never ran,
-//      exit 0 (a silent failure). -> rewrite //flags to /flags on
+//      itself reports for /tmp (cygpath -w /tmp): that is the mapping bash
+//      uses for its own '/tmp', so both sides of a command agree on it.
+//      bash-side /tmp is untouched (MSYS mounts it correctly). os.tmpdir() is
+//      NOT the authority here: on this machine MSYS already converts TEMP to a
+//      Windows path for native children (measured), yet the shell tool's bash
+//      is what defines '/tmp'.
+//   2. this machine's BASH_ENV (.bashrc, which `bash -c` sources) sets
+//      MSYS_NO_PATHCONV=1, so the MSYS-doubled flag spelling `cmd //c` reaches
+//      cmd.exe literally and starts an INTERACTIVE cmd: measured with stdin
+//      closed -- exit 0, and stdout is the banner + copyright + prompt
+//      ("Microsoft Windows [Version ...]" then "(c) Microsoft Corporation..."
+//      then "C:\...>") instead of `ver`'s single line. The banner's first line
+//      mimics `ver` closely enough that a model can read it as the answer,
+//      which is why this is a silent failure. -> rewrite //flags to /flags on
 //      command-position cmd only, including nested $( ) / backticks / double
-//      quotes and the tight `cmd//c` form; data positions (`echo cmd //c`)
-//      are untouched. The rewrite is GATED on a probe of the real bash
-//      environment (bash -c 'printf %s "$MSYS_NO_PATHCONV"', which sources
-//      the invisible bashrc): with path conversion ON, `//c` is the spelling
-//      that works and rewriting it would BE the side effect; a failed or
-//      inconclusive probe leaves everything alone (uncertainty never enables
-//      side effects; the un-fixed failure is loud -- banner, exit 0, no
-//      output -- and `/c` works in both configurations).
+//      quotes, shell keywords ({ } if/then/do ...) and the tight `cmd//c`
+//      form; data positions (`echo cmd //c`) are untouched. The rewrite is
+//      GATED on a probe of that environment (bash -c 'printf %s
+//      "$MSYS_NO_PATHCONV"', which sources .bashrc through BASH_ENV): with
+//      path conversion ON, `//c` is the spelling that works and rewriting it
+//      would BE the side effect; a failed or inconclusive probe leaves
+//      everything alone (uncertainty never enables side effects; `/c` works in
+//      both configurations).
 //
 // Deliberately NOT fixed (native execution wins; let it fail where it fails):
 //   - C:\\tmp in file tools: a legal Windows path, the native write simply
 //     succeeds (measured). The model choosing C:\\tmp is not environment
 //     breakage.
-//   - MSYS drive-letter paths (/c/Users/...): OpenCode's own tool layer
-//     resolves them correctly (measured: read /c/Users/... hit the real
-//     file). A rewrite here would be duplicate protection, pure side effect.
-//   - `nul` redirect targets: measured on THIS machine bash writes a real
-//     3-byte `nul` file even for a bare `> nul` in a fresh process (differs
-//     from the pi sibling's machine) -- but this is bash-native behaviour,
-//     not something this environment's tooling inflicts, so per the shared
-//     priority rules it stays untouched; `rm ./nul` removes it.
-//   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled (measured);
+//   - MSYS drive-letter paths (/c/Users/...): OpenCode's tool layer maps them
+//     itself (measured on v2.2.1 for read; re-measured on v2.2.5 for shell
+//     workdir '/c/Users/...', which ran in the right directory). A rewrite
+//     here would be duplicate protection, pure side effect.
+//   - `nul` redirect targets: re-measured today -- bash writes a real 3-byte
+//     `nul` file even for a bare `> nul` in a fresh process (differs from the
+//     pi sibling's machine) -- but this is bash-native behaviour, not
+//     something this environment's tooling inflicts, so it stays untouched;
+//     `rm ./nul` removes it.
+//   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled (measured;
+//     the same run that printed the version also produced the mojibake);
 //     there is no faithful rewrite (the pi sibling only warns) and the
 //     mojibake itself is the visible, self-correcting signal.
 //
@@ -66,11 +75,13 @@ const IS_WINDOWS = process.platform === "win32";
 // every candidate must answer `uname -s` with an MSYS/MINGW prefix (WSL
 // answers "Linux", Cygwin "CYGWIN_NT-*"; OSTYPE cannot discriminate -- Git
 // Bash reports "cygwin"). Candidates: PATH scan (skipping System32), the
-// install root derived from a PATH git.exe (scoop's git.shim resolved -- scoop
-// neither puts bash on PATH nor writes the registry, the shim is the only
-// trail), the Git for Windows registry keys, then env-derived program roots.
-// No package-manager enumeration: installers either put git on PATH or
-// register GitForWindows -- both covered. Nothing found -> null -> inert.
+// install root derived from a PATH git.exe, the Git for Windows registry keys,
+// then env-derived program roots. On this machine that is what it takes: the
+// user PATH carries `C:\Program Files\Git\cmd` plus scoop shims (git.exe and
+// git-bash.exe, no bash.exe) and there is no GitForWindows registry key, so
+// the install root has to come from a PATH git.exe -- and when that git.exe is
+// a scoop shim, its sibling git.shim names the real install. Verified result
+// here: <git>\usr\bin\bash.exe. Nothing found -> null -> inert.
 
 let bashCache: string | null | undefined;
 
@@ -161,12 +172,12 @@ export function findBash(): string | null {
 }
 
 // ---- the real temp anchor ------------------------------------------------
-// os.tmpdir() is not trusted: this machine's TEMP is the MSYS-mapped "/tmp",
-// which a Windows consumer would use verbatim. The anchor is what the
-// detected bash itself answers for /tmp (cygpath -w /tmp) -- the one value
-// file tools and bash's `> /tmp/x` agree on even with a custom fstab.
-// Fallbacks: os.tmpdir() when it is a real drive path, then the canonical
-// user temp under homedir().
+// The anchor is what the detected bash answers for /tmp (cygpath -w /tmp):
+// that is the directory bash itself uses for '/tmp', so file tools and a
+// command's `> /tmp/x` land together even with a custom fstab. os.tmpdir() is
+// only a fallback -- measured, MSYS already converts TEMP to a Windows path
+// for native children, so it usually agrees, but it is not the shell's map.
+// Then the canonical user temp under homedir().
 
 let bashTmp: string | null = null;
 let bashTmpProbed = false;
@@ -346,14 +357,13 @@ export function splitTempPrefix(pattern: string): { dir: string; rest: string } 
 
 // ---- shell command scan: cmd doubled flags, position-aware ----------------
 
-export function rewriteBashCommand(
-  command: string,
-  allowFlagRewrite: boolean = pathConvDisabled("bash"),
-): string {
-  return scanBash(command, allowFlagRewrite);
+// The caller decides WHEN to rewrite: the hook gates on a verified MSYS shell
+// plus the path-conversion probe. The scanner itself always rewrites.
+export function rewriteBashCommand(command: string): string {
+  return scanBash(command);
 }
 
-function scanBash(command: string, allowFlagRewrite: boolean): string {
+function scanBash(command: string): string {
   const heredoc = /<<(-?)[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_]*)\2/y; // sticky, anchored at lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd flags are alphabetic; /v:on keeps its colon tail
   let out = "";
@@ -411,7 +421,7 @@ function scanBash(command: string, allowFlagRewrite: boolean): string {
       if (c === "$" && seg[k + 1] === "(") {
         const close = matchParen(seg, k + 2);
         if (close === -1) { s += seg.slice(k); break; }
-        const sub = scanBash(seg.slice(k + 2, close), allowFlagRewrite);
+        const sub = scanBash(seg.slice(k + 2, close));
         s += "$(" + sub + ")";
         k = close + 1;
         continue;
@@ -423,7 +433,7 @@ function scanBash(command: string, allowFlagRewrite: boolean): string {
           p++;
         }
         if (p >= m2) { s += seg.slice(k); break; }
-        const sub = scanBash(seg.slice(k + 1, p), allowFlagRewrite);
+        const sub = scanBash(seg.slice(k + 1, p));
         s += "`" + sub + "`";
         k = p + 1;
         continue;
@@ -568,7 +578,7 @@ function scanBash(command: string, allowFlagRewrite: boolean): string {
         curTok === ""
           ? (prevTokCmdPos && isCmdTok(prevTok)) || (cmdFlagZone && prevTok.startsWith("/"))
           : cmdPosNext && isCmdTok(curTok);
-      if (atCmd && allowFlagRewrite) {
+      if (atCmd) {
         cmdFlag.lastIndex = i;
         const m = cmdFlag.exec(command);
         if (m) {
@@ -655,7 +665,7 @@ export default Plugin.define({
         if (cwd !== event.cwd) event.cwd = cwd;
       }
       if (!pathConvDisabled(event.shell)) return;
-      const rewritten = rewriteBashCommand(event.command, true);
+      const rewritten = rewriteBashCommand(event.command);
       if (rewritten !== event.command) event.command = rewritten;
     });
   },

@@ -272,7 +272,7 @@ agent 可用 `cygpath -w` 自癒。全面改寫 argv 會誤傷依賴 posix 形�
 | `glob` 的 `pattern` 內嵌路徑 | `pattern: "${TEMP}/*.txt"` 靜默回 0 筆（假陰性） | 只在**沒有另給 `path`** 時，把前綴 temp 目錄拆到 `path`、其餘留給 `pattern`；有給 `path` 就完全不動 |
 | `patch` 的 `patchText` | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾 | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動。四種都實測過（含改名與刪除） |
 | `shell` 的 `workdir` | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp` | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`） |
-| `shell` 的 `command` | bashrc 的 `MSYS_NO_PATHCONV=1` 讓 `cmd //c` 原樣抵達 cmd → 進互動模式（GBK banner、命令沒跑、exit 0，靜默失敗） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、貼緊的 `cmd//c` 都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動 |
+| `shell` 的 `command` | `BASH_ENV` 指到的 `.bashrc` 設了 `MSYS_NO_PATHCONV=1`，`cmd //c` 原樣抵達 cmd → 進互動模式（實測 stdin 關閉時：exit 0，輸出是 banner＋版權聲明＋提示符，第一行與 `ver` 幾乎同形；GBK 編碼，沒改寫時模型會把 banner 讀成 `ver` 的答案） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、貼緊的 `cmd//c` 都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動 |
 
 **刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
 （OpenCode 工具層自己解析正確，`workdir` 也實測可用）、`nul` 重導向（bash 原生行為）、
@@ -342,7 +342,7 @@ bash 映射到丟棄裝置；OpenCode 的 `/c/...` 由工具層處理、`nul` �
 | patch | `*** Update File: ${TEMP}/oc-m1.txt` + `*** Move to: ${TEMP}/oc-m2.txt` + hunk | 改名成功到真實 temp（內容 `alpha`/`gamma`/`beta`）；`Move to` 與 Add 是同一條 host 解析，未改寫會落到字面 `${TEMP}`（Add 已實測） |
 | patch | `*** Delete File: ${TEMP}/oc-m2.txt` | 刪掉真實 temp 的檔案；後續 `read` 回報該真實路徑 not found |
 | shell | `workdir: /tmp`、`command: pwd` | 修正前 `Working directory does not exist: C:\tmp`；修正後 `pwd` = `/tmp` |
-| shell | `cmd //c ver` | spawn 行為 `-c "cmd /c ver"`，輸出 `Microsoft Windows [版本 10.0.19045.7725]` |
+| shell | `cmd //c ver` | spawn 行為 `-c "cmd /c ver"`，輸出 `ver` 的正常單行（GBK 編碼，解碼後為 `Microsoft Windows [版本 10.0.19045.7725]`） |
 | shell | `cmd //c "echo hello world"` | `hello world`（引號與 payload 原樣抵達 cmd） |
 | shell | `cmd //c "echo one" && cmd //c "echo two"` | `one` / `two`（兩段都改寫、`&&` 交由 bash） |
 | shell | `v=$(cmd //c echo sub); echo "got:$v"` | `got:sub`（`$( )` 內也改寫） |

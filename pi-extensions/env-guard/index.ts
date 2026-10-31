@@ -30,7 +30,7 @@
 //   - 其他 cmd-ism（del、dir /b、robocopy //mir…）：不是所有 shell 語法都能無風險改寫
 //
 // 位置：~/.pi/agent/extensions/env-guard/index.ts（全域生效，jiti 直接跑 TS；
-// 也可整包用 pi install git:github.com/Artin0123/cmdc-mods 安裝）
+// 也可整包用 pi install git:github.com/Artin0123/harness-plugins 安裝）
 
 import * as os from "node:os";
 import * as path from "node:path";
