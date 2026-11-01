@@ -61,8 +61,8 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // 不直接信 os.tmpdir()：若 pi 是從 git-bash 啟動，TEMP 可能是 "/tmp" 這種
 // MSYS 映射值，Node 直接拿去用會再踩同樣的坑。但也不要預設 AppData 佈局：
@@ -772,6 +772,120 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
   return { command: out, cmdFlagFixed, sawCmd, nonAscii };
 }
 
+// ===== 使用統計 =====
+// 計數清單內工具的呼叫次數與各修復的觸發次數，量測外掛實際命中率。分類學
+// 與 OC 兄弟共用：
+//   分母  toolCalls[tool]——清單內工具每次呼叫 +1，且都在 gate 之後
+//        （非 win32 提前 return、handler 只在 gate 後註冊，所以
+//        統計範圍＝外掛實際作用的範圍）
+//   分子  fixes[key]——真的改寫/警告才 +1，以故障點為 key；同性質的
+//        variant 合併（/tmp、$TEMP、${TEMP}、%TEMP% 都是 "path.temp"；
+//        //c、多旗標都是 "shell.cmdFlag"），不同類型分開
+//        （shell.cmdNonAscii 是警告型「修復」，也記一筆）。
+// 儲存：pi 不提供 per-extension 儲存 API（docs/extensions.md 的 State 段：
+// session 外的資料＝external storage，由擴充自選），所以放 pi 自己的
+// agent 目錄——getAgentDir() 是 pi 官方匯出的路徑（吃 PI_CODING_AGENT_DIR
+// 覆蓋），不自己復刻路徑邏輯。檔案：~/.pi/agent/env-guard-stats.json，
+// 直接開檔即看。寫入：分子即時落盤（觸發低頻）、分母 5 秒 debounce
+// ＋session_shutdown 補冲；tmp+rename 避免讀到半截 JSON。任何失敗都
+// 吞掉：統計絕不能影響工具執行。
+
+const STATS_FILE = "env-guard-stats.json";
+
+interface Stats {
+  schema: 1;
+  since: string;
+  toolCalls: Record<string, number>;
+  fixes: Record<string, number>;
+}
+
+let stats: Stats | null = null;
+let statsFileCache: string | null | undefined; // undefined＝未解析；null＝解析失敗（只留記憶體計數）
+let statsTimer: ReturnType<typeof setTimeout> | undefined;
+
+function adoptCounts(saved: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (saved && typeof saved === "object") {
+    for (const [k, v] of Object.entries(saved as Record<string, unknown>)) {
+      const n = typeof v === "number" ? v : Number(v);
+      if (Number.isFinite(n) && n >= 0) out[k] = n;
+    }
+  }
+  return out;
+}
+
+export function statsSnapshot(): Stats | null {
+  return stats && { ...stats, toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
+}
+
+function statsFile(): string | null {
+  if (statsFileCache !== undefined) return statsFileCache;
+  statsFileCache = null;
+  try {
+    const dir = getAgentDir();
+    if (typeof dir === "string" && dir) statsFileCache = path.join(dir, STATS_FILE);
+  } catch {
+    /* pi API 不可用：只留記憶體計數 */
+  }
+  return statsFileCache;
+}
+
+// 讀檔-合併：沿用先前 run 累積的計數（jiti reload／新 session 的 module
+// 重新載入後，記憶體從零開始，不清掉歷史）
+function loadStats(): void {
+  if (stats) return;
+  const file = statsFile();
+  if (file) {
+    try {
+      const saved = JSON.parse(readFileSync(file, "utf8")) as Partial<Stats>;
+      if (saved && typeof saved === "object" && saved.schema === 1 && typeof saved.since === "string") {
+        stats = { schema: 1, since: saved.since, toolCalls: adoptCounts(saved.toolCalls), fixes: adoptCounts(saved.fixes) };
+        return;
+      }
+    } catch {
+      /* 不存在/讀不了/壞檔：重新開始 */
+    }
+  }
+  stats = { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
+}
+
+function persistStats(): void {
+  const file = statsFile();
+  if (!file || !stats) return;
+  try {
+    const tmp = file + ".tmp";
+    writeFileSync(tmp, JSON.stringify(stats, null, 2) + "\n", "utf8");
+    renameSync(tmp, file);
+  } catch {
+    /* 統計失敗不影響工具執行 */
+  }
+}
+
+function flushStats(): void {
+  if (statsTimer) {
+    clearTimeout(statsTimer);
+    statsTimer = undefined;
+  }
+  persistStats();
+}
+
+function bumpTool(tool: string): void {
+  loadStats();
+  if (!stats) return;
+  stats.toolCalls[tool] = (stats.toolCalls[tool] ?? 0) + 1;
+  if (!statsTimer) {
+    statsTimer = setTimeout(flushStats, 5000); // 分批：每次呼叫不該付一次磁碟寫入
+    statsTimer.unref?.(); // 不擋 pi 退出（session_shutdown 會補冲）
+  }
+}
+
+function bumpFix(key: string): void {
+  loadStats();
+  if (!stats) return;
+  stats.fixes[key] = (stats.fixes[key] ?? 0) + 1;
+  flushStats(); // 分子低頻：立即落盤
+}
+
 const notifyUI = (ctx: { hasUI: boolean; ui: { notify: (msg: string, level?: string) => void } }, msg: string, level: string) => {
   if (!ctx.hasUI) return;
   try {
@@ -799,6 +913,9 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
   });
+  // session 結束：把分母 debounce 還沒寫出的部分補冲
+  pi.on("session_shutdown", () => flushStats());
+
   pi.on("tool_call", (event, ctx) => {
     const name = event.toolName;
 
@@ -806,12 +923,14 @@ export default function (pi: ExtensionAPI) {
     //（grep/find/ls 同樣是 host 端解析（resolveToCwd），/tmp/$TEMP 也會出事，
     //  但它們是唯讀工具，失敗型態是「找不到目錄」大聲報錯——修掉是純獲益）
     if (name === "write" || name === "edit" || name === "read" || name === "grep" || name === "find" || name === "ls") {
+      bumpTool(name);
       const input = event.input as { path?: string };
       if (typeof input?.path === "string") {
         const rewritten = rewritePath(input.path);
         if (rewritten !== input.path) {
           const from = input.path;
           input.path = rewritten;
+          bumpFix("path.temp");
           notifyUI(
             ctx,
             `env-guard: path rewritten ${from} -> ${rewritten}`,
@@ -825,6 +944,7 @@ export default function (pi: ExtensionAPI) {
     // bash：cmd //c 旗標修正、cmd+非 ASCII 警告
     //（bash 內的 /tmp 經 MSYS 映射本來就正確，不需動）
     if (name === "bash") {
+      bumpTool("bash");
       const input = event.input as { command?: string };
       if (typeof input?.command === "string") {
         const r = rewriteBashCommand(input.command);
@@ -832,6 +952,7 @@ export default function (pi: ExtensionAPI) {
           input.command = r.command;
         }
         if (r.cmdFlagFixed) {
+          bumpFix("shell.cmdFlag");
           notifyUI(
             ctx,
             "env-guard: cmd //c flag rewritten to /c (MSYS_NO_PATHCONV is set, so msys path conversion is off and //c would start an interactive cmd)",
@@ -839,6 +960,7 @@ export default function (pi: ExtensionAPI) {
           );
         }
         if (r.cmdNonAscii) {
+          bumpFix("shell.cmdNonAscii");
           notifyUI(
             ctx,
             "env-guard: cmd + non-ASCII - measured: cmd writes output in the console code page (936/GBK here) while pi decodes stdout as UTF-8, so it arrives as mojibake; characters outside that code page become '?'. No faithful rewrite exists (injecting chcp 65001 is non-deterministic and switches built-in messages to English), so prefer bash-native tools or PowerShell-native commands for non-ASCII work",

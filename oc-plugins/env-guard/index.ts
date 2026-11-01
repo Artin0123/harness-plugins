@@ -765,24 +765,114 @@ function scanBash(command: string): string {
 
 const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
 
+// ---- usage telemetry -------------------------------------------------------
+// Counts how often the guarded tools actually run and which fixes fire, to
+// measure the plugin's real hit rate. Same taxonomy as the pi sibling:
+//   denominator  toolCalls[tool] -- one bump per guarded-tool call, POST-gate
+//     (the hooks only exist after the win32 + findBash gates pass, and the
+//     bash bump sits behind the MSYS shell check, so off-platform calls and
+//     foreign shells never inflate the base)
+//   numerator    fixes[key] -- one bump per actual rewrite, keyed by fault
+//     point; same-nature variants share one key (/tmp, $TEMP, ${TEMP},
+//     %TEMP% all count as "path.temp"; //c, //q //c and tight cmd//c all
+//     count as "shell.cmdFlag"), different kinds stay separate.
+//     OC-only keys: glob.tempPrefix, patch.tempLine, shell.workdir.temp.
+// Storage: ctx.storage (the host's official plugin-scoped durable JSON --
+// it lands in opencode.db's kv table; read it read-only with sqlite, never
+// by guessing at the db schema from the plugin). Numerators persist at once
+// (they are rare); denominators batch on a 5s debounce, and the setup
+// cleanup flushes what is pending. Every failure is swallowed: telemetry
+// must never change what a tool call does.
+
+const STATS_KEY = "stats";
+
+interface Stats {
+  schema: 1;
+  since: string;
+  toolCalls: Record<string, number>;
+  fixes: Record<string, number>;
+}
+
+let stats: Stats | null = null;
+let saveStats: ((s: Stats) => Promise<void>) | null = null;
+let statsTimer: ReturnType<typeof setTimeout> | undefined;
+
+function adoptCounts(saved: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (saved && typeof saved === "object") {
+    for (const [k, v] of Object.entries(saved as Record<string, unknown>)) {
+      const n = typeof v === "number" ? v : Number(v);
+      if (Number.isFinite(n) && n >= 0) out[k] = n;
+    }
+  }
+  return out;
+}
+
+export function statsSnapshot(): Stats | null {
+  return stats && { ...stats, toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
+}
+
+function flushStats(): void {
+  if (statsTimer) {
+    clearTimeout(statsTimer);
+    statsTimer = undefined;
+  }
+  const snap = statsSnapshot();
+  if (snap && saveStats) saveStats(snap).catch(() => { /* telemetry stays silent */ });
+}
+
+function bumpTool(tool: string): void {
+  if (!stats) return;
+  stats.toolCalls[tool] = (stats.toolCalls[tool] ?? 0) + 1;
+  if (!statsTimer) {
+    statsTimer = setTimeout(flushStats, 5000); // batched: every call must not pay an IPC round trip
+    statsTimer.unref?.(); // never keep a process alive just for telemetry
+  }
+}
+
+function bumpFix(key: string): void {
+  if (!stats) return;
+  stats.fixes[key] = (stats.fixes[key] ?? 0) + 1;
+  flushStats(); // numerators are rare: persist at once, nothing is lost on unload
+}
+
 export default Plugin.define({
   id: "env.guard",
   async setup(ctx) {
     if (process.platform !== "win32") return;
     if (!findBash()) return; // no MSYS bash: stay inert
 
+    // load-and-merge: adopt whatever an earlier run already counted; if the
+    // storage API itself misbehaves, counting continues in memory only
+    try {
+      const saved = (await ctx.storage.get(STATS_KEY)) as Partial<Stats> | undefined;
+      stats =
+        saved && typeof saved === "object" && saved.schema === 1 && typeof saved.since === "string"
+          ? { schema: 1, since: saved.since, toolCalls: adoptCounts(saved.toolCalls), fixes: adoptCounts(saved.fixes) }
+          : { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
+      saveStats = (s) => ctx.storage.set(STATS_KEY, s);
+    } catch {
+      stats = { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
+      saveStats = null;
+    }
+
     await ctx.tool.hook("execute.before", (event) => {
       const input = event.input as Record<string, unknown> | null;
       if (!input || typeof input !== "object") return;
       const tool = event.tool.toLowerCase();
       if (tool === "patch") {
+        bumpTool("patch");
         if (typeof input.patchText === "string") {
           const rewritten = rewritePatchText(input.patchText);
-          if (rewritten !== input.patchText) input.patchText = rewritten;
+          if (rewritten !== input.patchText) {
+            input.patchText = rewritten;
+            bumpFix("patch.tempLine");
+          }
         }
         return;
       }
       if (!PATH_TOOLS.has(tool)) return;
+      bumpTool(tool);
       // glob: a temp-prefixed pattern carries its own directory
       if (tool === "glob" && typeof input.pattern === "string") {
         const hasPath = typeof input.path === "string" && input.path !== "";
@@ -791,27 +881,40 @@ export default Plugin.define({
           if (split) {
             input.pattern = split.rest;
             input.path = split.dir;
+            bumpFix("glob.tempPrefix");
           }
         }
       }
       if (typeof input.path !== "string") return;
       const rewritten = rewritePath(input.path);
-      if (rewritten !== input.path) input.path = rewritten;
+      if (rewritten !== input.path) {
+        input.path = rewritten;
+        bumpFix("path.temp");
+      }
     });
 
     await ctx.shell.hook("create.before", (event) => {
       if (!isMsysShell(event.shell)) return;
+      bumpTool("bash");
       // `workdir` reaches this hook unresolved (`/tmp`) and the host checks it
       // with Windows semantics afterwards ("Working directory does not exist:
       // C:\tmp" -- measured), so the same temp forms rewrite to the anchor
       // bash itself uses. Independent of the //c gate below.
       if (typeof event.cwd === "string") {
         const cwd = rewritePath(event.cwd);
-        if (cwd !== event.cwd) event.cwd = cwd;
+        if (cwd !== event.cwd) {
+          event.cwd = cwd;
+          bumpFix("shell.workdir.temp");
+        }
       }
       if (!pathConvDisabled(event.shell)) return;
       const rewritten = rewriteBashCommand(event.command);
-      if (rewritten !== event.command) event.command = rewritten;
+      if (rewritten !== event.command) {
+        event.command = rewritten;
+        bumpFix("shell.cmdFlag");
+      }
     });
+
+    return () => flushStats(); // unload: flush what the debounce still holds
   },
 });

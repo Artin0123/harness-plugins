@@ -427,6 +427,98 @@ if (bash && gateOn) {
     JSON.stringify({ sent: sentAssign, status: r2.status, out: (r2.stdout?.toString() ?? '').slice(0, 80) }));
 }
 
+// --- usage telemetry: denominators post-gate, numerators per fix key ---
+// Fresh setup over an in-memory storage: the counters start at zero (the
+// H-block events above counted without persistence and are discarded by this
+// fresh load). The persisted value must round-trip: reload adopts it
+// (read-modify-write), a second run adds on top, malformed saved data is
+// coerced/dropped and never fatal, and a broken storage never breaks a call.
+const savedSets = [];
+const mkStatsCtx = (saved, broken = false) => {
+  const h = {};
+  const ctx = {
+    tool: { hook: (name, cb) => { h['tool:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
+    shell: { hook: (name, cb) => { h['shell:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
+    storage: {
+      get: async () => { if (broken) throw new Error('db down'); return saved; },
+      set: async (k, v) => { if (broken) throw new Error('db down'); savedSets.push(v); },
+    },
+  };
+  return { h, ctx };
+};
+
+const A = mkStatsCtx(undefined);
+const cleanupA = await mod.default.setup(A.ctx);
+const tA = A.h['tool:execute.before'];
+const sA = A.h['shell:create.before'];
+check('S: setup registers both hooks', !!tA && !!sA, Object.keys(A.h).join(','));
+
+await tA({ tool: 'read', input: { path: '/tmp/x' } });
+await tA({ tool: 'read', input: { path: 'plain.txt' } });
+await tA({ tool: 'webfetch', input: {} }); // outside the guard list: no denominator
+await tA({ tool: 'glob', input: { pattern: '${TEMP}/*.txt' } });
+await tA({ tool: 'patch', input: { patchText: '*** Add File: ${TEMP}/x\n' } });
+await sA({ shell: bash, cwd: '/tmp/sub', command: 'echo hi' }); // MSYS shell: bash denominator
+await sA({ shell: process.execPath, cwd: '/tmp/sub', command: 'cmd //c ver' }); // non-MSYS shell: skipped
+await sA({ shell: bash, cwd: '/tmp/sub', command: 'cmd //c ver' }); // cmd flag numerator
+
+const snapA = mod.statsSnapshot();
+check('S: denominators (read 2, glob 1, patch 1, bash 2)',
+  snapA.toolCalls.read === 2 && snapA.toolCalls.glob === 1 && snapA.toolCalls.patch === 1 && snapA.toolCalls.bash === 2,
+  JSON.stringify(snapA.toolCalls));
+check('S: unguarded tool not counted', snapA.toolCalls.webfetch === undefined, JSON.stringify(snapA.toolCalls));
+check('S: non-MSYS shell does not bump bash', snapA.toolCalls.bash === 2, JSON.stringify(snapA.toolCalls));
+check('S: path.temp numerator', snapA.fixes['path.temp'] === 1, JSON.stringify(snapA.fixes));
+check('S: glob.tempPrefix numerator', snapA.fixes['glob.tempPrefix'] === 1, JSON.stringify(snapA.fixes));
+check('S: patch.tempLine numerator', snapA.fixes['patch.tempLine'] === 1, JSON.stringify(snapA.fixes));
+check('S: shell.workdir.temp numerator (one per MSYS shell event)', snapA.fixes['shell.workdir.temp'] === 2, JSON.stringify(snapA.fixes));
+check('S: cmd flag numerator (gate-conditional)', snapA.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(snapA.fixes));
+
+await cleanupA(); // flushes the debounce queue
+await new Promise((r) => setTimeout(r, 10));
+check('S: cleanup flush persists', savedSets.length >= 1, JSON.stringify(savedSets.length));
+const persisted = savedSets[savedSets.length - 1];
+check('S: persisted value matches the snapshot',
+  persisted && persisted.schema === 1 &&
+  persisted.toolCalls.read === snapA.toolCalls.read &&
+  persisted.fixes['path.temp'] === snapA.fixes['path.temp'],
+  JSON.stringify(persisted));
+
+// reload adopts what was persisted (history survives a restart)
+const B = mkStatsCtx(persisted);
+const cleanupB = await mod.default.setup(B.ctx);
+const snapB = mod.statsSnapshot();
+check('S: reload adopts prior counts',
+  snapB.toolCalls.read === snapA.toolCalls.read && snapB.fixes['path.temp'] === snapA.fixes['path.temp'],
+  JSON.stringify(snapB));
+check('S: reload keeps the original since', snapB.since === persisted.since, JSON.stringify(snapB.since));
+await B.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/y' } });
+await cleanupB();
+await new Promise((r) => setTimeout(r, 10));
+check('S: second run adds on top (read-modify-write)',
+  savedSets[savedSets.length - 1].toolCalls.read === snapA.toolCalls.read + 1,
+  JSON.stringify(savedSets[savedSets.length - 1]));
+
+// malformed saved data: shape-checked and coerced, never fatal
+const C = mkStatsCtx({ schema: 1, since: 'SINCE', toolCalls: { read: '5', bad: -1 }, fixes: 'nope' });
+const cleanupC = await mod.default.setup(C.ctx);
+const snapC = mod.statsSnapshot();
+check('S: malformed counts coerced/dropped',
+  snapC.toolCalls.read === 5 && snapC.toolCalls.bad === undefined && Object.keys(snapC.fixes).length === 0,
+  JSON.stringify(snapC));
+check('S: malformed data keeps since', snapC.since === 'SINCE', JSON.stringify(snapC.since));
+await cleanupC();
+
+// broken storage: counting continues in memory, hooks still register,
+// cleanup survives the failed flush
+const D = mkStatsCtx(undefined, true);
+const cleanupD = await mod.default.setup(D.ctx);
+check('S: broken storage still registers hooks', !!D.h['tool:execute.before'], Object.keys(D.h).join(','));
+await D.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/z' } });
+check('S: in-memory counting survives a broken storage', mod.statsSnapshot().toolCalls.read === 1, JSON.stringify(mod.statsSnapshot().toolCalls));
+await cleanupD(); // must not throw
+check('S: cleanup with broken storage does not throw', true, '');
+
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== oc unit battery: ${pass} passed, ${failures.length} failed ===`);
 rmSync(scratch, {recursive: true, force: true});

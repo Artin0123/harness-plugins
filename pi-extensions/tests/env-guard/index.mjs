@@ -6,6 +6,15 @@
 // and asserts every documented guard plus every deliberately-not-fixed form,
 // so the "刻意不修" decisions stay pinned instead of drifting back.
 //
+// The source now has one runtime import only the host resolves
+// (getAgentDir from @earendil-works/pi-coding-agent). Like the OC battery,
+// the import is swapped for a stub and the source is loaded from a
+// throwaway copy in the system temp dir (nothing added to the repo).
+// EG_AGENT_DIR points the stub at a scratch agent dir so the stats
+// persistence is exercised without touching ~/.pi. Worker scenarios reuse
+// the scratch via EG_SCRATCH (their scrubbed envs make mkdtempSync
+// impossible, so the parent provides the dir).
+//
 // The cmd //c rewrite is gated on a probe of MSYS_NO_PATHCONV inside a spawned
 // bash, so its expected result depends on the machine: this box's bashrc sets
 // the variable (conversion off -> rewrite), a stock git-bash does not
@@ -18,10 +27,18 @@ import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
+import {readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync} from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const selfPath = fileURLToPath(import.meta.url);
-const mod = await import(pathToFileURL(join(here, '..', '..', 'env-guard', 'index.ts')).href);
+const srcPath = join(here, '..', '..', 'env-guard', 'index.ts');
+const src = readFileSync(srcPath, 'utf8').replace(
+  'import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+  'const getAgentDir = () => process.env.EG_AGENT_DIR ?? "";',
+);
+const scratch = process.env.EG_SCRATCH ?? mkdtempSync(join(tmpdir(), 'env-guard-pi-'));
+if (!process.env.EG_SCRATCH) writeFileSync(join(scratch, 'index.ts'), src, 'utf8');
+const mod = await import(pathToFileURL(join(scratch, 'index.ts')).href);
 
 // Probe/machine worker modes: cached results mean each scenario needs its own
 // process.
@@ -320,7 +337,7 @@ const envWithout = (...keys) => {
   return env;
 };
 const probe = (env) => {
-  const r = spawnSync(process.execPath, [selfPath, '--probe'], {env, encoding: 'utf8'});
+  const r = spawnSync(process.execPath, [selfPath, '--probe'], {env: {...env, EG_SCRATCH: scratch}, encoding: 'utf8'});
   return (r.stdout ?? '').trim();
 };
 check('P: probe false when MSYS_NO_PATHCONV unset', probe(envWithout('BASH_ENV', 'MSYS_NO_PATHCONV')) === 'false', probe(envWithout('BASH_ENV', 'MSYS_NO_PATHCONV')));
@@ -336,6 +353,7 @@ const noAnchor = JSON.parse(
   spawnSync(process.execPath, [selfPath, '--noanchor'], {
     env: {
       ...envWithout('BASH_ENV', 'MSYS_NO_PATHCONV'),
+      EG_SCRATCH: scratch,
       PATH: 'C:\\Windows\\system32',
       ProgramFiles: 'C:\\nope',
       'ProgramFiles(x86)': 'C:\\nope',
@@ -357,7 +375,7 @@ check(
 // Reading the host's own value is exact, not a guess: a configured non-MSYS
 // shell (pwsh/cmd/WSL) means neither rewrite applies at all.
 const shellRun = (shellPath) => JSON.parse(
-  spawnSync(process.execPath, [selfPath, '--shellpath', shellPath], {encoding: 'utf8'}).stdout.trim(),
+  spawnSync(process.execPath, [selfPath, '--shellpath', shellPath], {env: {...process.env, EG_SCRATCH: scratch}, encoding: 'utf8'}).stdout.trim(),
 );
 const nonMsys = (process.env.SystemRoot ?? 'C:\\Windows') + '\\System32\\cmd.exe';
 const cfgNonMsys = shellRun(nonMsys);
@@ -389,6 +407,40 @@ try {
   Object.defineProperty(process, 'platform', {value: realPlatformHook, configurable: true});
 }
 check('P: non-win32 registers no hook', hookRegistrations === 0, String(hookRegistrations));
+
+// --- usage stats: post-gate denominators, per-fix numerators, JSON file ---
+// EG_AGENT_DIR points the getAgentDir stub at a scratch agent dir; a
+// pre-existing stats file pins the read-modify-write merge (a restart must
+// adopt the old counts and add on top, never overwrite).
+const agentDir = join(scratch, 'agent');
+mkdirSync(agentDir, {recursive: true});
+const statsPath = join(agentDir, 'env-guard-stats.json');
+writeFileSync(statsPath, JSON.stringify({schema: 1, since: '2025-01-01T00:00:00.000Z', toolCalls: {read: 7}, fixes: {'path.temp': 3}}), 'utf8');
+process.env.EG_AGENT_DIR = agentDir;
+
+const registered = [];
+mod.default({ getSettings: () => ({}), on: (ev, fn) => registered.push([ev, fn]) });
+const toolCall = registered.find(([e]) => e === 'tool_call')?.[1];
+const shutdown = registered.find(([e]) => e === 'session_shutdown')?.[1];
+check('S: session_shutdown flush registered', typeof shutdown === 'function', JSON.stringify(registered.map(([e]) => e)));
+const uiCtx = { hasUI: false, ui: { notify: () => {} } };
+toolCall({ toolName: 'read', input: { path: '/tmp/x' } }, uiCtx);
+toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx);
+toolCall({ toolName: 'find', input: {} }, uiCtx);       // denominator even without a path field
+toolCall({ toolName: 'webfetch', input: {} }, uiCtx);   // outside the guard list: not counted
+toolCall({ toolName: 'bash', input: { command: 'cmd //c ver' } }, uiCtx);
+toolCall({ toolName: 'bash', input: { command: 'cmd /c echo 中文' } }, uiCtx); // warning-type fix counts
+shutdown({}, uiCtx); // flush what the debounce still holds
+
+const saved = JSON.parse(readFileSync(statsPath, 'utf8'));
+check('S: denominators merged with prior (read 9, find 1, bash 2)',
+  saved.toolCalls.read === 9 && saved.toolCalls.find === 1 && saved.toolCalls.bash === 2,
+  JSON.stringify(saved.toolCalls));
+check('S: unguarded tool not counted', saved.toolCalls.webfetch === undefined, JSON.stringify(saved.toolCalls));
+check('S: path.temp merged on top', saved.fixes['path.temp'] === 4, JSON.stringify(saved.fixes));
+check('S: cmd flag counted only when the gate is on', saved.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
+check('S: cmdNonAscii warning counted', saved.fixes['shell.cmdNonAscii'] === 1, JSON.stringify(saved.fixes));
+check('S: since preserved across runs', saved.since === '2025-01-01T00:00:00.000Z', JSON.stringify(saved.since));
 
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== pi unit battery: ${pass} passed, ${failures.length} failed (gate ${gateOn ? 'ON: path conversion disabled' : 'OFF: conversion enabled'}) ===`);
