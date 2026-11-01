@@ -78,13 +78,13 @@ cp -r oc-plugins/chat-trim-context ~/.config/opencode/plugins/
 指令安裝登記到全域 `~/.config/opencode/opencode.json` 的 `plugins`，實體安裝在
 `~/.cache/opencode/npm/git-<repo>-<hash>/<timestamp>/node_modules/`。以 `#master`
 跟隨 master 分支，`opencode plugin update env.guard` 更新到最新 commit（釘版本就用
-完整 commit hash）。管理指令：`opencode plugin list`（只列本地插件目錄的）／
-`check`（指令安裝的看這個，顯示插件 id 與所在 commit）／`remove`。
+完整 commit hash）。管理指令：`opencode plugin list`（列 id / commit / source，指令
+安裝的也在裡面；`--standalone` 看不到它們）／`check`（比對是否有可用更新）／`remove`。
 
-**安裝體積**（v2.2.5 實測）：每個插件 **1 個套件 / 42 KB**。插件本體不宣告任何
-依賴，也不 import `@opencode/plugin`（`define` 只是 identity 函式，各插件自己宣告
-一份）。這一點是必要的：`opencode plugin add` 抓完包會在安裝目錄跑一次 npm
-install，而 npm 會自動安裝 peer——先前那一行
+**安裝體積**（v2.2.5 實測）：每個插件 **1 個套件**，安裝目錄 12 KB（chat-trim-context）
+與 48 KB（env-guard）。插件本體不宣告任何依賴，也不 import `@opencode/plugin`
+（`define` 只是 identity 函式，各插件自己宣告一份）。這一點是必要的：`opencode plugin
+add` 抓完包會在安裝目錄跑一次 npm install，而 npm 會自動安裝 peer——先前那一行
 `peerDependencies: { "@opencode/plugin": "^2.2.0" }` 實測拖進 **273 個套件 /
 168 MB**（`effect` 57M、`@opentelemetry` 24M、`@opencode/*` 15M、`@redis` 12M…），
 且每次 add/update 都重來一次。`oc-plugins/tests/packaging/` 釘死這個形狀。
@@ -95,11 +95,14 @@ install，而 npm 會自動安裝 peer——先前那一行
   會隨更新次數單向長大，要自己刪。
 - `check` / `list` 問的是**執行中的 server**（`~/.cache/opencode/opencode-service-*.exe`，
   `service.json` 存密碼），不是磁碟：檔案刪掉後它們照樣列出舊結果（server 的 log 同時
-  已記 `Package is not installed`）。要讓答案反映現實，得重啟那個 server。
+  已記 `Package is not installed`），所以磁碟改動後要重啟那個 server 才會反映。反過來，
+  service 沒在跑時 `check` 會即時去拉起來，這一下可能趕不上載入而回「No package plugins
+  found」（實測：第一跑拿到空答案，再跑一次即列出真實 commit）。管理：
+  `opencode service status|stop`。
 
-本地檔案安裝（`plugins/` 目錄或 config 寫本地路徑）不需要任何 npm 安裝，插件現在也
-沒有執行期依賴，所以先前那個「本地檔 import `@opencode/plugin` 會 `ReferenceError`」
-的坑已經不存在。
+本地檔案安裝（`plugins/` 目錄，或 config 的 `plugins` 寫本地路徑——後者是官方 v2
+文件列出的形式，本機未實測）不需要任何 npm 安裝，插件現在也沒有執行期依賴，所以
+先前那個「本地檔 import `@opencode/plugin` 會 `ReferenceError`」的坑已經不存在。
 
 ---
 
