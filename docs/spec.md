@@ -94,17 +94,18 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 
 | 插件 package.json | 安裝結果 |
 | ----------------- | -------- |
-| `peerDependencies: { "@opencode/plugin": "^2.2.0" }` | 273 套件 / 168 MB（npm 自動安裝 peer，`@opencode/plugin` 自己依賴 `@opencode/{ai,client,protocol,schema,util}` + `effect`） |
-| 不宣告任何依賴（現況） | 1 套件 / 42 KB |
+| 宣告依賴（含 `peerDependencies`） | 整個依賴樹都會下來；以 `@opencode/plugin` 當 peer 實測 273 套件 / 168 MB（npm 自動安裝 peer，它自己依賴 `@opencode/{ai,client,protocol,schema,util}` + `effect`） |
+| 不宣告依賴（本 repo 的規則） | 1 套件；安裝目錄 12 KB（chat-trim-context）／48 KB（env-guard） |
 
 `Plugin.define` 是 identity（實裝 tarball 的 `dist/effect/plugin.js`：
 `export function define(plugin) { return plugin }`），所以插件自己宣告一份即可，不需要
-host 的執行期模組——先前本地 plugins 目錄安裝會 `ReferenceError: Plugin is not defined`，
-同一個原因，已消失。載入器只要求 default export 是帶 `id` / `setup` 的物件。
+host 的執行期模組；本地 plugins 目錄安裝也不必先裝任何套件。載入器只要求 default
+export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個形狀釘死（無依賴
+欄位、無 runtime import `@opencode/plugin`、default export 有 `id`/`setup`）。
 
-附帶事實：每次 add/update 會新增 `~/.cache/opencode/npm/<key>/<timestamp>/`，舊目錄不
-自動清除；`check` / `list` 由執行中的 server 回答（記憶體中的 registry），與磁碟狀態
-無關，server 沒重啟就不會反映刪檔。
+每次 add/update 會新增 `~/.cache/opencode/npm/<key>/<timestamp>/`，舊目錄不自動清除；
+`check` / `list` 由執行中的 server 回答（記憶體中的 registry），與磁碟狀態無關，server
+沒重啟就不會反映刪檔。
 
 ## oc 版：接線與閘門
 

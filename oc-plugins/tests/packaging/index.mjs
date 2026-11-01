@@ -3,17 +3,13 @@
 //   node oc-plugins/tests/packaging/index.mjs
 //
 // `opencode plugin add` fetches the package and then runs an npm install into
-// ~/.cache/opencode/npm/<key>/<timestamp>/ -- so every dependency declared in
-// the plugin's package.json is downloaded again on each add/update. A peer on
-// @opencode/plugin was measured at 273 packages / 168 MB per install (v2.2.5,
-// this machine): npm auto-installs peers, and that package depends on
-// @opencode/{ai,client,protocol,schema,util} + effect/@opentelemetry/@redis.
+// ~/.cache/opencode/npm/<key>/<timestamp>/, so every dependency declared here is
+// downloaded again on each add/update (npm auto-installs peers: a peer on
+// @opencode/plugin measured 273 packages / 168 MB per install, v2.2.5).
 //
-// What the plugin actually needs from the host is one identity function,
-// `define` (`export function define(plugin) { return plugin }`, read from the
-// installed 2.2.5 tarball), which each plugin now declares itself. This
-// battery pins that shape: no runtime dependency fields, no runtime import of
-// the host package, and a default export the loader can consume as-is.
+// The rule these checks pin: no dependency fields, no runtime import of the host
+// package (its `define` is identity and each plugin declares its own), and a
+// default export of the shape the loader consumes (`{ id, setup }`).
 import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {existsSync, readFileSync} from 'node:fs';
