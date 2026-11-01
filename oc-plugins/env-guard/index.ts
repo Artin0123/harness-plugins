@@ -59,8 +59,8 @@
 //     `rm ./nul` removes it.
 //   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled (measured;
 //     the same run that printed the version also produced the mojibake);
-//     there is no faithful rewrite (the pi sibling only warns) and the
-//     mojibake itself is the visible, self-correcting signal.
+//     there is no faithful rewrite and the mojibake itself is the visible,
+//     self-correcting signal.
 //
 // Scope discipline: NATIVE EXECUTION WINS -- agent errors and syntax that
 // fails under its own native execution are left loud. Uncertainty resolves to

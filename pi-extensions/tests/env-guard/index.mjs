@@ -314,13 +314,10 @@ check('P: nul forms untouched (deliberate)', nul.command === 'a 2>nul & b &>nul'
 const paramExp = bc('echo "${x//c/d}"');
 check('P: ${x//c/d} untouched', paramExp.command === 'echo "${x//c/d}"', JSON.stringify(paramExp));
 
-// --- cmd + non-ASCII detection ---
-const cn = bc('cmd /c echo 中文');
-check('P: cmd+nonASCII flagged', cn.cmdNonAscii === true, JSON.stringify(cn));
-const noCn = bc('echo 中文');
-check('P: plain nonASCII not flagged', noCn.cmdNonAscii === false, JSON.stringify(noCn));
-const cnData = bc('echo cmd 中文');
-check('P: cmd-in-data not flagged', cnData.cmdNonAscii === false, JSON.stringify(cnData));
+// --- 非 ASCII：不偵測、不改寫，命令原樣通過（兩個 gate 狀態都一樣） ---
+const cnPass = bc('cmd /c echo 中文');
+check('P: non-ASCII command passed through untouched',
+  cnPass.command === 'cmd /c echo 中文' && !cnPass.cmdFlagFixed, JSON.stringify(cnPass));
 
 // --- pathConvDisabled: MSYS disables conversion when the variable is *set* ---
 // Measured with a native Windows program's argv: //c arrives as /c when the
@@ -429,7 +426,7 @@ toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx);
 toolCall({ toolName: 'find', input: {} }, uiCtx);       // denominator even without a path field
 toolCall({ toolName: 'webfetch', input: {} }, uiCtx);   // outside the guard list: not counted
 toolCall({ toolName: 'bash', input: { command: 'cmd //c ver' } }, uiCtx);
-toolCall({ toolName: 'bash', input: { command: 'cmd /c echo 中文' } }, uiCtx); // warning-type fix counts
+toolCall({ toolName: 'bash', input: { command: 'cmd /c echo 中文' } }, uiCtx); // 非 ASCII：不偵測不改寫，命令原樣通過
 shutdown({}, uiCtx); // flush what the debounce still holds
 
 const saved = JSON.parse(readFileSync(statsPath, 'utf8'));
@@ -439,7 +436,7 @@ check('S: denominators merged with prior (read 9, find 1, bash 2)',
 check('S: unguarded tool not counted', saved.toolCalls.webfetch === undefined, JSON.stringify(saved.toolCalls));
 check('S: path.temp merged on top', saved.fixes['path.temp'] === 4, JSON.stringify(saved.fixes));
 check('S: cmd flag counted only when the gate is on', saved.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
-check('S: cmdNonAscii warning counted', saved.fixes['shell.cmdNonAscii'] === 1, JSON.stringify(saved.fixes));
+check('S: non-ASCII command untouched (no detection, no count)', saved.fixes['shell.cmdNonAscii'] === undefined, JSON.stringify(saved.fixes));
 check('S: since preserved across runs', saved.since === '2025-01-01T00:00:00.000Z', JSON.stringify(saved.since));
 check('S: no tmp leftovers after flush (per-PID tmp is renamed away)', readdirSync(agentDir).filter((f) => f.endsWith('.tmp')).length === 0, JSON.stringify(readdirSync(agentDir)));
 

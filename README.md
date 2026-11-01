@@ -168,21 +168,21 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法不同：
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                          |
 | `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫 |
-| cmd + 非 ASCII                                        | 實測 cmd 輸入端在 ANSI 轉換時已毀損、輸出非 UTF-8，無法忠實改寫 → 發警告，建議改用 bash 原生工具或 PowerShell 原生命令                           |
 
 **刻意不修**（原生行為或模型自身錯誤，讓它壞）：`C:\tmp`（原生寫入會成功）、
 MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析層原生正確映射）、裸
 `>nul`/`&>nul`/`<nul`/`2>&nul`/`<&nul`、其他 cmd-ism（`del`、`dir /b`、
 `robocopy //mir`…）、原生 exe 的 posix 路徑參數（`python /tmp/x.py`——大聲失敗，
-agent 可用 `cygpath -w` 自癒）。完整理由見 spec。
+agent 可用 `cygpath -w` 自癒）、cmd 的非 ASCII 亂碼（無忠實改寫，亂碼本身就是
+可見、可自矯正的訊號）。完整理由見 spec。
 
-通知前綴 `env-guard:`；改寫與警告都用 `ctx.ui.notify`，不擋工具執行。
+通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
 
 ### 使用統計
 
 統計清單內工具的呼叫次數（分母 `toolCalls`）與各修復的觸發次數（分子
 `fixes`）：`path.temp`（各種 temp 寫法合計）、`shell.cmdFlag`（`//c` 多旗標
-合計）、`shell.cmdNonAscii`（警告型）。分類學與 OC 版共用，可直接對照。
+合計）。分類學與 OC 版共用，可直接對照。
 
 儲存：`~/.pi/agent/env-guard-stats.json`（pi 官方 agent 目錄，吃
 `PI_CODING_AGENT_DIR` 覆蓋），**直接開檔即看**：

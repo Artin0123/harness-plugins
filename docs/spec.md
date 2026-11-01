@@ -59,8 +59,6 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗
   不改寫。**實測**：pi 的 bash 經 `BASH_ENV` 一樣載入 bashrc、病理重現——banner 與
   `ver` 輸出幾乎同形，無修復時模型會把 banner 誤讀成指令結果（靜默錯誤答案）。
-- cmd + 非 ASCII：實測 cmd 輸入端在 ANSI 轉換時已毀損、輸出非 UTF-8，無法忠實改寫
-  → 發警告，建議改用 bash 原生工具或 PowerShell 原生命令。
 
 ### 刻意不修（完整理由）
 
@@ -80,8 +78,12 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   了對原生程式 argv 的路徑轉換，原生 exe 收到字面 `/tmp/...` 找不到檔；大聲失敗，
   agent 可用 `cygpath -w` 自癒。全面改寫 argv 會誤傷依賴 posix 形式的 MSYS 工具
   參數，誤修風險大於漏修。
+- **cmd 的非 ASCII 亂碼**——cmd 照 console code page（本機 936＝GBK）編碼輸出、
+  host 以 UTF-8 解碼 → 中文變亂碼。無忠實改寫：注入 `chcp 65001` 實測非確定性
+  （同命令有時 UTF-8 有時仍 GBK）且會把內建訊息切英文；治本在 host 的解碼層
+  （權限外）。亂碼本身是可見訊號，模型可自矯正（改用 bash 原生工具）。
 
-通知前綴 `env-guard:`；改寫與警告都用 `ctx.ui.notify`，不擋工具執行。
+通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
 
 ## oc 版：接線與閘門
 
@@ -154,11 +156,10 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 | `patch.tempLine`     | patch 指令行改寫（oc）      | 同上                                                      |
 | `shell.workdir.temp` | shell `workdir` 改寫（oc）  | 同上                                                      |
 | `shell.cmdFlag`      | cmd `//x` → `/x`            | `//c`、`//k`、多旗標、緊貼形全算同一種                    |
-| `shell.cmdNonAscii`  | cmd+非 ASCII 警告（pi）     | 一種（警告型「修復」也記）                                |
 
 - **分母** `toolCalls[tool]`：清單內工具每次呼叫 +1，且都在 gate 之後——統計範圍
   ＝外掛實際作用的範圍（非 win32／無 MSYS bash 時整體 inert，不灌水）。
-- **分子** `fixes[key]`：真的改寫／警告才 +1，以故障點為 key；同性質 variant 合併、
+- **分子** `fixes[key]`：真的改寫才 +1，以故障點為 key；同性質 variant 合併、
   不同類型分開。
 
 ### 儲存（各走官方機制）

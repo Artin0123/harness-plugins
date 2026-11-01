@@ -383,14 +383,6 @@ export function rewritePath(p: string): string {
 //      此故障在「本機轉換層被 MSYS_NO_PATHCONV 關閉（存在即停用）」，模型語法（git-bash
 //      官方慣用法）與 cmd.exe 本身都無錯。將來若有別的工具出現「自然使用＋
 //      故障可歸因於本機環境層＋靜默失敗」三條全中的實例，再按同一標準納入。
-//   2. 偵測「cmd + 非 ASCII」：只警告、不改寫。實測機制：cmd 的輸出照 console
-//      code page（本機 936＝GBK）編碼，pi 的 bash-executor 一律以 UTF-8 解碼 stdout
-//      → 中文變亂碼；argv 反而會正確送達（`type 中文.txt` 讀得到、`dir /b 中文*`
-//      匹配得到），只有該 code page 表示不了的字（emoji）變 '?'。不可在命令層修：
-//      注入 `chcp 65001` 實測不忠實（同一條命令有時輸出 UTF-8、有時仍是 GBK，
-//      且會把內建訊息語言切掉：ver 的「版本」變 "Version"）；tool_result 拿到的
-//      又是 host 解碼後的文字（原始 bytes 已遺失）→ 正確修法在 host 的解碼層（權限
-//      外），所以維持只警告。
 // 語法感知規則：
 //   - 單引號/雙引號內的字面「> nul」是資料，不動（cmd //c "dir > nul" 引號內交給 cmd）
 //   - heredoc 本體是資料，不動；結束標記行整行原樣跳過（同列殘字非標記，bash 會視為本體）
@@ -411,12 +403,9 @@ export function rewritePath(p: string): string {
 //     ——由「`(` 前一字元」與 commit 後的指令位置天然分流；`foo( … )` 函式
 //     定義維持 true；群組 `( … ) word` 原生就是語法錯誤 → false
 //   - 2>&1 的 & 不是分隔符（前一字元是 > ）
-//   - cmdNonAscii 是全命令掃描（不是只看 cmd 的 argv）：`echo 中文; cmd /c ver`
-//     也會報警告。只是提示、不改命令，所以容忍這個誤報而不另做區間追蹤。
 export interface BashScanResult {
   command: string;
   cmdFlagFixed: boolean;  // cmd //c|//k 被改寫為 /c|/k
-  cmdNonAscii: boolean;   // 指令位置的 cmd + 非 ASCII（僅警告）
 }
 
 export function rewriteBashCommand(command: string): BashScanResult {
@@ -424,11 +413,10 @@ export function rewriteBashCommand(command: string): BashScanResult {
   return {
     command: r.command,
     cmdFlagFixed: r.cmdFlagFixed,
-    cmdNonAscii: r.sawCmd && r.nonAscii,
   };
 }
 
-function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii: boolean } {
+function scanBash(command: string): BashScanResult {
   // heredoc 定界符是 bash 的 word：加引號時可含任意內容（`<<'END OF FILE'`，
   // 終止行去引號比對），也可寫成 `<<\EOF`（跳脫＝字面化，定界符是 EOF）。
   // 辨識不到就會把本體當指令掃描（＝改到資料）；起始字仍限字母/底線，
@@ -437,7 +425,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
   // POSIX 語法關鍵字：固定集合（bash 語法），不是「猜哪些程式會轉發指令」
   const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|[{}!])$/;
-  const nonAsciiRe = /[^\x00-\x7F]/;
   let out = "";
   let i = 0;
   const n = command.length;
@@ -445,8 +432,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
   let pendingStripTabs = false; // <<- ：終止符行先去掉前導 tab 再比（bash 只去 tab，不去空白）
   let inHeader = false;
   let cmdFlagFixed = false;
-  let sawCmd = false;
-  let nonAscii = false;
   // token 追蹤：判斷 cmd 是否在「指令位置」（可執行處），避免改到字面資料
   let curTok = "";
   let prevTok = "";
@@ -490,7 +475,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
     if (cmdPosNext) {
-      sawCmd = sawCmd || isCmdTok(curTok);
       // FOO=bar 環境變數前綴、與 if/while/{/! 等語法關鍵字都不結束指令位置
       cmdPosNext = RESERVED_WORD.test(curTok) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok);
     }
@@ -524,8 +508,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
         const sub = scanBash(seg.slice(k + 2, close));
         s += "$(" + sub.command + ")";
         cmdFlagFixed ||= sub.cmdFlagFixed;
-        sawCmd ||= sub.sawCmd;
-        nonAscii ||= sub.nonAscii;
         k = close + 1;
         continue;
       }
@@ -542,8 +524,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
         const sub = scanBash(seg.slice(k + 1, p));
         s += "`" + sub.command + "`";
         cmdFlagFixed ||= sub.cmdFlagFixed;
-        sawCmd ||= sub.sawCmd;
-        nonAscii ||= sub.nonAscii;
         k = p + 1;
         continue;
       }
@@ -588,7 +568,6 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
     }
     if (ch === "\\") {
       const seg = command.slice(i, i + 2);
-      if (nonAsciiRe.test(seg)) nonAscii = true;
       out += seg;
       curTok += seg; // 跳脫字元屬於當前詞（\> 不構成運算子）
       i += 2;
@@ -599,12 +578,10 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
       const end = command.indexOf("'", i + 1);
       if (end === -1) {
         const seg = command.slice(i);
-        if (nonAsciiRe.test(seg)) nonAscii = true;
         out += seg;
         break;
       }
       const seg = command.slice(i, end + 1);
-      if (nonAsciiRe.test(seg)) nonAscii = true; // 引號內非 ASCII 仍會抵達 cmd（cmd /c "echo 中文"）
       out += seg;
       i = end + 1;
       continue;
@@ -640,12 +617,10 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
       }
       if (j >= n) {
         const seg = command.slice(i);
-        if (nonAsciiRe.test(seg)) nonAscii = true;
         out += scanDq(seg); // 未閉合引號內的 $() 同樣會執行
         break;
       }
       const seg = command.slice(i, j + 1);
-      if (nonAsciiRe.test(seg)) nonAscii = true;
       out += scanDq(seg);
       i = j + 1;
       continue;
@@ -764,12 +739,11 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
       i++;
       continue;
     }
-    if (nonAsciiRe.test(ch)) nonAscii = true;
     curTok += ch;
     out += ch;
     i++;
   }
-  return { command: out, cmdFlagFixed, sawCmd, nonAscii };
+  return { command: out, cmdFlagFixed };
 }
 
 // ===== 使用統計 =====
@@ -778,10 +752,9 @@ function scanBash(command: string): BashScanResult & { sawCmd: boolean; nonAscii
 //   分母  toolCalls[tool]——清單內工具每次呼叫 +1，且都在 gate 之後
 //        （非 win32 提前 return、handler 只在 gate 後註冊，所以
 //        統計範圍＝外掛實際作用的範圍）
-//   分子  fixes[key]——真的改寫/警告才 +1，以故障點為 key；同性質的
+//   分子  fixes[key]——真的改寫才 +1，以故障點為 key；同性質的
 //        variant 合併（/tmp、$TEMP、${TEMP}、%TEMP% 都是 "path.temp"；
-//        //c、多旗標都是 "shell.cmdFlag"），不同類型分開
-//        （shell.cmdNonAscii 是警告型「修復」，也記一筆）。
+//        //c、多旗標都是 "shell.cmdFlag"），不同類型分開。
 // 儲存：pi 不提供 per-extension 儲存 API（docs/extensions.md 的 State 段：
 // session 外的資料＝external storage，由擴充自選），所以放 pi 自己的
 // agent 目錄——getAgentDir() 是 pi 官方匯出的路徑（吃 PI_CODING_AGENT_DIR
@@ -901,7 +874,7 @@ const notifyUI = (ctx: { hasUI: boolean; ui: { notify: (msg: string, level?: str
 
 export default function (pi: ExtensionAPI) {
   // 故障點全部是 Windows 的（host 端路徑解析、MSYS 轉換層）：非 Windows 整個擴充
-  // 停用，連 cmd+非 ASCII 警告也不發（那種機器上沒有 cmd.exe）
+  // 停用（那種機器上沒有 cmd.exe）
   if (process.platform !== "win32") return;
   // 探測對象＝ pi 自己配置的 shell（settings.shellPath）；有設就只信它，
   // 沒設才退回 findBash() 的掃描。這樣就不必「假設」pi 會 spawn 哪顆 bash。
@@ -941,7 +914,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // bash：cmd //c 旗標修正、cmd+非 ASCII 警告
+    // bash：cmd //c 旗標修正
     //（bash 內的 /tmp 經 MSYS 映射本來就正確，不需動）
     if (name === "bash") {
       bumpTool("bash");
@@ -957,14 +930,6 @@ export default function (pi: ExtensionAPI) {
             ctx,
             "env-guard: cmd //c flag rewritten to /c (MSYS_NO_PATHCONV is set, so msys path conversion is off and //c would start an interactive cmd)",
             "info",
-          );
-        }
-        if (r.cmdNonAscii) {
-          bumpFix("shell.cmdNonAscii");
-          notifyUI(
-            ctx,
-            "env-guard: cmd + non-ASCII - measured: cmd writes output in the console code page (936/GBK here) while pi decodes stdout as UTF-8, so it arrives as mojibake; characters outside that code page become '?'. No faithful rewrite exists (injecting chcp 65001 is non-deterministic and switches built-in messages to English), so prefer bash-native tools or PowerShell-native commands for non-ASCII work",
-            "warning",
           );
         }
       }
