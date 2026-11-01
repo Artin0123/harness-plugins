@@ -1,6 +1,6 @@
 {
 	"name": "harness-plugins-opencode",
-	"version": "0.6.0",
+	"version": "0.6.1",
 	"description": "OpenCode v2 plugin 版：chat-trim-context（送出模型請求前清理系統提示）與 env-guard（Windows 下檔案工具路徑與 cmd //c 修復）。",
 	"keywords": ["opencode-plugin"],
 	"type": "module",

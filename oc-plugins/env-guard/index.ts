@@ -796,6 +796,7 @@ interface Stats {
 let stats: Stats | null = null;
 let saveStats: ((s: Stats) => Promise<void>) | null = null;
 let statsTimer: ReturnType<typeof setTimeout> | undefined;
+let statsWrite: Promise<void> = Promise.resolve(); // serialization tail: sets must not land out of order
 
 function adoptCounts(saved: unknown): Record<string, number> {
   const out: Record<string, number> = {};
@@ -812,13 +813,21 @@ export function statsSnapshot(): Stats | null {
   return stats && { ...stats, toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
 }
 
-function flushStats(): void {
+function flushStats(): Promise<void> {
   if (statsTimer) {
     clearTimeout(statsTimer);
     statsTimer = undefined;
   }
   const snap = statsSnapshot();
-  if (snap && saveStats) saveStats(snap).catch(() => { /* telemetry stays silent */ });
+  if (snap && saveStats) {
+    // chain onto the previous write: a debounced flush and an immediate
+    // numerator flush can overlap, and two racing .set calls could otherwise
+    // persist the older snapshot last (last-writer-wins with stale data)
+    statsWrite = statsWrite
+      .then(() => saveStats!(snap))
+      .catch(() => { /* telemetry stays silent */ });
+  }
+  return statsWrite;
 }
 
 function bumpTool(tool: string): void {
@@ -915,6 +924,9 @@ export default Plugin.define({
       }
     });
 
-    return () => flushStats(); // unload: flush what the debounce still holds
+    // unload: flush what the debounce still holds. Cleanup is typed
+    // `() => Promise<void> | void` in @opencode/plugin -- returning the
+    // promise lets the host await the final write instead of racing it.
+    return () => flushStats();
   },
 });

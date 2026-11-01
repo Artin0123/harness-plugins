@@ -172,20 +172,27 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 - **pi**：pi 不提供 per-extension 儲存 API（`docs/extensions.md` 的 State 段：
   session 外的資料＝external storage，由擴充自選），放官方 agent 目錄——
   `getAgentDir()/env-guard-stats.json`（官方匯出的路徑，吃 `PI_CODING_AGENT_DIR`
-  覆蓋），不自己復刻路徑邏輯。
+  覆蓋），不自己復刻路徑邏輯。**實測歸屬**：`getAgentDir` 是 runtime export 且回傳
+  `C:\Users\artin\.pi\agent`、`session_shutdown` 見於官方 `docs/extensions.md`
+  ——兩者都對照安裝中的 `@earendil-works/pi-coding-agent` 1.4.0（`require` 實跑＋
+  dist 內 grep）驗證過；測試電池 stub 掉了這兩個 API，故在此另記實測。
 
 ### 寫入時機與安全
 
 - 分子（修復觸發）**即時落盤**——觸發低頻，一次小寫入可接受，unload/reload 不掉資料。
 - 分母（工具呼叫）**in-memory 累加 + 5 秒 debounce**（每次呼叫不該付一次 IPC／磁碟
   寫入；timer `unref` 不擋退出），pi 在 `session_shutdown`、oc 在 setup cleanup
-  （插件卸載）補冲。
+  （插件卸載）補冲。oc 的 cleanup 回傳 promise（官方 `@opencode/plugin` dist 的
+  `Cleanup = () => Promise<void> | void`），host 可以等到最後一筆寫入完成。
 - **讀檔-合併-寫入**：jiti reload／新 session 的 module 重新載入、或 opencode 重啟
   後，沿用先前累積的計數，不清零、不覆蓋。
-- pi 寫檔用 tmp+rename，避免讀到半截 JSON。
+- pi 寫檔用 tmp+rename，避免讀到半截 JSON；tmp 檔名帶 PID（多個 session 並存時
+  不會 rename 走彼此寫到一半的檔）。
 - **任何統計失敗都吞掉**：先做完原有改寫再計數；storage 壞掉時 hook 照常註冊、
   改寫照常運作、cleanup 不拋錯；壞檔／畸形資料 shape-check + 數值轉換，絕不致命。
-- oc 的 `ctx.storage.set` fire-and-forget（catch 錯誤、不 await 修復路徑）。
+- oc 的 `ctx.storage.set` 寫入序列化（鏈在前一筆之後）：debounce flush 與分子
+  即時 flush 可能重疊，兩個 racing 的 `set` 可能把舊快照最後落盤；錯誤照樣吞掉，
+  修復路徑不 await。
 
 ## oc 版：實測記錄（v2.2.5，一次乾淨對話）
 

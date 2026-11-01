@@ -441,7 +441,9 @@ const mkStatsCtx = (saved, broken = false) => {
     shell: { hook: (name, cb) => { h['shell:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     storage: {
       get: async () => { if (broken) throw new Error('db down'); return saved; },
-      set: async (k, v) => { if (broken) throw new Error('db down'); savedSets.push(v); },
+      // 5ms delay: a cleanup that does not await its write cannot pass the
+      // persistence assertions below without the old sleep-after-cleanup hack
+      set: async (k, v) => { await new Promise((r) => setTimeout(r, 5)); if (broken) throw new Error('db down'); savedSets.push(v); },
     },
   };
   return { h, ctx };
@@ -474,10 +476,9 @@ check('S: patch.tempLine numerator', snapA.fixes['patch.tempLine'] === 1, JSON.s
 check('S: shell.workdir.temp numerator (one per MSYS shell event)', snapA.fixes['shell.workdir.temp'] === 2, JSON.stringify(snapA.fixes));
 check('S: cmd flag numerator (gate-conditional)', snapA.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(snapA.fixes));
 
-await cleanupA(); // flushes the debounce queue
-await new Promise((r) => setTimeout(r, 10));
-check('S: cleanup flush persists', savedSets.length >= 1, JSON.stringify(savedSets.length));
-const persisted = savedSets[savedSets.length - 1];
+await cleanupA(); // the returned promise must cover the final write (Cleanup = () => Promise<void> | void)
+check('S: awaited cleanup flush persists (no sleep after cleanup)', savedSets.length >= 1, JSON.stringify(savedSets.length));
+const persisted = savedSets[savedSets.length - 1] ?? null; // null when the cleanup write never landed (old fire-and-forget bug)
 check('S: persisted value matches the snapshot',
   persisted && persisted.schema === 1 &&
   persisted.toolCalls.read === snapA.toolCalls.read &&
@@ -491,12 +492,11 @@ const snapB = mod.statsSnapshot();
 check('S: reload adopts prior counts',
   snapB.toolCalls.read === snapA.toolCalls.read && snapB.fixes['path.temp'] === snapA.fixes['path.temp'],
   JSON.stringify(snapB));
-check('S: reload keeps the original since', snapB.since === persisted.since, JSON.stringify(snapB.since));
+check('S: reload keeps the original since', snapB.since === persisted?.since, JSON.stringify(snapB.since));
 await B.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/y' } });
-await cleanupB();
-await new Promise((r) => setTimeout(r, 10));
+await cleanupB(); // awaited: the +1 read must be persisted when this resolves
 check('S: second run adds on top (read-modify-write)',
-  savedSets[savedSets.length - 1].toolCalls.read === snapA.toolCalls.read + 1,
+  savedSets[savedSets.length - 1]?.toolCalls.read === snapA.toolCalls.read + 1,
   JSON.stringify(savedSets[savedSets.length - 1]));
 
 // malformed saved data: shape-checked and coerced, never fatal

@@ -853,7 +853,7 @@ function persistStats(): void {
   const file = statsFile();
   if (!file || !stats) return;
   try {
-    const tmp = file + ".tmp";
+    const tmp = `${file}.${process.pid}.tmp`; // per-PID: concurrent sessions must not rename each other's half-written file
     writeFileSync(tmp, JSON.stringify(stats, null, 2) + "\n", "utf8");
     renameSync(tmp, file);
   } catch {

@@ -1,6 +1,6 @@
 {
 	"name": "harness-plugins-pi",
-	"version": "0.5.0",
+	"version": "0.5.1",
 	"description": "env-guard（Windows 下 bash 工具的 cmd //c 與檔案路徑修復）的 pi extension 版。",
 	"keywords": ["pi-package", "pi-extension"],
 	"type": "module",

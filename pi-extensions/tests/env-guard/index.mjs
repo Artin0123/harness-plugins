@@ -27,7 +27,7 @@ import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
-import {readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync} from 'node:fs';
+import {readFileSync, writeFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync} from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const selfPath = fileURLToPath(import.meta.url);
@@ -441,6 +441,7 @@ check('S: path.temp merged on top', saved.fixes['path.temp'] === 4, JSON.stringi
 check('S: cmd flag counted only when the gate is on', saved.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
 check('S: cmdNonAscii warning counted', saved.fixes['shell.cmdNonAscii'] === 1, JSON.stringify(saved.fixes));
 check('S: since preserved across runs', saved.since === '2025-01-01T00:00:00.000Z', JSON.stringify(saved.since));
+check('S: no tmp leftovers after flush (per-PID tmp is renamed away)', readdirSync(agentDir).filter((f) => f.endsWith('.tmp')).length === 0, JSON.stringify(readdirSync(agentDir)));
 
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== pi unit battery: ${pass} passed, ${failures.length} failed (gate ${gateOn ? 'ON: path conversion disabled' : 'OFF: conversion enabled'}) ===`);
