@@ -164,11 +164,11 @@ sub-agent 也拿不到。改常數後 `/mods reload`（或新 session）生效�
 
 pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法不同：
 
-| 項目                                                  | pi 版做法                                                                                                                                                                   |
-| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                                                    |
-| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫                            |
-| cmd + 非 ASCII                                        | 實測 cmd 輸入端在 ANSI 轉換時已毀損、輸出非 UTF-8，無法忠實改寫 → 發警告，建議改用 bash 原生工具或 PowerShell 原生命令                                                      |
+| 項目                                                  | pi 版做法                                                                                                                                        |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                          |
+| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫 |
+| cmd + 非 ASCII                                        | 實測 cmd 輸入端在 ANSI 轉換時已毀損、輸出非 UTF-8，無法忠實改寫 → 發警告，建議改用 bash 原生工具或 PowerShell 原生命令                           |
 
 **刻意不修**（原生行為或模型自身錯誤，讓它壞）：`C:\tmp`（原生寫入會成功）、
 MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析層原生正確映射）、裸
@@ -242,6 +242,15 @@ con = sqlite3.connect("file:" + os.path.expanduser("~/.local/share/opencode/open
 for k, v in con.execute("SELECT key, value FROM kv WHERE value LIKE '%toolCalls%'"):
     print(k, "=>", v)
 EOF
+```
+
+```powershell
+@'
+import sqlite3, os
+con = sqlite3.connect("file:" + os.path.expanduser("~/.local/share/opencode/opencode.db") + "?mode=ro", uri=True)
+for k, v in con.execute("SELECT key, value FROM kv WHERE value LIKE '%toolCalls%'"):
+    print(k, "=>", v)
+'@ | py -
 ```
 
 分子（修復觸發）即時持久化，重啟不清零；統計失敗不影響工具執行（儲存與寫入時機
