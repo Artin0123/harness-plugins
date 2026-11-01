@@ -19,15 +19,18 @@ import {spawnSync} from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const selfPath = fileURLToPath(import.meta.url);
-// The plugin imports `Plugin` from @opencode/plugin (a runtime dep only the
-// host resolves). The unit battery targets the exported pure functions, so
-// the import is swapped for a passthrough stub and the source is imported
-// from a throwaway copy in the system temp dir (nothing added to the repo).
-// The --noanchor worker reuses this scratch via EG_SCRATCH (its scrubbed
-// env makes mkdtempSync itself impossible, so the parent provides the dir).
+// The plugin needs no host package at load time (its `define` is declared in
+// the source), so the battery imports the source verbatim -- from a throwaway
+// copy in the system temp dir, so nothing is written into the repo. The
+// --noanchor worker reuses this scratch via EG_SCRATCH (its scrubbed env makes
+// mkdtempSync itself impossible, so the parent provides the dir).
 const srcPath = join(here, '..', '..', 'env-guard', 'index.ts');
-const src = readFileSync(srcPath, 'utf8')
-  .replace('import { Plugin } from "@opencode/plugin"', 'const Plugin = { define: (p) => p };');
+const src = readFileSync(srcPath, 'utf8');
+if (/from\s+["']@opencode\/plugin["']/.test(src)) {
+  // A runtime import of the host package makes npm auto-install the peer and
+  // pull in 273 packages / 168 MB per install (measured, v2.2.5).
+  throw new Error('env-guard/index.ts must not import @opencode/plugin at runtime');
+}
 const scratch = process.env.EG_SCRATCH ?? mkdtempSync(join(tmpdir(), 'env-guard-oc-'));
 const loadPath = join(scratch, 'index.ts');
 writeFileSync(loadPath, src, 'utf8');

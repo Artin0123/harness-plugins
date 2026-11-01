@@ -6,7 +6,7 @@
 	"scripts": {
 		"test": "node cmdc-mods/tests/env-guard/index.mjs && node cmdc-mods/tests/system-prompt/index.mjs && node cmdc-mods/tests/disable-tools/index.mjs",
 		"test:pi": "node pi-extensions/tests/env-guard/index.mjs",
-		"test:oc": "node oc-plugins/tests/env-guard/index.mjs"
+		"test:oc": "node oc-plugins/tests/env-guard/index.mjs && node oc-plugins/tests/packaging/index.mjs"
 	},
 	"commandcode": {
 		"mods": ["./cmdc-mods/system-prompt/index.ts", "./cmdc-mods/disable-tools/index.ts", "./cmdc-mods/env-guard/index.ts"]

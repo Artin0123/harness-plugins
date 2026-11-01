@@ -1,4 +1,8 @@
-import { Plugin } from "@opencode/plugin"
+// @opencode/plugin's `define` is identity (`export function define(plugin){return plugin}`,
+// read from the installed 2.2.5 tarball). Importing the real package would make it a
+// runtime dependency: npm auto-installs that peer and pulls the whole host runtime in
+// (273 packages / 168 MB measured per install), while this plugin needs none of it.
+const define = <T>(plugin: T): T => plugin
 
 const ENV_PARAGRAPHS = [
   "Here is some useful information about the environment you are running in:",
@@ -12,7 +16,7 @@ const clean = (text: string) =>
     .join("\n\n")
     .trim()
 
-export default Plugin.define({
+export default define({
   id: "chat.trim-context",
   async setup(ctx) {
     for (const name of ["context", "compaction", "generate"] as const) {

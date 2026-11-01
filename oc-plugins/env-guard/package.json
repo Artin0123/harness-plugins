@@ -1,9 +1,6 @@
 {
   "name": "opencode-env-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
-  "main": "index.ts",
-  "peerDependencies": {
-    "@opencode/plugin": "^2.2.0"
-  }
+  "main": "index.ts"
 }

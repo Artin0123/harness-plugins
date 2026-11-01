@@ -85,6 +85,27 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 
 通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
 
+## oc 版：安裝形態與體積（v2.2.5 實測）
+
+`opencode plugin add` = 用 pacote 把 spec 解析成 **codeload tarball**（
+`https://codeload.github.com/<user>/<repo>/tar.gz/<commit>`，只取一個 commit，不 clone
+歷史），解開後在安裝目錄跑一次 npm install（`@opencode/Npm`，arborist，
+`--prefix <安裝目錄>`）。所以**是否有依賴，全看插件的 package.json**：
+
+| 插件 package.json | 安裝結果 |
+| ----------------- | -------- |
+| `peerDependencies: { "@opencode/plugin": "^2.2.0" }` | 273 套件 / 168 MB（npm 自動安裝 peer，`@opencode/plugin` 自己依賴 `@opencode/{ai,client,protocol,schema,util}` + `effect`） |
+| 不宣告任何依賴（現況） | 1 套件 / 42 KB |
+
+`Plugin.define` 是 identity（實裝 tarball 的 `dist/effect/plugin.js`：
+`export function define(plugin) { return plugin }`），所以插件自己宣告一份即可，不需要
+host 的執行期模組——先前本地 plugins 目錄安裝會 `ReferenceError: Plugin is not defined`，
+同一個原因，已消失。載入器只要求 default export 是帶 `id` / `setup` 的物件。
+
+附帶事實：每次 add/update 會新增 `~/.cache/opencode/npm/<key>/<timestamp>/`，舊目錄不
+自動清除；`check` / `list` 由執行中的 server 回答（記憶體中的 registry），與磁碟狀態
+無關，server 沒重啟就不會反映刪檔。
+
 ## oc 版：接線與閘門
 
 - 路徑類：`ctx.tool.hook("execute.before")` 改 `event.input`（`path` / `patchText` /
@@ -274,10 +295,12 @@ model**：schema 不送出、執行被拒（loud failure，agent 可自癒改道
 
 測試放 **host 資料夾的 `tests/` 下**、與插件資料夾分離——插件資料夾保持只含交付物，
 手動安裝（`cp -r` 插件資料夾）不會把測試帶進安裝目錄。單元電池直接 import 插件
-TypeScript（Node type stripping，無建置步驟）；oc 版與 pi 版都把 host 才解析得到的
-runtime import（`@opencode/plugin`、`getAgentDir`）換成 stub、從系統暫存目錄的
-拋棄式副本載入（repo 內不留任何產物），worker 場景（無錨點／探測開關）各自跑
-獨立 process（module 級快取會釘死情境）。
+TypeScript（Node type stripping，無建置步驟）；pi 版把 host 才解析得到的 runtime
+import（`getAgentDir`）換成 stub、從系統暫存目錄的拋棄式副本載入（repo 內不留任何
+產物），oc 版則不需 stub（插件沒有執行期依賴），同一套拋棄式副本機制照用。
+`oc-plugins/tests/packaging/` 另外釘死安裝體積的形狀（無依賴欄位、無 runtime import
+`@opencode/plugin`、default export 有 `id`/`setup`）。worker 場景（無錨點／探測開關）
+各自跑獨立 process（module 級快取會釘死情境）。
 
 涵蓋（env-guard）：每一條修復、每一條刻意不修（釘死防回歸）、hook 接線、gate 的
 兩個方向（轉換開／關的機器都能跑同一份電池）、統計的分母 gate、各 fix key、

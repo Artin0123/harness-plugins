@@ -71,7 +71,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { Plugin } from "@opencode/plugin";
+
+// The loader only needs the exported object: @opencode/plugin's `define` is
+// identity -- `export function define(plugin) { return plugin }`, read from the
+// installed 2.2.5 tarball (dist/effect/plugin.js). Importing the real package
+// turns it into a runtime dependency, and npm auto-installs that peer, which
+// drags the whole host runtime in (@opencode/{ai,client,protocol,schema,util},
+// effect, @opentelemetry, @redis): 273 packages / 168 MB measured per install
+// on v2.2.5. Declared here, an install is 1 package / 42 KB -- and a local
+// plugins-dir copy no longer dies with `ReferenceError: Plugin is not defined`.
+const define = <T>(plugin: T): T => plugin;
 
 // ---- bash detection (scan + verify identity; no install paths hardcoded) --
 // C:\Windows\System32\bash.exe is the WSL launcher and always sits on PATH, so
@@ -845,7 +854,7 @@ function bumpFix(key: string): void {
   flushStats(); // numerators are rare: persist at once, nothing is lost on unload
 }
 
-export default Plugin.define({
+export default define({
   id: "env.guard",
   async setup(ctx) {
     if (process.platform !== "win32") return;
