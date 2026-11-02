@@ -203,6 +203,14 @@ const toolBefore = hooks['tool:execute.before']?.[0];
 const shellBefore = hooks['shell:create.before']?.[0];
 check('H: setup registers both hooks', !!toolBefore && !!shellBefore, Object.keys(hooks).join(','));
 
+// a missing tool name must fail safe (documented contract): no throw, no
+// rewrite -- never a TypeError from the hook itself
+const evNoTool = { input: { path: '/tmp/x' } };
+let noToolThrew = false;
+try { toolBefore(evNoTool); } catch { noToolThrew = true; }
+check('H: missing tool name fails safe (no throw, no rewrite)',
+  !noToolThrew && evNoTool.input.path === '/tmp/x', JSON.stringify({ noToolThrew, path: evNoTool.input.path }));
+
 const evPath = (tool, p) => ({ tool, input: { path: p } });
 const p1 = evPath('write', '/tmp/e2e.txt'); toolBefore(p1);
 check('H: tool hook rewrites input.path', p1.input.path === N + 'e2e.txt', JSON.stringify(p1.input));
@@ -294,6 +302,27 @@ check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver') === 'ls
 // (0/508 real commands in this machine's log), so handling it would only add
 // scanner risk. Left as-is: pre-plugin behaviour.
 check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver') === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
+
+// --- escaped \$ ( : literal data, not a substitution opener ---
+// bash: "\$(x)" inside double quotes prints $(x) literally (the $ is
+// escaped), while "\\$(x)" runs a REAL substitution after a literal
+// backslash (measured both). Before the pair-aware scanDq the scanner
+// rewrote inside the literal "\$( )" -- silently corrupting echo's data
+// (the rewritten run prints $(cmd /c ver), native prints $(cmd //c ver)).
+check('B: dq "\\$(" stays literal (data, not substitution)',
+  bc('echo "\\$(cmd //c ver)"') === 'echo "\\$(cmd //c ver)"', JSON.stringify(bc('echo "\\$(cmd //c ver)"')));
+check('B: dq "\\\\$(" is a real substitution, still fixed',
+  bc('echo "\\\\$(cmd //c ver)"') === 'echo "\\\\$(cmd /c ver)"', JSON.stringify(bc('echo "\\\\$(cmd //c ver)"')));
+// bare \$( is a native SYNTAX ERROR (loud, exit 2, measured) in both the
+// original and the rewritten form, so the interior rewrite changes nothing
+// observable -- pinned to keep the shape classified as native-equivalent
+check('B: bare \\$( interior rewritten, native-equivalent failure',
+  bc('echo \\$(cmd //c ver)') === 'echo \\$(cmd /c ver)', JSON.stringify(bc('echo \\$(cmd //c ver)')));
+// bash runs \cmd exactly like cmd, and the basename isCmdTok covers it
+// (measured). The header ledger listed this as a miss -- corrected there;
+// pinned here so the ledger and the code cannot drift apart again.
+check('P: escaped \\cmd fixed via basename isCmdTok',
+  bc('\\cmd //c ver') === '\\cmd /c ver', JSON.stringify(bc('\\cmd //c ver')));
 
 // --- misfix regressions: these silently rewrote correct syntax before the
 // position rules were tightened (each verified against real bash first) ---

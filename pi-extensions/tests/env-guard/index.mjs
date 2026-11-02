@@ -403,6 +403,16 @@ for (const c of misses) {
   check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed && !r.envPathFixed, JSON.stringify(r));
 }
 
+// --- 跳脫的 \$ ( ：字面資料、不是替換開頭 ---
+// bash 實測：雙引號內 "\$(x)" 印字面 $(x)（$ 被跳脫）；"\\$(x)" 才是字面
+// 反斜線＋真替換（印 "\<pwd>"）。成對消費跳脫序之前的掃描器把 "\$( )" 內
+// 當替換掃描改寫＝靜默誤修 echo 的資料。dq 形兩種 gate 狀態都不動；
+// 裸 \$ ( 原生本來就是語法錯誤（大聲、exit 2），改寫前後同形。
+check('P: dq "\\$(" 字面資料不動',
+  bc('echo "\\$(cmd //c ver)"').command === 'echo "\\$(cmd //c ver)"', JSON.stringify(bc('echo "\\$(cmd //c ver)"')));
+flagCase('dq "\\\\$(" 是真替換，照修', 'echo "\\\\$(cmd //c ver)"', 'echo "\\\\$(cmd /c ver)"');
+flagCase('裸 \\$( 內部照掃（原生同為語法錯誤）', 'echo \\$(cmd //c ver)', 'echo \\$(cmd /c ver)');
+
 // --- taskkill 事件原形（CS0016 檔案鎖定那條）：整條對 env-guard 是 no-op ---
 // cmd.exe /c 是本機（轉換關閉）的正確單斜線形；taskkill 非 cmd、無前綴賦值
 // → 兩種改寫都不觸發。病理（//IM 原樣抵達 → exit 1）留在漏修臺：失敗大聲、

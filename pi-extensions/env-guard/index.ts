@@ -449,6 +449,9 @@ function scanBash(command: string): BashScanResult {
   //           獨立替換（$(…)）→ false，替換結果本身就是指令名，後面的 cmd 只是參數
   //   群組 ( → false（`( … ) word` 原生就是語法錯誤，不改寫）
   const parenRestore: boolean[] = [];
+  // 被 \$ 跳脫分支成對消費的 "$" 位置：該 "$" 是字面——其後的 "(" 不是
+  // $( 替換開頭（bash 剖析為語法錯誤），括號分類不得把它當開頭
+  const escapedDollar = new Set<number>();
   // case 樣式的 `)`（`case x in a) …`）在 bash 語法上沒有對應的 `(`：它終止樣式、
   // 開 body，若讓它 pop 就會偷走外層 $( 的堆疊項。所以照 bash 語法追蹤區段
   //（這段註解是唯一防腐劑，別當不明狀態碼刪）：
@@ -528,13 +531,22 @@ function scanBash(command: string): BashScanResult {
   };
 
   // 双引號內的 $( ) 與 `…` 會真的被 bash 執行（如 R="$(cmd //c ver)"），
-  // 必須遞迴掃描；引號本身是字面，但命令取代區域內是完整 shell 語法
+  // 必須遞迴掃描；引號本身是字面，但命令取代區域內是完整 shell 語法。
+  // 跳脫序成對消費："\$" 的 $ 是字面（其後 "(" 是資料、不是替換開頭——
+  // bash 實測 "\$(x)" 印字面 $(x)；改此修之前 "\$( )" 內被當替換掃描改寫＝
+  // 靜默誤修 echo 的資料）；"\\" 是字面反斜線、其後的 $( 才是真替換（實測
+  // "\\$(pwd)" 印 "\<pwd>"）——成對跳過讓兩側都對。
   const scanDq = (seg: string): string => {
     let s = "";
     let k = 0;
     const m2 = seg.length;
     while (k < m2) {
       const c = seg[k];
+      if (c === "\\") {
+        s += seg.slice(k, k + 2);
+        k += 2;
+        continue;
+      }
       if (c === "$" && seg[k + 1] === "(") {
         const close = matchParen(seg, k + 2);
         if (close === -1) {
@@ -608,6 +620,7 @@ function scanBash(command: string): BashScanResult {
       const seg = command.slice(i, i + 2);
       out += seg;
       curTok += seg; // 跳脫字元屬於當前詞（\> 不構成運算子）
+      if (command[i + 1] === "$") escapedDollar.add(i + 1); // \$：$ 是字面（見 escapedDollar）
       i += 2;
       continue;
     }
@@ -699,10 +712,12 @@ function scanBash(command: string): BashScanResult {
       if (ch === "(") {
         // cmdPosNext 此時是 commit 後的值：`count=$(` 會被 assignment 前綴保
         // 留在 true，`$(` 則已被 commit 成一個普通 word → false（天然分流）
+        // prev 是未被 \$ 跳脫的 "$" 才算 $( 替換開頭；被跳脫的 $ 後接 "(" 在
+        // bash 是語法錯誤（字面 $），照群組括號處理
         // 樣式區裡的 `(`（`case x in (a) …` 的選配包裹）不推堆疊：它的 `)` 就是
         // 樣式終止符，由下面的 region 分支處理
         const prev = command[i - 1] ?? "";
-        if (caseRegion !== "pattern") parenRestore.push(prev === "$" ? cmdPosNext : /[A-Za-z0-9_]/.test(prev));
+        if (caseRegion !== "pattern") parenRestore.push(prev === "$" && !escapedDollar.has(i - 1) ? cmdPosNext : /[A-Za-z0-9_]/.test(prev));
       }
       clearTok();
       cmdPosNext = true; // 分隔符後是新的指令位置（含 $( 與反引號開頭）

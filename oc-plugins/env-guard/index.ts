@@ -57,7 +57,9 @@
 //     retry loop hangs forever, while natively //xxx converts and fails
 //     fast -- the outcomes diverge either way, loudness is not the
 //     criterion, the return != native is); cmd behind external wrappers,
-//     quoted "cmd" //c, escaped \cmd //c (zero organic occurrences);
+//     quoted "cmd" //c (zero organic occurrences; the escaped \cmd spelling
+//     IS covered by the basename isCmdTok -- bash runs \cmd exactly like
+//     cmd, measured \cmd //c ver rewrites);
 //     POSIX path arguments of native programs; envp residual value shapes
 //     (see the scanner section and spec.md "envp 殘餘形").
 //   cmd's GBK mojibake is its own case: the host's UTF-8 decode differs
@@ -496,6 +498,10 @@ function scanBash(command: string, convOff = true): BashScanResult {
   // pattern region, "group" = everything else; a ")" restores accordingly
   // (func/case always keep the position)
   const parenStack: { kind: string; pos: boolean }[] = [];
+  // positions of a "$" consumed as an \$ escape pair: that "$" is LITERAL, so
+  // a "(" right after it never opens a substitution (bash parses it as a
+  // syntax error) -- the paren classifier must not see it as an opener
+  const escapedDollar = new Set<number>();
   // case tracking: "case" (command position) arms it, the case's "in" starts
   // the PATTERN region -- its ")" terminates the pattern and opens the body
   // -- ";;" returns to the pattern region and "esac" ends it. The region
@@ -506,7 +512,10 @@ function scanBash(command: string, convOff = true): BashScanResult {
   let casePending = false; // saw "case", waiting for the case's "in"
 
   // A cmd token is recognised by basename, so an explicit path
-  // (C:\Windows\System32\cmd.exe) is the same command as `cmd`. Quoted
+  // (C:\Windows\System32\cmd.exe) is the same command as `cmd` -- and the
+  // split incidentally covers the escaped spelling \cmd too (bash runs
+  // \cmd exactly like cmd; measured, pinned in the battery; the pi sibling
+  // compares whole tokens and leaves it a documented miss). Quoted
   // spellings ("cmd") still fall through -- no rewrite, the pre-plugin
   // behaviour (documented as a known miss).
   const isCmdTok = (t: string) => {
@@ -575,12 +584,23 @@ function scanBash(command: string, convOff = true): BashScanResult {
   };
 
   // $( ) and `...` execute inside double quotes too: recurse into them.
+  // Escape pairs are consumed as pairs: "\$" makes the $ literal (a "(" after
+  // it is data, never a substitution opener -- bash: "\$(x)" prints $(x)),
+  // while "\\" is a literal backslash and the $( after it is a REAL
+  // substitution (bash: "\\$(pwd)" prints "\<pwd>"); the pair skip keeps both
+  // sides straight (before it, the literal "\$( )" interior was scanned and
+  // rewritten -- a silent misfix of echo's data).
   const scanDq = (seg: string): string => {
     let s = "";
     let k = 0;
     const m2 = seg.length;
     while (k < m2) {
       const c = seg[k];
+      if (c === "\\") {
+        s += seg.slice(k, k + 2);
+        k += 2;
+        continue;
+      }
       if (c === "$" && seg[k + 1] === "(") {
         const close = matchParen(seg, k + 2);
         if (close === -1) { s += seg.slice(k); break; }
@@ -652,6 +672,7 @@ function scanBash(command: string, convOff = true): BashScanResult {
       const seg = command.slice(i, i + 2);
       out += seg;
       curTok += seg; // escaped chars belong to the token (\> is no operator)
+      if (command[i + 1] === "$") escapedDollar.add(i + 1); // \$: the $ is literal (see escapedDollar)
       i += 2;
       continue;
     }
@@ -739,11 +760,13 @@ function scanBash(command: string, convOff = true): BashScanResult {
         // subshell opener. The saved position decides what the closing ")"
         // restores: "count=$(...) cmd" opened from an assignment prefix
         // (position alive -- bash runs cmd), while "echo $(...) cmd" opened
-        // from an argument (cmd is data).
+        // from an argument (cmd is data). A "$" consumed as \$ is literal
+        // (the "(" after it is a bash syntax error), so it never classifies
+        // as a substitution opener (escapedDollar).
         const kind =
           caseRegion === "pattern"
             ? "case"
-            : command[i - 1] === "$"
+            : command[i - 1] === "$" && !escapedDollar.has(i - 1)
               ? "subst"
               : /[A-Za-z0-9_]/.test(command[i - 1] ?? "")
                 ? "func"
@@ -999,7 +1022,9 @@ export default define({
     await ctx.tool.hook("execute.before", (event) => {
       const input = event.input as Record<string, unknown> | null;
       if (!input || typeof input !== "object") return;
-      const tool = event.tool.toLowerCase();
+      // a missing tool name fails safe: no rewrite (the contract a few lines
+      // up), never a TypeError thrown from the hook itself
+      const tool = typeof event.tool === "string" ? event.tool.toLowerCase() : "";
       if (tool === "patch") {
         bumpTool("patch");
         if (typeof input.patchText === "string") {
