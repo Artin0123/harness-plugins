@@ -105,6 +105,12 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   write 工具 `path:"nul"` 同理（Node host 端原生建真檔，實測 dir 可見）。
 - `<nul`——bash 直接報 ENOENT；`2>&nul`/`<&nul`——ambiguous redirect，大聲失敗
   且不造檔（重測一致）。
+- 重導向目標的雙斜線（`cmd //c "x" > //out`）——目標路徑是 bash 自己開檔時
+  解析的，根本不經被 MSYS_NO_PATHCONV 關掉的 argv 轉換層——沒有故障點；原生
+  就是大聲失敗（`//out: Is a directory`）。也不能「順手」修正：「修」成
+  `/tmp/eg.log` 反而會靜默寫到另一個位置——這是誤修方向，目標原樣不動。
+- 原生就壞的 cmd 雙斜線形（`cmd //?`、`cmd ///c`、`cmd //server/share`）——
+  實測轉換開啟時一樣進互動模式：模型自己寫錯，不修。
 - 其他 cmd-ism（`del`、`dir /b`…）——`del` 真的不存在，"command not found"
   是 bash 自己的訊息（工具回傳≡原生）；`dir` 存在（/usr/bin/dir）但它是 MSYS
   程式（msys→msys 邊界不轉換），`/b` 兩種環境都原樣抵達、同樣 rc=2
@@ -137,6 +143,13 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   判斷「哪個參數是路徑」要各程式自己的參數語義＝開放集合，全面改寫 argv 又會
   改壞字串／regex（`echo /tmp`、`grep /tmp`、`sed 's|/tmp|X|'`）、誤傷依賴
   posix 形式的 MSYS 工具參數——誤修風險大於漏修。
+- **範圍界定（為何只有 cmd 進了修復清單）**：吃 `-`/`--` 旗標的工具（git/npx/
+  python/pwsh…）對 MSYS_NO_PATHCONV 沒有可觀察影響——msys argv 轉換層不碰
+  `-` 開頭的參數，不是選擇性不修，是它們沒有這個故障模式。cmd 單獨納入的
+  依據＝①故障在轉換層且模型語法無錯（`//c` 是 git-bash 官方慣用法）；②失敗
+  靜默（互動模式、exit 0、橫幅偽裝成輸出）；③ OS shell（bash 到不了的 OS
+  設施都得經它，e2e 實測自然觸發）。將來若有別的工具三條全中，再按同一標準
+  納入。
 - **cmd 的非 ASCII 亂碼**——cmd 照 console code page（本機 936＝GBK）編碼輸出、
   host 以 UTF-8 解碼 → 工具回傳≠真實終端機所見 → 依分界屬漏修；無忠實改寫：
   注入 `chcp 65001` 實測非確定性（同命令有時 UTF-8 有時仍 GBK）且會把內建訊息
@@ -240,8 +253,10 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
    **外部程式** 之間，不是憑感覺挑幾個。
 4. **要執行才知道的 → 不修**：`$C //c`、alias、`eval`、`${TEMP:-/tmp}/x`——靜態
    掃描的邊界外。
-5. **有機頻率為零的語法 → 可修但不划算**：`"cmd" //c`（引號包住的指令名）。語法上
-   可修，但實務上沒人這樣寫（語料見下），留著只增加掃描器風險。
+5. **有機頻率為零的語法 → 可修但不划算**：`"cmd" //c`（引號包住的指令名）、
+   絕對路徑 `C:\…\cmd.exe //c`、跳脫 `\cmd //c`。語法上
+   可修，但實務上沒人這樣寫（語料見下：引號指令名 0、全路徑 cmd.exe 0），
+   留著只增加掃描器風險。
 
 **語料實測（本機 opencode.log 的 508 條真實 `bash -c` 指令）**：20 條含 `cmd` +
 `//`，其中只有 **2 條是真的要執行 cmd**——1 條在指令起始（已改寫），1 條躲在外部

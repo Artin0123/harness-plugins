@@ -140,7 +140,7 @@ flagCase('env-assignment prefix keeps position', 'x=1 cmd //c ver', 'x=1 cmd /c 
 // 不同——實測如此）；本機轉換被 MSYS_NO_PATHCONV 關閉時值原樣抵達 → Node
 // 把前導 / 當磁碟相對路徑解析成 C:\c\foo（靜默錯位，exit 0）。只修「前綴賦值
 // ＋後接指令字」；standalone 賦值（bash 端語意需要 POSIX 值）、引號值、清單值、
-// 根相對路徑、wrapper 參數一律不動（見檔頭刻意不修清單）。
+// 根相對路徑、wrapper 參數一律不動(見 docs/spec.md 刻意不修清單)。
 const Tf = String(mod.realTempDir() ?? T).replace(/\\/g, '/');
 const envCase = (label, input, expectedWhenOn) => {
   const r = bc(input);
@@ -195,7 +195,7 @@ envMiss('A=/c/x sh -c "echo $A"');
 // `:` 與 compopt：內建（防漂移對照由 enable -a 測試覆蓋）
 envMiss('A=/c/x :');
 envMiss('A=/c/x compopt');
-// 函式名殘餘（混合邊界，見檔頭）：無法靜態排除→維持套用，釘實際行為
+// 函式名殘餘（混合邊界，見 docs/spec.md「envp 殘餘形」）：無法靜態排除→維持套用，釘實際行為
 envCase('function name residual (mixed boundary)', 'A=/c/x f', 'A=C:/x f');
 // 緊貼組合單獨形：無後接指令字＝standalone（動態輸出進 shell 變數、不轉換）
 envMiss('A=/c/x$(pwd)');
@@ -393,7 +393,7 @@ const misses = [
   'printf %s cmd //c',
   // / 前綴原生工具：與 cmd //c 同一個故障點（實測 taskkill //IM
   // exit 1 報『無效參數』；失敗大聲但大聲≠豁免，回傳≠原生才是判準），
-  // 留在漏修臺（見檔頭）——釘住不升級成誤修
+  // 留在漏修臺（見 docs/spec.md）——釘住不升級成誤修
   'taskkill //IM media-downloader.exe //F',
   'taskkill //F //IM x.exe',
   'sc //query wuauserv',
