@@ -223,7 +223,7 @@ envMiss('A=/c/x # cmd');
 // && 左側是賦值敘述（shell 變數，不進 envp——實測 process.env.A undefined）
 envMiss('A=/c/x && node -e y');
 envMiss('A=/c/x&&node -e y');
-// wrapper 選項之後的詞在參數位置（選項結構＝開放集合）→ 刻意漏修
+// wrapper 選項之後的詞在參數位置（選項結構＝開放集合）→ 留在漏修臺
 envMiss('env -u V XDG=/c/foo node x');
 // A=x (…) 實測是 syntax error＝死文字，套用與否都無效果；群組內的詞是內建
 // （echo）不再觸發套用——不動同樣安全。釘實際行為防止意外漂移。
@@ -391,8 +391,9 @@ const misses = [
   'cmd //?',
   'cmd ///c ver',
   'printf %s cmd //c',
-  // / 前綴原生工具：與 cmd //c 同一個故障點但失敗大聲（實測 taskkill //IM
-  // exit 1 報『無效參數』），列為刻意漏修（見檔頭）——釘住不升級成誤修
+  // / 前綴原生工具：與 cmd //c 同一個故障點（實測 taskkill //IM
+  // exit 1 報『無效參數』；失敗大聲但大聲≠豁免，回傳≠原生才是判準），
+  // 留在漏修臺（見檔頭）——釘住不升級成誤修
   'taskkill //IM media-downloader.exe //F',
   'taskkill //F //IM x.exe',
   'sc //query wuauserv',
@@ -404,8 +405,9 @@ for (const c of misses) {
 
 // --- taskkill 事件原形（CS0016 檔案鎖定那條）：整條對 env-guard 是 no-op ---
 // cmd.exe /c 是本機（轉換關閉）的正確單斜線形；taskkill 非 cmd、無前綴賦值
-// → 兩種改寫都不觸發。病理（//IM 原樣抵達 → exit 1）是刻意漏修：失敗大聲、
-// agent 看到即自癒（實錄：拿掉遮罩後下一步就改 /IM）；事件裡的靜默是模型
+// → 兩種改寫都不觸發。病理（//IM 原樣抵達 → exit 1）留在漏修臺：失敗大聲、
+// agent 看到即自癒（實錄：拿掉遮罩後下一步就改 /IM）——大聲不是豁免，
+// 回傳≠原生才是漏修的判準；事件裡的靜默是模型
 // 自己的 >/dev/null 2>&1，屬模型自身錯誤不介入。
 const incident = 'cmd.exe /c "csc-build.cmd /nopause media-downloader.cs" 2>&1 | tail -2 && rm -f media-downloader.ini && ./media-downloader.exe & sleep 4; taskkill //IM media-downloader.exe //F >/dev/null 2>&1; sleep 1; sed -n \'1,14p\' media-downloader.ini';
 const incidentR = bc(incident);

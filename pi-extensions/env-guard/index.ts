@@ -58,8 +58,12 @@
 //     別的位置（`> /tmp/eg.log` 真的建檔），所以目標原樣不動。
 //   - 原生就壞的雙斜線形（cmd //?、cmd ///c、cmd //server/share）：實測轉換
 //     開啟時一樣進互動模式 → 模型自己寫錯，不修。
-//   - 其他 cmd-ism（del、dir /b、robocopy //mir…）：bash 沒有這些指令——
-//     "command not found" 是 bash 自己的訊息（回傳≡原生），大聲失敗、agent 自矯正。
+//   - 其他 cmd-ism（del、dir /b…）：del 真的不存在——"command not found" 是
+//     bash 自己的訊息（回傳≡原生）；dir 存在（/usr/bin/dir）但它是 MSYS
+//     程式（msys→msys 邊界不轉換），/b 兩種環境都原樣抵達、同樣 rc=2
+//     cannot access（實測逐位元相同）——模型從 cmd 帶來的寫法，不修。
+//     robocopy 不在此列：它是 PATH 上的 Windows 二進位，// 旗標形與 taskkill
+//     同一故障、且失敗形態是卡死不是快敗 → 漏修臺（見該條實測）。
 //
 // 【漏修臺帳】環境轉換層造成（工具回傳≠原生），大聲≠豁免；留下的唯一理由＝
 // 靜態修法需要開放集合的猜測、誤修風險大於漏修：
@@ -78,6 +82,13 @@
 //     遮罩後下一步就改 /IM），靜態修復又需列舉「哪些程式吃 / 旗標」（開放集合
 //     ＋猜測）→ 留在漏修臺。cmd 是唯一例外：失敗靜默（互動模式、exit 0）且是
 //     OS shell，已修（判準見掃描器註解）。
+//     失敗形態隨程式而異，robocopy 最糟：本機 robocopy //xxx a b 把 //xxx 當
+//     來源路徑、Windows 正規化成 UNC \\xxx\（bash argv 原樣傳 //xxx、實測；
+//     正規化在 robocopy 自己那一層），錯誤 161 觸發它預設 /R:1000000 /W:30
+//     重試迴圈（每 30 秒一次、百萬次）＝無限卡；原生端 //xxx→/xxx 無效
+//     switch 快敗 rc=16（實測 64–79ms）——兩端發散。探測紀律：實測 robocopy
+//     形必須 timeout 包住＋//r:1 //w:1 給重試上界，| head 截斷救不了（head
+//     退出後 pipeline 仍在等 robocopy）。
 //   - 原生程式的 POSIX 路徑參數（`git -F /tmp/x`、`git hash-object /tmp/x`、
 //     `python /tmp/x.py`…）：預設 git-bash 靠 argv 轉換才成立，本機轉換關閉就
 //     變成 `could not open '/tmp/…'`（實測；MSYS 程式如 cat/ls 不受影響）。
@@ -449,7 +460,7 @@ function convertEnvPath(v: string): string | null {
 //      語法存在於所有以 / 為 switch 前綴的原生程式：除了 cmd.exe，還有 taskkill、
 //      sc、net、reg、robocopy、findstr 這類可直接從 bash 呼叫的 Windows 內建
 //      工具——實測 taskkill //IM x //F 在原生 git-bash 成功、本機（轉換關閉）
-//      原樣抵達而 exit 1 大聲報錯，與 //c 同一個故障點。它們維持刻意漏修：
+//      原樣抵達而 exit 1 大聲報錯，與 //c 同一個故障點。它們留在漏修臺：
 //      失敗是大聲的（stderr＋exit 1，agent 看到即自癒——事件實錄裡的「靜默」
 //      是模型自己加 >/dev/null 2>&1 遮掉的，屬模型自身錯誤、不介入），且靜態
 //      修復必須列舉「哪些程式吃 / 旗標」＝開放集合＋猜測。cmd 單獨納入的依據：

@@ -105,8 +105,12 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   write 工具 `path:"nul"` 同理（Node host 端原生建真檔，實測 dir 可見）。
 - `<nul`——bash 直接報 ENOENT；`2>&nul`/`<&nul`——ambiguous redirect，大聲失敗
   且不造檔（重測一致）。
-- 其他 cmd-ism（`del`、`dir /b`、`robocopy //mir`…）——bash 沒有這些指令，
-  "command not found" 是 bash 自己的訊息（工具回傳≡原生）、大聲失敗、agent 自矯正。
+- 其他 cmd-ism（`del`、`dir /b`…）——`del` 真的不存在，"command not found"
+  是 bash 自己的訊息（工具回傳≡原生）；`dir` 存在（/usr/bin/dir）但它是 MSYS
+  程式（msys→msys 邊界不轉換），`/b` 兩種環境都原樣抵達、同樣 rc=2
+  cannot access（實測逐位元相同）——模型從 cmd 帶來的寫法，不修。
+  `robocopy //mir` 不在此列：robocopy 是 PATH 上的 Windows 二進位，與 taskkill
+  同一故障、且失敗形態是卡死不是快敗 → 漏模臺帳（見該條實測）。
 
 **漏修臺帳（環境轉換層造成、工具回傳≠原生；大聲≠豁免，留下的唯一理由＝靜態
 修法是開放集合的猜測）：**
@@ -117,7 +121,13 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   `/IM` 被 argv 轉換改壞成 `C:/…/Git/IM` 而失敗）；事件實錄：拿掉遮罩後下一步
   就改 `/IM`（大聲自癒，但失敗來自轉換層＝漏修形態），靜態修復需列舉「哪些
   程式吃 / 旗標」＝開放集合 → 留在漏修臺。cmd 是唯一例外：失敗靜默（互動模式
-  、exit 0）且是 OS shell → 已修。
+  、exit 0）且是 OS shell → 已修。失敗形態隨程式而異，robocopy 最糟：本機
+  `robocopy //xxx a b` 把 `//xxx` 當來源路徑、Windows 正規化成 UNC `\\xxx\`
+  （bash argv 原樣傳 `//xxx`、實測；正規化在 robocopy 自己那一層），錯誤 161
+  觸發它預設 `/R:1000000 /W:30` 重試迴圈＝無限卡；原生端 `//xxx`→`/xxx` 無效
+  switch 快敗 rc=16（實測 64–79ms）——兩端發散。探測紀律：實測 robocopy 形必須
+  `timeout` 包住＋`//r:1 //w:1` 給重試上界，`| head` 截斷救不了（head 退出後
+  pipeline 仍在等 robocopy）。
 - 外部 wrapper 後的 cmd（`timeout 5 cmd //c`、`xargs cmd //c`、`nice …`）——
   同一故障層；wrapper 參數結構是開放集合＋猜測。env/exec/command/builtin 已納入
   關鍵字（閉集合，見上）。

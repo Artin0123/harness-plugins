@@ -93,7 +93,13 @@
 //   - //flags for other native /-switch programs (taskkill //IM, sc, net,
 //     reg, robocopy //mir, findstr //n...): same fault as //c, but the
 //     failure is loud and the rewrite needs an open list of which programs
-//     take /-flags (open set + guessing).
+//     take /-flags (open set + guessing). Failure modes vary per program:
+//     robocopy does not fail loudly -- it treats //xxx as a source path,
+//     Windows normalizes it to the UNC \\\\xxx\\ (bash passes //xxx through
+//     verbatim, measured), error 161 triggers its default /R:1000000 /W:30
+//     retry loop = hangs forever; natively //xxx converts to /xxx and fails
+//     fast with rc=16 (measured 64-79ms). The outcomes diverge either way,
+//     loud or hung -- loudness is not the criterion, the return != native is.
 //   - cmd behind external wrappers (timeout 5 cmd //c ..., xargs..., nice...),
 //     quoted "cmd" //c, escaped \\cmd //c: same fault; wrapper argument
 //     structures are an open set (timeout/nice/xargs), the quoted and
