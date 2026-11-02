@@ -1,127 +1,70 @@
 // env-guard -- protects OpenCode's Windows shell and file tools from this
 // machine's measured environment failures. Same judgement framework as the
-// pi-extensions and cmdc-mods siblings in Artin0123/harness-plugins; every fix
-// below is anchored to a failure MEASURED on this machine (Git for Windows
-// 2.56.0 / MINGW64, opencode v2.2.5 -- the old read '/tmp/x' failure was
-// first seen on v2.2.1):
+// pi-extensions and cmdc-mods siblings in Artin0123/harness-plugins; every
+// fix is anchored to a failure MEASURED on this machine (Git for Windows
+// 2.56.0 / MINGW64, opencode v2.2.5). User view & install: README.md; the
+// deliberate-no-fix / missed-fix ledgers with the per-item pathologies and
+// measurements: docs/spec.md -- comments here and below keep only what
+// reading and safely modifying the code requires.
 //
-//   1. every path this host resolves WITHOUT MSYS mapping: file-tool `path`,
-//      the shell tool's `workdir`, a temp prefix inside a `glob` pattern, and
-//      the paths in `patch` directives (all measured). read '/tmp/x' looks at
-//      C:\tmp (host normalization: workdir '/tmp' fails with "Working
-//      directory does not exist: C:\tmp"), write '$TEMP/x' (or '${TEMP}/x')
-//      creates a literal '$TEMP' folder under the project, glob
-//      '${TEMP}/*.txt' silently finds nothing, and patch
-//      '*** Add File: ${TEMP}/x' makes a literal folder.
-//      -> /tmp, $TEMP/$TMP/$TMPDIR (bare and ${...}), %TEMP%/%TMP%
-//      (any case, either separator) rewrite to the directory the detected bash
-//      itself reports for /tmp (cygpath -w /tmp): that is the mapping bash
-//      uses for its own '/tmp', so both sides of a command agree on it.
-//      bash-side /tmp is untouched (MSYS mounts it correctly). os.tmpdir() is
-//      NOT the authority here: on this machine MSYS already converts TEMP to a
-//      Windows path for native children (measured), yet the shell tool's bash
-//      is what defines '/tmp'.
-//   2. this machine's BASH_ENV (.bashrc, which `bash -c` sources) sets
-//      MSYS_NO_PATHCONV=1, so the MSYS-doubled flag spelling `cmd //c` reaches
-//      cmd.exe literally and starts an INTERACTIVE cmd: measured with stdin
-//      closed -- exit 0, and stdout is the banner + copyright + prompt
-//      ("Microsoft Windows [Version ...]" then "(c) Microsoft Corporation..."
-//      then "C:\...>") instead of `ver`'s single line. The banner's first line
-//      mimics `ver` closely enough that a model can read it as the answer,
-//      which is why this is a silent failure. -> rewrite //flags to /flags on
-//      command-position cmd only, including nested $( ) / backticks / double
-//      quotes, shell keywords ({ } if/then/do ...) and the tight `cmd//c`
-//      form; data positions are untouched (`echo cmd //c`, redirect targets
-//      (`cmd > //out` -- native "> //x" is a loud failure), heredoc bodies
-//      (exact terminator match, <<\EOF and non-word delimiters included) and
-//      the word after a closed `$( )`/backtick (`echo $(pwd) cmd //c ver`)).
-//      The rewrite is GATED on a probe of that environment (bash -c 'printf
-//      %s "${MSYS_NO_PATHCONV+x}"', which sources .bashrc through BASH_ENV;
-//      the variable is presence-based in the MSYS runtime -- "0" and "" also
-//      disable conversion, measured): with path conversion ON, `//c` is the
-//      spelling that works and rewriting it
-//      would BE the side effect; a failed or inconclusive probe leaves
-//      everything alone (uncertainty never enables side effects; `/c` works in
-//      both configurations).
-//   3. bash prefix-assignment POSIX path values (`A=/c/x node ...`): measured
-//      native git-bash converts the VALUE at the msys->native envp boundary
-//      (name-agnostic value-grammar conversion: FOO and XDG_CACHE_HOME are
-//      treated alike; /c/foo -> C:/foo, /tmp -> its mount anchor, forward
-//      slashes), and this machine's .bashrc (sourced through BASH_ENV) disables
-//      that layer with MSYS_NO_PATHCONV like `//c`, so the raw value reaches
-//      the native child and is resolved as a drive-relative path -- Node
-//      writes to C:\c\foo with exit 0 (measured silent). The rewrite
-//      reproduces that layer fair: only command-position assignments followed
-//      by a real command word (the value then provably enters that command's
-//      environment); the two verifiable anchors /c and /tmp (deliberately
-//      conservative -- single-letter drive roots and colon-list values
-//      convert natively on this machine too and stay misses); staged and
-//      applied right-to-left via spans, discarded at every standalone
-//      boundary (separator, background &, newline, redirect, heredoc, word
-//      head `#`, EOF), kept through a closer restoring the command position
-//      so the tight dynamic-tail form composes (VAR=/c/x$(pwd) node).
-//      Scanner details and the native fact base live in the scanBash section
-//      below and in docs/spec.md (掃描器要點).
+// Priority: NATIVE EXECUTION WINS -- syntax that fails under its own native
+// execution stays loud (the tool's return equals what native would return;
+// the agent sees the real cause and self-corrects); only failures inflicted
+// by this environment's conversion/tooling layer (return != native, loud OR
+// silent) are fix targets; uncertainty never enables a rewrite -- an
+// undetectable bash or a failed probe leaves the plugin inert (寧可漏修，
+// 不可誤修：誤修是靜默破壞正確語法；漏修是環境層未修的故障，大聲只是失敗
+// 形態，不是不修的豁免).
 //
-// NATIVE failures (the tool's return equals what native would return, so the
-// agent sees the real cause and self-corrects) stay untouched -- rewriting
-// them IS the side effect:
-//   - C:\\tmp in file tools: a legal Windows path, the native write simply
-//     succeeds (measured). The model choosing C:\\tmp is not environment
-//     breakage.
-//   - MSYS drive-letter paths (/c/Users/...): OpenCode's tool layer maps them
-//     itself (measured on v2.2.1 for read; re-measured on v2.2.5 for shell
-//     workdir '/c/Users/...', which ran in the right directory). A rewrite
-//     here would be duplicate protection, pure side effect.
-//   - `nul` redirect targets: re-measured today -- bash writes a real 3-byte
-//     `nul` file even for a bare `> nul` in a fresh process (differs from the
-//     pi sibling's machine) -- but this is bash-native behaviour, not
-//     something this environment's tooling inflicts, so it stays untouched;
-//     `rm ./nul` removes it.
-//   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled, which is
-//     exactly what a native terminal would print (parity holds) -- the
-//     mojibake is the visible, self-correcting signal and there is no
-//     faithful rewrite.
-//   - `cmd //?`, `cmd ///c`, `cmd //server/share`: WAS-error without
-//     conversion as well -- the model's own syntax error, native.
+// Fixes (fault points all on this machine's Windows layers; details in the
+// functions' own comments):
+//   1. paths the host resolves WITHOUT MSYS mapping -- file-tool `path`, the
+//      shell tool's `workdir`, a temp prefix in a `glob` pattern, the
+//      directive lines of `patch`: /tmp, $TEMP/$TMP/$TMPDIR (bare and
+//      ${...}), %TEMP%/%TMP% rewrite to the anchor the detected bash itself
+//      reports for /tmp (cygpath -w /tmp), so the file tools and a command's
+//      `> /tmp/x` agree on one directory even with a custom fstab;
+//      bash-side /tmp is untouched (rewritePath + realTempDir;
+//      splitTempPrefix / rewritePatchText for the glob/patch surfaces).
+//   2. `cmd //c|//k` -> /c|/k, gated on a probe of MSYS_NO_PATHCONV (the
+//      shell's .bashrc sets it through BASH_ENV, so the doubled spelling
+//      reaches cmd literally and starts an INTERACTIVE cmd -- exit 0, and
+//      the banner's first line mimics `ver` closely enough to be misread as
+//      the answer: a silent failure). With conversion ON `//c` is the
+//      spelling that works and rewriting it would BE the side effect; a
+//      failed or inconclusive probe leaves everything alone (`/c` works in
+//      both configurations) (pathConvDisabled + scanBash).
+//   3. command-position prefix-assignment POSIX path values -> the native
+//      envp conversion value: measured native git-bash converts the VALUE
+//      grammar at the msys->native exec boundary, name-agnostic (/c/foo ->
+//      C:/foo, /tmp -> its mount anchor); with that layer off the raw value
+//      reaches the child and Node resolves /c/foo as drive-relative
+//      C:\c\foo with exit 0 (measured silent). Two verifiable anchors only
+//      (drive-letter-generic /c, /tmp), deliberately conservative
+//      (convertEnvPath + scanBash).
 //
-// MISSED FIXES (漏修 ledger -- failures the environment's conversion layer
-// inflicts, so the tool's return does NOT equal the native return: a loud
-// failure does NOT exempt these, it just self-corrects where the message is
-// still faithful; they stay unfixed only where every static rewrite is an
-// open-set guess and the better-to-miss-than-mis-fix rule binds):
-//   - //flags for other native /-switch programs (taskkill //IM, sc, net,
-//     reg, robocopy //mir, findstr //n...): same fault as //c, but the
-//     failure is loud and the rewrite needs an open list of which programs
-//     take /-flags (open set + guessing). Failure modes vary per program:
-//     robocopy does not fail loudly -- it treats //xxx as a source path,
-//     Windows normalizes it to the UNC \\\\xxx\\ (bash passes //xxx through
-//     verbatim, measured), error 161 triggers its default /R:1000000 /W:30
-//     retry loop = hangs forever; natively //xxx converts to /xxx and fails
-//     fast with rc=16 (measured 64-79ms). The outcomes diverge either way,
-//     loud or hung -- loudness is not the criterion, the return != native is.
-//   - cmd behind external wrappers (timeout 5 cmd //c ..., xargs..., nice...),
-//     quoted "cmd" //c, escaped \\cmd //c: same fault; wrapper argument
-//     structures are an open set (timeout/nice/xargs), the quoted and
-//     escaped spellings are not the builder's habit (measured: zero organic
-//     occurrences in this machine's command log).
-//   - POSIX path arguments of native programs (`git -F /tmp/x`, `python
-//     /tmp/x.py`): conversion is what makes them work natively; here they
-//     fail loudly. Deciding which argument is a path is per-program (open
-//     set) and rewriting every /... token would corrupt string/regex data.
-//   - envp residual boundaries (see the scanner section): quoted-leading and
-//     list/backslash values, root-relative and single-letter drive roots,
-//     tight VAR=/c$(...), redirect-interleaved prefixes, standalone "node",
-//     function bodies and msys internals that read the value back -- native
-//     converts these (or reads the value it kept); the scanner cannot see an
-//     unquoted full value or a program's argument semantics without the
-//     same open-set guessing.
-//
-// Scope discipline: NATIVE EXECUTION WINS -- agent errors and syntax that
-// fails under its own native execution are left loud. Uncertainty resolves to
-// "do not touch": an undetectable bash or a failed probe leaves the plugin
-// inert (寧可漏修，不可誤修：誤修是靜默破壞正確語法；漏修是環境層未修的故障臺,
-// 大聲只是失敗形態,不是不修的豁免).
+// Not fixed (inventory against regression; per-item evidence in spec.md):
+//   NATIVE (return == native): C:\tmp in file tools (a legal Windows path,
+//     the native write simply succeeds); MSYS drive-letter paths (the
+//     host's tool layer maps them itself -- a rewrite would be duplicate
+//     protection); `nul` redirect targets (bash-native behaviour);
+//     natively-broken `cmd //?`, `///c`, `//server/share` (the model's own
+//     syntax error).
+//   MISSED (return != native, but every static rewrite is an open-set
+//     guess): //flags of other /-switch programs (taskkill/sc/net/reg/
+//     robocopy/findstr -- robocopy does not fail loudly: it treats //xxx as
+//     a source path, Windows normalizes it to a UNC path and its default
+//     retry loop hangs forever, while natively //xxx converts and fails
+//     fast -- the outcomes diverge either way, loudness is not the
+//     criterion, the return != native is); cmd behind external wrappers,
+//     quoted "cmd" //c, escaped \cmd //c (zero organic occurrences);
+//     POSIX path arguments of native programs; envp residual value shapes
+//     (see the scanner section and spec.md "envp 殘餘形").
+//   cmd's GBK mojibake is its own case: the host's UTF-8 decode differs
+//     from what a native terminal prints (strictly return != native =
+//     漏修), but the faithful fix lives in the host's decode layer -- out
+//     of this plugin's scope; the mojibake is the visible, self-correcting
+//     signal.
 
 import * as os from "node:os";
 import * as path from "node:path";
@@ -437,51 +380,19 @@ export function splitTempPrefix(pattern: string): { dir: string; rest: string } 
 // ---- shell command scan: cmd doubled flags, position-aware ----------------
 
 // Two rewrites, one position-aware scan:
-//   cmdFlag: `cmd //c|//k` -> /c|/k (the interactive-cmd failure above);
-//     fires only when the caller says the conversion layer is OFF (the hook
-//     probes it; with conversion ON `//c` is the spelling that works, so
-//     rewriting it would BE the side effect -- scanner trusts the caller).
-//   envPath: a command-position assignment prefix with a POSIX absolute path
-//     value (`A=/c/x node …`) gets the native envp conversion value. Measured
-//     on this machine (Git for Windows 2.56.0): with conversion ON, the
-//     msys->native exec boundary converts the VALUE grammar, name-agnostic
-//     (`A=/c/x node` -> node receives C:/x; `bash -c 'echo $A'` stays /c/x;
-//     `A=/c$(echo foo)` -> <msys-root>/cfoo; tight `A=/c/x$(pwd) node` >=
-//     prefix + verbatim suffix = native conversion of the joined value). This
-//     machine's .bashrc sets MSYS_NO_PATHCONV through BASH_ENV, so that layer
-//     is off here and the value arrives raw, resolved by Node as a
-//     drive-relative path (path.resolve('/c/x') -> C:\c\x, exit 0 -- silent).
-//     The rewrite reproduces ONLY that layer's two verifiable anchors
-//     (deliberate conservatism, NOT a claim that the native layer converts
-//     nothing else -- colon-list values convert natively with their own
-//     rule set, and are left as misses): the drive-letter form is
-//     LETTER-GENERIC (measured: /m /b /q /x /y /z all resolve through the
-//     msys mount table and convert natively -> M:/x etc.) and the /tmp
-//     anchor:
-//     `A=/<drive>[...]` -> X:<...> (case-insensitive in, capital drive,
-//     forward slashes, native-identical), `A=/tmp[...]` -> the realTempDir
-//     anchor.
-//     Staged per assignment token (span in the output), applied only when a
-//     real command word of the same simple command lands -- the value is then
-//     KNOWN to cross the exec boundary; standalone assignments are shell
-//     variables whose POSIX value is bash-side semantics (rewriting them IS
-//     the mis-fix). Drop points (each pins one discard path): separators,
-//     `&` background, newline, redirect (incl. fd targets), heredoc, `#` as
-//     the word head, EOF. The one keep: a closed `$( )` restoring command
-//     position -- `VAR=/c/x$(pwd) node` closes the value with the following
-//     command word.
-// Values deliberately not rewritten (residual misses -- the native layer
-//   converts them, the scanner cannot see an unquoted full value, and the
-//   direction is loud-or-native-safe): quoted-leading values, list / backslash
-//   values, root-relative values (/usr... -> MSYS install root, mount
-//   dependent), tight forms whose static prefix
-//   stops at the drive letter (VAR=/c$(...)), the standalone quoted word
-//   ("node"), and redirect-interleaved prefixes (A=/c/x > log node).
-// Mixed boundary, applied-bias kept (documented residual): functions and other
-//   msys programs are an open set -- when their dynamic scope spawns native,
-//   native converts just like this rewrite; when the value is only read
-//   back, native does not convert and the rewrite diverges (rare, silent).
-//
+//   cmdFlag: `cmd //c|//k` -> /c|/k (the interactive-cmd failure in the
+//     header). Fires only when the caller says the conversion layer is OFF
+//     (the hook probes it; scanner trusts the caller, and applyPendingEnv
+//     re-checks). Why only cmd and where the boundary sits: docs/spec.md
+//     "刻意不修與漏修的分界".
+//   envPath: a command-position assignment prefix with a POSIX absolute
+//     path value gets the native envp conversion value. The value shapes
+//     and their anchors live in convertEnvPath; the staging model in
+//     pendingEnv / applyPendingEnv; the tight dynamic-tail form's
+//     composition rule at the `(` branch. The measured native fact base
+//     (name-agnostic grammar, drive-letter-generic anchors, the residual
+//     value shapes deliberately left as misses): docs/spec.md
+//     (掃描器要點 / envp 殘餘形).
 // Returns flags separately (telemetry): an envPath rewrite must not be
 // counted under a synthetic "rewritten !== input" heuristic as a cmd-flag fix.
 export interface BashScanResult {
@@ -973,42 +884,35 @@ function scanBash(command: string, convOff = true): BashScanResult {
 }
 
 // ---- OpenCode hook wiring -------------------------------------------------
-// Two hooks, each on the boundary where the environment breaks the command:
+// Two hooks, each on the boundary where the environment breaks the command
+// (wiring facts -- inputs are mutable and both mutations land on the spawned
+// command line, measured on v2.2.5 -- are in docs/spec.md〈oc 版：接線與閘門〉):
 //   ctx.shell.hook("create.before") -> event.command (the exact string the host
 //     hands to the shell) and event.cwd (the shell's `workdir`, still
 //     unresolved here). `shell` names the executable it will spawn, so both
 //     rewrites are gated on that shell being a verified MSYS bash; the //c
-//     rewrite additionally needs the MSYS_NO_PATHCONV probe. A cmd/pwsh/WSL
-//     shell or an unknown value leaves everything untouched.
+//     rewrite additionally needs the MSYS_NO_PATHCONV probe.
 //   ctx.tool.hook("execute.before") -> event.input for the file tools: `path`,
 //     plus `patch.patchText` (paths live in its directive lines) and a
 //     `glob.pattern` whose temp prefix becomes `path`. The host resolves these
-//     paths itself (no MSYS mapping), so the rewrite belongs on that side;
-//     `input` is mutable in this hook and the mutation reaches execution. A
-//     missing tool name or key fails safe: nothing is rewritten, which is the
-//     pre-plugin status quo, and loud failures self-correct.
-// Measured on v2.2.5: both mutations land on the spawned command line.
+//     paths itself (no MSYS mapping), so the rewrite belongs on that side.
+//     A missing tool name or key fails safe: nothing is rewritten, which is
+//     the pre-plugin status quo, and loud failures self-correct.
 
 const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
 
 // ---- usage telemetry -------------------------------------------------------
 // Counts how often the guarded tools actually run and which fixes fire, to
 // measure the plugin's real hit rate. Same taxonomy as the pi sibling:
-//   denominator  toolCalls[tool] -- one bump per guarded-tool call, POST-gate
-//     (the hooks only exist after the win32 + findBash gates pass, and the
-//     bash bump sits behind the MSYS shell check, so off-platform calls and
-//     foreign shells never inflate the base)
-//   numerator    fixes[key] -- one bump per actual rewrite, keyed by fault
-//     point; same-nature variants share one key (/tmp, $TEMP, ${TEMP},
-//     %TEMP% all count as "path.temp"; //c, //q //c and tight cmd//c all
-//     count as "shell.cmdFlag"; A=/c/... and A=/tmp/... prefixes both count
-//     as "shell.envPath"), different kinds stay separate.
-//     OC-only keys: glob.tempPrefix, patch.tempLine, shell.workdir.temp.
-// Storage: ctx.storage (the host's official plugin-scoped durable JSON --
-// it lands in opencode.db's kv table; read it read-only with sqlite, never
-// by guessing at the db schema from the plugin). Numerators persist at once
-// (they are rare); denominators batch on a 5s debounce, and the setup
-// cleanup flushes what is pending. Every failure is swallowed: telemetry
+// denominator toolCalls[tool] bumps POST-gate (off-platform calls and
+// foreign shells never inflate the base); numerator fixes[key] bumps per
+// actual rewrite, keyed by fault point, same-nature variants merged into
+// one key (path.temp / shell.cmdFlag / shell.envPath; OC-only keys:
+// glob.tempPrefix, patch.tempLine, shell.workdir.temp). Storage: ctx.storage
+// (the host's official plugin-scoped durable JSON -- lands in opencode.db's
+// kv table; read it read-only with sqlite, never by guessing at the db
+// schema from the plugin). Write timing lives in the functions below; every
+// failure is swallowed: telemetry must never change what a tool call does.
 // must never change what a tool call does.
 
 const STATS_KEY = "stats";

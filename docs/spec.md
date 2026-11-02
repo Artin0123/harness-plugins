@@ -111,6 +111,9 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   `/tmp/eg.log` 反而會靜默寫到另一個位置——這是誤修方向，目標原樣不動。
 - 原生就壞的 cmd 雙斜線形（`cmd //?`、`cmd ///c`、`cmd //server/share`）——
   實測轉換開啟時一樣進互動模式：模型自己寫錯，不修。
+- MSYS 磁碟路徑（`/c/Users/...`）——host 的工具層自己映射（pi：read／e2e 落點
+  正確；oc：read v2.2.1、shell `workdir` v2.2.5 重測，落在正確目錄）；再改寫
+  ＝重複防護、純副作用。
 - 其他 cmd-ism（`del`、`dir /b`…）——`del` 真的不存在，"command not found"
   是 bash 自己的訊息（工具回傳≡原生）；`dir` 存在（/usr/bin/dir）但它是 MSYS
   程式（msys→msys 邊界不轉換），`/b` 兩種環境都原樣抵達、同樣 rc=2
@@ -187,13 +190,19 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
 
 ## oc 版：接線與閘門
 
-- 路徑類：`ctx.tool.hook("execute.before")` 改 `event.input`（`path` / `patchText` /
-  `glob` 的 `pattern`）。
+- 路徑類：`ctx.tool.hook("execute.before")` 改 `event.input`（`path` /
+  `patchText` / `glob` 的 `pattern`）——input 可就地改動、改動直達執行
+  （v2.2.5 實測兩處改寫都落到 spawn 的指令行）。
 - 指令類：`ctx.shell.hook("create.before")` 改 `event.command` 與 `event.cwd`。
+- temp 錨點問 bash 本身（`cygpath -w /tmp`）：`os.tmpdir()` 不是權威——本機對
+  native 子行程 MSYS 已把 TEMP 轉成 Windows 路徑（實測），但定義 `/tmp` 的是
+  shell 工具的 bash；`os.tmpdir()` 只在是真盤符路徑時當 fallback，無錨點 →
+  改寫整體 inert（不猜 AppData 佈局）。
 - 兩者都先驗證 `event.shell` 真的是 MSYS bash（`uname -s`，按執行檔快取），`//c`
-  改寫再加一道 `$MSYS_NO_PATHCONV` 探測（同樣按 shell 快取，envp 改寫共用同一道
-  閘門——轉換開啟時原生層會自己做，改寫是重複防護；掃描器內的 convOff 複查在此
-  配置下是無害冗餘）。任何閘門失敗 → 整體不動（不動時留在漏修臺＝環境層故障未
+  改寫再加一道 `$MSYS_NO_PATHCONV` 探測（presence-based：`0`／空字串也停用，
+  實測——探測驗「有設」（`${VAR+x}`）而非 `=1`；同樣按 shell 快取，envp 改寫共用
+  同一道閘門——轉換開啟時原生層會自己做，改寫是重複防護；掃描器內的
+  convOff 複查在此配置下是無害冗餘）。任何閘門失敗 → 整體不動（不動時留在漏修臺＝環境層故障未
   修；誤修是靜默破壞正確語法，比漏修嚴重）。
 
 ### 掃描器要點（pi / oc 共用語法感知規則）
