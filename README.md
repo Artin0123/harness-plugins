@@ -163,29 +163,58 @@ sub-agent 也拿不到。改常數後 `/mods reload`（或新 session）生效�
 
 pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法不同：
 
+需求：pi **≥ 0.48.0**（探測對象用 pi 自己匯出的 `getShellConfig`——它自 0.48.0
+起 export；舊宿主上擴充會整體停用並在第一次工具呼叫時通知一次，不會默默失效）。
+
 | 項目                                                  | pi 版做法                                                                                                                                        |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                          |
-| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴（外部 wrapper 如 timeout/xargs 維持不修＝漏修臺：靜態修法需開放集合的參數結構猜測） |
-| 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字） | 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把值轉成 Windows 形式；本機被 `MSYS_NO_PATHCONV` 停用 → 值原樣抵達、被當磁碟相對路徑寫到 `C:\c\...`（靜默錯位）。重現該層規則改寫（盤符→`C:/...`、`/tmp`→錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發，實測這些形原生不走 envp 轉換或方向安全） |
+| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴與獨立成詞的引號指令字（`"cmd" //c`——引號不改變 word 身分）；指令字用 basename 比對，`\cmd`、`/c/Windows/System32/cmd.exe`、`"C:/…/cmd.exe"` 都是同一顆 cmd（實測三形同一個故障）。外部 wrapper 如 timeout/xargs 維持不修＝漏修臺：靜態修法需開放集合的參數結構猜測 |
+| 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字） | 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把值轉成 Windows 形式；本機被 `MSYS_NO_PATHCONV` 停用 → 值原樣抵達、被當磁碟相對路徑寫到 `C:\c\...`（靜默錯位）。重現該層規則改寫（盤符→`C:/...`、`/tmp`→錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）與引號內建（`A=/c/x "bash" -c`）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發，實測這些形原生不走 envp 轉換或方向安全；`env X=/c/... node` 的賦值參數會跨邊界、照樣修，exec/command/builtin 後的賦值形原生就錯、不修） |
 
-**刻意不修**（原生行為或模型自身錯誤，讓它壞）：`C:\tmp`（原生寫入會成功）、
-MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析層原生正確映射）、`nul` 重導向
-（bash 原生行為——重測會建實體 `nul` 檔、`rm nul` 可刪；`<nul`／`2>&nul` 大聲
-失敗）、`/` 前綴原生工具的雙斜線旗標（`taskkill //IM`、`sc //query`…——同一
-故障點但失敗大聲、agent 可自癒）、賦值值的其他形態（根相對路徑、引號值、清單
-值、`env X=...` wrapper 參數、standalone 賦值）、其他 cmd-ism（`del`、
-`dir /b`、`robocopy //mir`…）、原生 exe 的 posix 路徑參數（`python /tmp/x.py`
-——大聲失敗，agent 可用 `cygpath -w` 自癒）、cmd 的非 ASCII 亂碼（無忠實改寫，
-亂碼本身就是可見、可自矯正的訊號）。完整理由見 spec。
+**零效應改寫不新增**：會被改寫的輸入都真的跑過「原版 vs 改寫版」比對 exit 與
+stdout（80 條語料）——文字有變、行為一樣的形一律不動（細節見 spec）。只剩
+`case $x in esac) …`（語法錯誤行）是已記載的例外。
+
+**刻意不修**（回傳≡原生：原生就壞，或 host 已經處理——讓它壞，agent 看得到
+真原因）：`C:\tmp`（原生寫入成功）、MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析
+層原生映射）、`~` 展開（host 自己做）、`nul` 重導向（bash 原生：建實體 `nul`
+檔／ENOENT／ambiguous redirect）、重導向目標的 `//x`、`cmd //?`／`cmd ///c`／
+`cmd //server/share`（模型錯字）、**緊貼形** `cmd//c`／`"cmd"//c`（bash 當程式名、
+原生 127）、`exec/command/builtin X=…` 與引號偽賦值（原生當指令名跑）、
+`del`／`dir /b`／`sc /query` 等 cmd-ism、未引號 `C:\…\cmd.exe`（跳脫吃掉反斜線、
+原生 127）、`( … ) cmd …`（語法錯誤）。
+
+**只能靠「寫對」的形**（插件不修或不該修；唯一改善途徑是改寫法——完整表在
+spec〈只能靠「寫對」的形〉）：
+
+- 原生工具的旗標：**gate ON（`MSYS_NO_PATHCONV` 有設）時寫單斜線**
+  `taskkill /IM x`；`//IM` 是給「轉換開啟」環境的寫法（實測本機 `//IM` 無效、
+  `/IM` 可用；原生相反）。
+- 給原生 exe 的路徑用 Windows 形式（`python C:/x.py`）或先 `cygpath -w`。
+- 不要在 wrapper（`timeout`/`xargs`/`nice`）或 `time -p` 之後放 `cmd //c`；
+  也不要把它塞進引號 payload（`bash -c '…'`）或反斜線續接。
+- envp 前綴值寫盤符形式（`A=C:/x`）；重導向／`env -u` 選項放到指令後面。
+- cmd 輸出 GBK 亂碼、以及指令字串裡成對反斜線被 `-c` 折一層——治療點在宿主
+  （解碼層／transport），插件只能記錄；要保位元組請用 write 工具落檔。
 
 通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
 
 ### 使用統計
 
 統計清單內工具的呼叫次數（分母 `toolCalls`）與各修復的觸發次數（分子
-`fixes`）：`path.temp`（各種 temp 寫法合計）、`shell.cmdFlag`（`//c` 多旗標
-合計）、`shell.envPath`（前綴賦值路徑值合計）。分類學與 OC 版共用，可直接對照。
+`fixes`）。**key ＝故障機制**，同一機制的拼法合併、機制不同就分開：
+
+| key | 故障機制 | 合併的 variant |
+| --- | --- | --- |
+| `path.tempMount` | host 不套 MSYS 掛載映射 | `/tmp`、`/TMP`、`/tmp\foo` |
+| `path.tempVar` | host 不展開變數 | `$TEMP/$TMP/$TMPDIR`、`${…}`、`%TEMP%` |
+| `shell.cmdFlag` | msys argv 旗標轉換被關 | `//c`、`//k`、多旗標、引號名、basename 路徑 |
+| `shell.envPath` | msys envp 賦值值轉換被關 | 碟符值與 `/tmp` 值 |
+
+舊版把 `/tmp` 與 `$TEMP` 合在 `path.temp`（兩個不同故障），已拆開；舊檔的
+`path.temp` 不重新命名。分類學與 OC 版共用（OC 各 surface 已用同一組
+Mount/Var 鍵），可直接對照。
 
 儲存：`~/.pi/agent/env-guard-stats.json`（pi 官方 agent 目錄，吃
 `PI_CODING_AGENT_DIR` 覆蓋），**直接開檔即看**：
@@ -195,7 +224,7 @@ MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析層原生正確映射）、
   "schema": 1,
   "since": "2025-01-01T00:00:00.000Z",
   "toolCalls": { "read": 123, "bash": 45 },
-  "fixes": { "path.temp": 7, "shell.cmdFlag": 9, "shell.envPath": 2 }
+  "fixes": { "path.tempMount": 5, "path.tempVar": 2, "shell.cmdFlag": 9, "shell.envPath": 2 }
 }
 ```
 
@@ -219,12 +248,34 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 | `glob` 的 `pattern` 內嵌路徑        | `pattern: "${TEMP}/*.txt"` 靜默回 0 筆（假陰性）                                                                                                                                                                                       | 只在**沒有另給 `path`** 時，把前綴 temp 目錄拆到 `path`、其餘留給 `pattern`；有給 `path` 就完全不動                                                                           |
 | `patch` 的 `patchText`              | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾                                                                                                                                                                              | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動。四種都實測過（含改名與刪除）        |
 | `shell` 的 `workdir`                | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp`                                                                                                                                                                   | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`）                                                                                                                           |
-| `shell` 的 `command`                | `BASH_ENV` 指到的 `.bashrc` 設了 `MSYS_NO_PATHCONV=1`，`cmd //c` 原樣抵達 cmd → 進互動模式（實測 stdin 關閉時：exit 0，輸出是 banner＋版權聲明＋提示符，第一行與 `ver` 幾乎同形；GBK 編碼，沒改寫時模型會把 banner 讀成 `ver` 的答案） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、貼緊的 `cmd//c` 都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動      |
-| `shell` 的 `command`（賦值前綴）    | 同一個 `MSYS_NO_PATHCONV=1` 關掉 envp 轉換：`VAR=/c/foo node …` 的值原樣抵達，被 node 當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位、exit 0）                                                                                               | 只修**指令位置賦值＋後接真指令字**的靜態未引號整值：盤符形（字母通用，`/m`、`/q` 等皆經 mount 表）→ 大寫盤符＋正斜線、`/tmp` 形 → cygpath 錨點；standalone 賦值是 shell 變數（bash 端需要 POSIX 值）＋所有丟棄點（分隔符／背景 `&`／換行／重導向／heredoc／詞首 `#`／EOF）不動 |
+| `shell` 的 `command`                | `BASH_ENV` 指到的 `.bashrc` 設了 `MSYS_NO_PATHCONV=1`，`cmd //c` 原樣抵達 cmd → 進互動模式（實測 stdin 關閉時：exit 0，輸出是 banner＋版權聲明＋提示符，第一行與 `ver` 幾乎同形；GBK 編碼，沒改寫時模型會把 banner 讀成 `ver` 的答案） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、獨立成詞的引號指令字（`"cmd" //c`——引號不改變 word 身分）都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動。緊貼形 `cmd//c` 不修（bash 當程式名、原生 127 大聲＝模型錯字） |
+| `shell` 的 `command`（賦值前綴）    | 同一個 `MSYS_NO_PATHCONV=1` 關掉 envp 轉換：`VAR=/c/foo node …` 的值原樣抵達，被 node 當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位、exit 0）                                                                                               | 只修**指令位置賦值＋後接真指令字**的靜態未引號整值：盤符形（字母通用，`/m`、`/q` 等皆經 mount 表）→ 大寫盤符＋正斜線、`/tmp` 形 → cygpath 錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）、引號內建（`A=/c/x "bash" -c`——去引號後是內建）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發；`env X=/c/... node` 的賦值參數會跨邊界、照樣修，exec/command/builtin 後的賦值形原生就錯、不修。standalone 賦值是 shell 變數（bash 端需要 POSIX 值）＋所有丟棄點（分隔符／背景 `&`／換行／重導向／heredoc／詞首 `#`／EOF）不動 |
 
 **刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
 （OpenCode 工具層自己解析正確）、`nul` 重導向（bash 原生行為）、cmd 的非 ASCII 亂碼
-（無忠實改寫，亂碼本身就是可見、可自矯正的訊號）。
+（無忠實改寫，亂碼本身就是可見、可自矯正的訊號）、**緊貼形**雙斜線（`cmd//c`、
+`"cmd"//c`——bash 把 `cmd//c` 當程式名，原生就是 `No such file or directory`／127；
+插空格把一個詞拆成兩個＝替模型改錯字，沒有環境故障點）、`exec`／`command`／`builtin`
+後的賦值形（`command X=/c/x node`——bash 把 `X=/c/x` 當指令名跑、原生就大聲失敗）、
+原生 exe 的 POSIX 路徑參數（`python /tmp/x.py`——大聲失敗、可用 `cygpath -w` 自癒）。
+
+**只能靠「寫對」的形**（插件不修或不該修；唯一改善途徑是改寫法——完整表在
+spec〈只能靠「寫對」的形〉）：
+
+- 原生工具的旗標：**gate ON（`MSYS_NO_PATHCONV` 有設）時寫單斜線**
+  `taskkill /IM x`；`//IM` 是給「轉換開啟」環境的寫法（實測本機 `//IM` 無效、
+  `/IM` 可用）。
+- `cmd` 的程式名直接寫 `cmd`（或全正斜線的 `/c/.../cmd.exe`）；未引號的
+  `C:\Windows\…\cmd.exe` 原生 127（`-c` 傳輸＋lexer 吃掉反斜線）。
+- 給原生 exe 的路徑用 Windows 形式（`python C:/x.py`）或先 `cygpath -w`。
+- 不要把 `cmd //c` 放進外部 wrapper（`timeout`/`xargs`/`nice`）、`time -p`、
+  引號 payload（`bash -c '…'`）或反斜線續接；寫在指令位置。
+- envp 前綴值直接寫盤符形式（`A=C:/x`）；重導向／`env -u` 選項放到指令後面。
+- 子殼或 `fi`／`done`／`esac`／`}` 之後要接指令，請加 `;`／`&&`／換行
+  （直接接指令字是 bash 語法錯誤）；函式本體用 `f() { …; }` 形式（
+  `function f { …; }` 內的 `cmd //c` 目前漏修）。
+- cmd 輸出的 GBK 亂碼、以及指令字串裡成對反斜線被 `-c` 折一層——治療點在宿主
+  （解碼層／transport），插件只能記錄；要保位元組請用 write 工具落檔或 `\134`。
 
 **不適用／未涵蓋**：`experimental_image_generate` 的 `path`（本機沒有 image model，
 無從實測）；`session_move` 的 `directory`（session 工具、不是檔案路徑消費者）。
@@ -232,8 +283,24 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 ### 使用統計
 
 與 pi 版同一套分類學：分母 `toolCalls`（清單內工具，gate 之後才算）、分子
-`fixes`（`path.temp` / `glob.tempPrefix` / `patch.tempLine` / `shell.workdir.temp`
-/ `shell.cmdFlag` / `shell.envPath`，同類 variant 合計）。
+`fixes`。**key ＝ surface × 故障機制**：同一機制的拼法合併、機制不同就分開；
+同一個 temp 機制在每個 surface 各有一個鍵（修好 `/tmp` 的掛載映射不代表修好
+`$TEMP` 的變數展開）：
+
+| key | 故障機制 | 合併的 variant |
+| --- | --- | --- |
+| `path.tempMount` / `path.tempVar` | 檔案工具 `path`：host 不套 MSYS 映射／不展開變數 | 上列兩族 |
+| `glob.tempMount` / `glob.tempVar` | glob pattern 前綴：同一組機制 | 上列兩族 |
+| `patch.tempMount` / `patch.tempVar` | patch 指令行：同一組機制 | 上列兩族 |
+| `shell.workdir.tempMount` / `shell.workdir.tempVar` | shell `workdir`：同一組機制 | 上列兩族 |
+| `shell.cmdFlag` | msys argv 旗標轉換被關 | `//c`、`//k`、多旗標、引號名、basename 路徑 |
+| `shell.envPath` | msys envp 賦值值轉換被關 | 碟符值與 `/tmp` 值 |
+
+`path.other`／`patch.other`／`shell.workdir.other` 是可見的 fallback（glob split
+只回 temp 命中，沒有 `.other`）：未來新增了不屬於 temp 族的改寫，會落在對應的
+`.other`，不會靜默混進別人的鍵。舊 key（`path.temp` /
+`glob.tempPrefix` / `patch.tempLine` / `shell.workdir.temp`）不重新命名——歷史
+值照舊，新計數走新鍵。
 
 儲存走官方 `ctx.storage`（plugin-scoped durable JSON），實體落在
 `~/.local/share/opencode/opencode.db` 的 `kv` 表。查看用唯讀 SQLite（WAL 模式

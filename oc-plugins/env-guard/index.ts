@@ -49,17 +49,25 @@
 //     host's tool layer maps them itself -- a rewrite would be duplicate
 //     protection); `nul` redirect targets (bash-native behaviour);
 //     natively-broken `cmd //?`, `///c`, `//server/share` (the model's own
-//     syntax error).
+//     syntax error); the tight spelling `cmd//c` / `"cmd"//c` (bash takes it
+//     as a PROGRAM NAME: natively `No such file or directory`/127 in both
+//     conversion states, loud and self-correcting -- inserting a space only
+//     rewrites the model's typo; the environment layer is not broken).
 //   MISSED (return != native, but every static rewrite is an open-set
 //     guess): //flags of other /-switch programs (taskkill/sc/net/reg/
 //     robocopy/findstr -- robocopy does not fail loudly: it treats //xxx as
 //     a source path, Windows normalizes it to a UNC path and its default
 //     retry loop hangs forever, while natively //xxx converts and fails
 //     fast -- the outcomes diverge either way, loudness is not the
-//     criterion, the return != native is); cmd behind external wrappers,
-//     quoted "cmd" //c (zero organic occurrences; the escaped \cmd spelling
-//     IS covered by the basename isCmdTok -- bash runs \cmd exactly like
-//     cmd, measured \cmd //c ver rewrites);
+//     criterion, the return != native is); cmd behind external wrappers;
+//     cmd inside a quoted payload an inner program executes (`bash -c
+//     'cmd //c ver'` -- quoted content is data to the scanner, and which
+//     programs take their first argument as a script is an open set; measured: conv-ON prints ver's output,
+//     conv-OFF starts the interactive-cmd silent failure); `time -p cmd
+//     //c ver` (bare `time` is a covered keyword, but `-p` ends the
+//     position -- measured, same silent failure; organic frequency ~0);
+//     `function NAME { … }` bodies (the name slot is not tracked; `f() { … }`
+//     is tracked and works);
 //     POSIX path arguments of native programs; envp residual value shapes
 //     (see the scanner section and spec.md "envp 殘餘形").
 //   cmd's GBK mojibake is its own case: the host's UTF-8 decode differs
@@ -314,10 +322,33 @@ function matchParen(s: string, from: number): number {
   return -1;
 }
 
-// The temp forms a host-side path resolver never expands: /tmp and the
-// bash/cmd variables. One list, used by the path rewrite and the glob prefix
-// split so the two can never drift apart.
-const TEMP_FORM = /^(?:\/tmp|\$(?:tmpdir|temp|tmp)|\$\{(?:tmpdir|temp|tmp)\}|%(?:temp|tmp)%)/i;
+// The temp forms a host-side path resolver never expands: /tmp (MSYS mount)
+// and the bash/cmd variables. ONE list feeds the path rewrite, the glob prefix
+// split, the patch directives and the workdir rewrite -- and the same call
+// returns the mechanism used for the stats key, so "value changed" and "counted"
+// can never disagree (the old two-regex setup could add a form to one side only).
+export type TempMechanism = "tempMount" | "tempVar";
+const TEMP_FAMILIES: { mechanism: TempMechanism; re: RegExp }[] = [
+  // POSIX /tmp: the host does not apply the MSYS mount mapping
+  { mechanism: "tempMount", re: /^\/tmp([\\/].*)?$/i },
+  // variables: the host does not expand them (bash $VAR/${VAR}, cmd %VAR%)
+  { mechanism: "tempVar", re: /^\$(?:tmpdir|temp|tmp)([\\/].*)?$/i },
+  { mechanism: "tempVar", re: /^\$\{(?:tmpdir|temp|tmp)\}([\\/].*)?$/i },
+  { mechanism: "tempVar", re: /^%(?:temp|tmp)%([\\/].*)?$/i },
+];
+
+function splitTempPath(p: string): { mechanism: TempMechanism; rest: string } | null {
+  for (const f of TEMP_FAMILIES) {
+    const m = f.re.exec(p);
+    if (m) return { mechanism: f.mechanism, rest: m[1] ?? "" };
+  }
+  return null;
+}
+
+// Classification alone (tests / callers that do not rewrite).
+export function classifyTempPath(p: string): TempMechanism | null {
+  return splitTempPath(p)?.mechanism ?? null;
+}
 
 // File-tool path rewrite: the temp-dir forms only. Everything else --
 // relative paths, other drives, drive-letter MSYS paths (handled natively by
@@ -325,19 +356,24 @@ const TEMP_FORM = /^(?:\/tmp|\$(?:tmpdir|temp|tmp)|\$\{(?:tmpdir|temp|tmp)\}|%(?
 // failure point is this host's Windows path resolution; on other platforms
 // /tmp and $TEMP are native semantics and rewriting them would BE the side
 // effect. No measured anchor -> inert (no guessed layout).
-export function rewritePath(p: string): string {
+// Returns the value AND the mechanism; the hook uses the same result for the
+// rewrite and the stats key (a future non-temp rewrite gets a null mechanism
+// and is counted under `<surface>.other` -- visible, never mislabelled).
+export function rewritePathFix(p: string): { value: string; mechanism: TempMechanism | null } {
   // checked at call time (not a captured const) so the battery can pin the
   // non-Windows behaviour with a platform override
-  if (process.platform !== "win32") return p;
-  const head = TEMP_FORM.exec(p);
-  if (!head) return p;
-  const rest = p.slice(head[0].length);
-  // $TEMPFILE/x, /tmpfoo/x and friends are not the temp dir
-  if (rest !== "" && !/^[\\/]/.test(rest)) return p;
+  if (process.platform !== "win32") return { value: p, mechanism: null };
+  const hit = splitTempPath(p);
+  if (!hit) return { value: p, mechanism: null };
   const realTemp = realTempDir();
-  if (!realTemp) return p;
-  const tail = rest.replace(/\//g, "\\").replace(/\\+$/, "");
-  return tail ? realTemp + tail : realTemp;
+  if (!realTemp) return { value: p, mechanism: null };
+  const tail = hit.rest.replace(/\//g, "\\").replace(/\\+$/, "");
+  return { value: tail ? realTemp + tail : realTemp, mechanism: hit.mechanism };
+}
+
+// Thin value-only wrapper (existing callers/tests).
+export function rewritePath(p: string): string {
+  return rewritePathFix(p).value;
 }
 
 // ---- patch text: same host-side paths, written as patch directives ---------
@@ -347,20 +383,31 @@ export function rewritePath(p: string): string {
 // "${TEMP}/x" landed in a literal "${TEMP}" directory under the project), so
 // the same temp forms rewrite -- and only on directive lines, so patch content
 // (whose lines start with ' ', '+' or '-') is never touched.
+// A single patch call may contain both mechanisms; the result reports every
+// mechanism actually rewritten so the hook can bump each key once (a patch is
+// one tool call, not one line).
 
 const PATCH_PATH_LINE = /^(\*\*\* (?:Add|Update|Delete) File: |\*\*\* Move to: )([^\r\n]+?)(\r?)$/;
 
-export function rewritePatchText(text: string): string {
-  if (!text.includes("*** ")) return text;
-  return text
+export function rewritePatchTextFix(text: string): { text: string; mechanisms: TempMechanism[] } {
+  if (!text.includes("*** ")) return { text, mechanisms: [] };
+  const found = new Set<TempMechanism>();
+  const out = text
     .split("\n")
     .map((line) => {
       const m = PATCH_PATH_LINE.exec(line);
       if (!m) return line;
-      const rewritten = rewritePath(m[2]!);
-      return rewritten === m[2] ? line : m[1]! + rewritten + m[3]!;
+      const fix = rewritePathFix(m[2]!);
+      if (fix.value === m[2]) return line;
+      if (fix.mechanism) found.add(fix.mechanism);
+      return m[1]! + fix.value + m[3]!;
     })
     .join("\n");
+  return { text: out, mechanisms: [...found] };
+}
+
+export function rewritePatchText(text: string): string {
+  return rewritePatchTextFix(text).text;
 }
 
 // A glob pattern may carry the directory itself ("${TEMP}/*.txt"). glob has no
@@ -368,25 +415,28 @@ export function rewritePatchText(text: string): string {
 // 0 results -- a silent false negative), so the leading temp form moves into
 // `path` and the rest stays the pattern. Only used when the call has no path,
 // so a call that works today is never reshaped.
-export function splitTempPrefix(pattern: string): { dir: string; rest: string } | null {
+export function splitTempPrefix(pattern: string): { dir: string; rest: string; mechanism: TempMechanism } | null {
   if (process.platform !== "win32") return null;
-  const head = TEMP_FORM.exec(pattern);
-  if (!head) return null;
-  const rest = pattern.slice(head[0].length);
-  if (!/^[\\/].+/.test(rest)) return null;
+  const hit = splitTempPath(pattern);
+  if (!hit) return null;
+  if (!/^[\\/].+/.test(hit.rest)) return null;
   const realTemp = realTempDir();
   if (!realTemp) return null; // no anchor: leave the pattern alone
-  return { dir: realTemp, rest: rest.slice(1).replace(/\\/g, "/") };
+  return { dir: realTemp, rest: hit.rest.slice(1).replace(/\\/g, "/"), mechanism: hit.mechanism };
 }
 
 // ---- shell command scan: cmd doubled flags, position-aware ----------------
 
 // Two rewrites, one position-aware scan:
 //   cmdFlag: `cmd //c|//k` -> /c|/k (the interactive-cmd failure in the
-//     header). Fires only when the caller says the conversion layer is OFF
-//     (the hook probes it; scanner trusts the caller, and applyPendingEnv
-//     re-checks). Why only cmd and where the boundary sits: docs/spec.md
-//     "刻意不修與漏修的分界".
+//     header). Command position is relative to a closed WORD (`echo cmd //c`
+//     stays data; a standalone quoted word carries the same identity --
+//     quote removal happens before the command word is parsed; the tight
+//     `cmd//c` is a different word to bash and is left alone). Fires only
+//     when the caller says the conversion layer is OFF (the hook probes it;
+//     scanner trusts the caller -- both rewrites gate on the same convOff
+//     flag, which defaults to false). Why only cmd and where the boundary
+//     sits: docs/spec.md "刻意不修與漏修的分界".
 //   envPath: a command-position assignment prefix with a POSIX absolute
 //     path value gets the native envp conversion value. The value shapes
 //     and their anchors live in convertEnvPath; the staging model in
@@ -403,7 +453,11 @@ export interface BashScanResult {
   envPathFixed: boolean;
 }
 
-export function rewriteBashCommand(command: string, convOff = true): BashScanResult {
+// convOff defaults to FALSE: both rewrites (cmdFlag and envp) gate on the
+// caller's probe verdict, so a direct call without gate evidence is a no-op
+// -- uncertainty never enables a rewrite (the hook passes true only after
+// pathConvDisabled has passed).
+export function rewriteBashCommand(command: string, convOff = false): BashScanResult {
   return scanBash(command, convOff);
 }
 
@@ -423,7 +477,7 @@ function convertEnvPath(v: string): string | null {
   return null;
 }
 
-function scanBash(command: string, convOff = true): BashScanResult {
+function scanBash(command: string, convOff = false): BashScanResult {
   // group 1: the <<- dash; group 2: the backslash of <<\EOF (literal body);
   // the delimiter is a bash WORD, quoted (any content, quotes stripped --
   // the terminator line compares bare, like bash) or unquoted starting with
@@ -442,10 +496,19 @@ function scanBash(command: string, convOff = true): BashScanResult {
   let curTok = "";
   let prevTok = "";
   let prevTokCmdPos = false;
+  // whether prevTok came from a quote-fed word (isCmdTok must not unescape a
+  // quoted word: inside double quotes a backslash before a normal char stays)
+  let prevTokQuoted = false;
   let cmdPosNext = true;
   let cmdFlagZone = false; // after cmd, /flags keep the zone alive (cmd //q //c)
   let cmdFlagFixed = false;
   let envPathFixed = false;
+  // whether the CURRENT token's content came from a quote-fed word: a quoted
+  // word carries its quotes in `out`, so the span arithmetic (out.length -
+  // curTok.length) would be wrong for it -- and bash's assignment-prefix rule
+  // runs before quote removal, so `"B=/c/y"` is a command word, not a prefix
+  // (measured 127). Set by the quote branches, consumed by commitTok.
+  let tokQuoted = false;
   // Prefix-assignment path rewrite: assignment tokens in command position are
   // staged (span in `out` + converted word); applied only when a real command
   // word of the SAME simple command lands. Applied right-to-left (spans stay
@@ -494,43 +557,76 @@ function scanBash(command: string, convOff = true): BashScanResult {
   let inBacktick = false; // flat backtick nesting (\` is eaten by the escape branch)
   const btPos: boolean[] = []; // outer command position to restore at each closing backtick
   // open parens, each remembering the OUTER command position at open time:
-  // "subst" = $(, "func" = foo(, "case" = a "( pattern" wrapper inside a case
-  // pattern region, "group" = everything else; a ")" restores accordingly
-  // (func/case always keep the position)
+  // "subst" = $(, "procsubst" = <( / >(, "func" = foo(, "case" = a
+  // "( pattern" wrapper inside a case pattern region, "group" = everything
+  // else; a ")" restores accordingly (func/case always keep the position).
+  // The kind also decides word continuation after ")": substitutions
+  // (including process substitution, measured `echo <(true)#x` -> "#x" is a
+  // literal tail) continue the word, group/subshell/function closes start a
+  // new one.
   const parenStack: { kind: string; pos: boolean }[] = [];
+  // whether the LAST ")" continued the WORD it closed (word continues past
+  // "$(pwd)" and "<(pwd)": "#" stays literal, measured) -- a group/subshell/
+  // function/arithmetic-command ")" starts a new word instead ((true)#,
+  // ((1))#, f()# are comments, measured), as does a case-PATTERN ")".
+  let parenContinuesWord = false;
   // positions of a "$" consumed as an \$ escape pair: that "$" is LITERAL, so
   // a "(" right after it never opens a substitution (bash parses it as a
   // syntax error) -- the paren classifier must not see it as an opener
   const escapedDollar = new Set<number>();
   // case tracking: "case" (command position) arms it, the case's "in" starts
   // the PATTERN region -- its ")" terminates the pattern and opens the body
-  // -- ";;" returns to the pattern region and "esac" ends it. The region
-  // decides what a ")" closes: a pattern ")" has no matching "(" (popping on
-  // it steals the enclosing substitution's stack entry), while a $( ) in the
-  // BODY is an ordinary paren and must pop normally.
+  // -- ";;" returns to the pattern region and "esac" ends it, but only at
+  // COMMAND position (a data-position `esac`, `echo esac`, is an argument and
+  // does not end the section: measured, otherwise the next pattern ")" steals
+  // the enclosing substitution's stack entry and `cmd //c` inside
+  // `echo $(case … echo esac;; b) cmd //c …)` is missed). The region decides
+  // what a ")" closes: a pattern ")" has no matching "(" (popping on it steals
+  // the enclosing substitution's stack entry), while a $( ) in the BODY is an
+  // ordinary paren and must pop normally.
   let caseRegion: "none" | "pattern" | "body" = "none";
   let casePending = false; // saw "case", waiting for the case's "in"
 
-  // A cmd token is recognised by basename, so an explicit path
-  // (C:\Windows\System32\cmd.exe) is the same command as `cmd` -- and the
-  // split incidentally covers the escaped spelling \cmd too (bash runs
-  // \cmd exactly like cmd; measured, pinned in the battery; the pi sibling
-  // compares whole tokens and leaves it a documented miss). Quoted
-  // spellings ("cmd") still fall through -- no rewrite, the pre-plugin
-  // behaviour (documented as a known miss).
-  const isCmdTok = (t: string) => {
-    const base = t.split(/[\\/]/).pop()!.toLowerCase();
+  // A cmd token is recognised by basename. Unquoted words go through the
+  // host's `-c` operand fold plus bash's escape rules: a paired `\\` in the
+  // command string collapses to one backslash before bash, and the unquoted
+  // lexer removes the remaining escape pair -- the net effect is that ALL
+  // backslashes disappear (`\cmd`/`c\md` -> cmd = real; `C:\Windows\…` and
+  // `C:\\Windows\\…` -> C:Windows… = not a program, native 127). Removing them
+  // for the comparison models that pipeline (pi's rule; measured on this
+  // host). A QUOTED word is different: backslashes are literal, and MSYS
+  // resolves them as separators when the path exists -- `"C:\Windows\…\cmd.exe"`
+  // and `"/c/Windows\System32\cmd.exe"` both run cmd (measured), so keep the
+  // raw quoted word (a quoted `"c\md"` basename is `md`, not cmd).
+  const isCmdTok = (t: string, quoted = false) => {
+    // a trailing escape pair in an unquoted word (`cmd\\ <space>`) folds into a
+    // lone backslash that escapes the delimiter; bash then sees `cmd <space>`
+    // (or `cmd <stuff>` as one word) -- not the program (measured 127). Refuse
+    // rather than rely on the all-backslash-removal approximation.
+    if (!quoted && /\\$/.test(t)) return false;
+    const word = quoted ? t : t.replace(/\\/g, "");
+    const base = word.split(/[\\/]/).pop()!.toLowerCase();
     return base === "cmd" || base === "cmd.exe";
   };
 
-  // Shell keywords never end a command position (if/then/do/{ ... }), so a
-  // cmd after them is still the command being run. Only matters when the
-  // token is literally cmd, so a wrong guess cannot rewrite anything else.
-  const SHELL_KEYWORDS = new Set([
-    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
-    "case", "esac", "in", "select", "function", "time", "exec", "command",
-    "builtin", "env", "!", "{", "}",
+  // A word after these starts a COMMAND WORD (the next word is executed).
+  // Deliberately excludes words whose next slot is DATA or END-OF-CONSTRUCT:
+  //   data slots: case SUBJECT, `in` list, for/select variable, function name
+  //   terminators: fi, done, esac, `}` (a command after them needs `;`/`&&`/newline)
+  // Keeping those in would let a data word arm the cmd-flag zone
+  // (`for cmd in …`, `case cmd in …`) or rewrite dead text (`{ …; } cmd`,
+  // `fi cmd`) -- both measured/zero-effect (details in spec).
+  const COMMAND_POS_CONTINUES = new Set([
+    "if", "then", "else", "elif", "while", "until", "do",
+    "time", "exec", "command", "builtin", "env", "!", "{",
   ]);
+  // A function definition's body must be a COMPOUND command; `f() cmd` is a
+  // syntax error (measured). After `f()` we defer the position until the next
+  // token: a compound starter opens the body (cmd inside is rewritten), a
+  // simple word does not (dead text stays untouched). `(`/`((` are handled by
+  // the paren branch; `[[` and the compound keywords are tokens.
+  const FUNC_BODY_STARTERS = new Set(["{", "if", "while", "until", "for", "case", "select", "[["]);
+  let funcAwaitBody = false;
 
   // a close or separator starts a fresh token context: tokens from INSIDE a
   // substitution must not authorize a rewrite outside it ("echo $(cmd) //x"
@@ -538,29 +634,55 @@ function scanBash(command: string, convOff = true): BashScanResult {
   const clearTok = () => {
     prevTok = "";
     prevTokCmdPos = false;
+    prevTokQuoted = false;
     cmdFlagZone = false;
   };
 
   const commitTok = () => {
+    // the quote-fed marker covers only the token it fed: take it first and
+    // clear it even on the empty-content early return (`""` is a fed empty
+    // word, whose quotes are in `out` but not in curTok)
+    const quotedTok = tokQuoted;
+    tokQuoted = false;
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
     if (cmdPosNext) {
-      // FOO=bar env prefixes and shell keywords do not end the command position
+      // FOO=bar env prefixes and command-leading keywords do not end the
+      // position (see COMMAND_POS_CONTINUES)
       cmdPosNext =
-        /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok) || SHELL_KEYWORDS.has(curTok.toLowerCase());
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok) || COMMAND_POS_CONTINUES.has(curTok.toLowerCase());
+    }
+    // function body: only a compound starter continues the command position
+    const low = curTok.toLowerCase();
+    if (funcAwaitBody) {
+      const startsBody = FUNC_BODY_STARTERS.has(low);
+      // the starter itself is the first token of the body: give it command
+      // position too (the case tracker needs `case` to be at command position)
+      if (startsBody) prevTokCmdPos = true;
+      cmdPosNext = startsBody;
+      funcAwaitBody = false;
     }
     // case-region tracking (see the declaration above for the grammar)
-    const low = curTok.toLowerCase();
     if (low === "case" && prevTokCmdPos) casePending = true;
     else if (low === "in" && casePending) {
       caseRegion = "pattern";
       casePending = false;
-    } else if (low === "esac") {
+    } else if (low === "esac" && !quotedTok && !casePending && (caseRegion === "pattern" || prevTokCmdPos)) {
+      // bare `esac` terminates the case:
+      //  - in the PATTERN region it is the empty-case terminator
+      //    (`case x in esac` is valid and its closing ")" is the enclosing
+      //    $() close, not a pattern ")" -- measured: `echo $(case x in esac)
+      //    cmd //c` prints the data, so rewriting there is a real misfix);
+      //  - in the BODY/`none` it needs command position (a data `echo esac`
+      //    does not end the section: measured, otherwise the next pattern ")"
+      //    steals the enclosing substitution's stack entry).
+      // Not a terminator when it is the case SUBJECT (`case esac in …`),
+      // a QUOTED pattern literal (`case esac in "esac") …`), or a data word.
       caseRegion = "none";
       casePending = false;
     }
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
-    if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
+    if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) cmdFlagZone = true;
     // prefix-assignment staging / apply (envp): the assignment token (whole
     // word, unquoted) in command position is staged; a later real command
     // word (non-assignment incl. empty-value, non-keyword, non-builtin,
@@ -569,17 +691,35 @@ function scanBash(command: string, convOff = true): BashScanResult {
     // neither stage (nothing convertible) nor trigger apply (see
     // envpTrigger). prevTokCmdPos here is still THIS token's position.
     if (prevTokCmdPos) {
-      const em = ASSIGN_PREFIX.test(curTok)
-        ? /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok)
-        : null;
-      if (em) {
-        const conv = convertEnvPath(em[2]!);
-        if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
+      if (ASSIGN_PREFIX.test(curTok)) {
+        if (quotedTok) {
+          // A quote-fed word is NOT a bash assignment prefix (the prefix rule
+          // runs before quote removal): native executes it as the command
+          // word (`A=/c/x "B=/c/y" node` -> `B=/c/y: No such file or
+          // directory`, 127). Do not stage; and never take the span path --
+          // curTok is not a tail of `out` for a quoted word (its quotes are).
+          cmdPosNext = false;
+        } else if (/^(?:exec|command|builtin)$/.test(prevTok)) {
+          // exec/command/builtin take the next word as their ARGUMENT: bash
+          // runs `X=/c/x` as a command name (measured 127/127/1, same message
+          // in both conversion states) -- the value reaches no envp, so do not
+          // stage and end the position like an ordinary word. `env` is NOT
+          // here: it is a POSIX external program, and its X= argument crosses
+          // the msys->native boundary (measured env X=/c/x node -> C:/x).
+          cmdPosNext = false;
+        } else {
+          const em = /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok);
+          if (em) {
+            const conv = convertEnvPath(em[2]!);
+            if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
+          }
+        }
       } else if (envpTrigger(curTok)) {
         applyPendingEnv();
       }
     }
     prevTok = curTok;
+    prevTokQuoted = quotedTok;
     curTok = "";
   };
 
@@ -677,20 +817,37 @@ function scanBash(command: string, convOff = true): BashScanResult {
       continue;
     }
     if (ch === "'") {
+      // A quote does not change word identity (bash removes quotes before
+      // parsing the command word). A standalone quoted word in command
+      // position is fed to the token; without it the NEXT word was taken as
+      // the command word and applied a staged assignment (`A=/c/x "bash" -c
+      // …` rewrote A although native keeps /c/x in both conversion states --
+      // a silent misfix). Quotes inside a word (A="…", ba"sh") stay
+      // invisible: value-quote shapes are ledger misses and an in-word split
+      // is not a reliable identity.
+      const feedTok = curTok === "" && cmdPosNext;
       commitTok();
+      funcAwaitBody = false; // a quoted word is not a function body
       const end = command.indexOf("'", i + 1);
       if (end === -1) {
         const seg = command.slice(i);
-          out += seg;
+        out += seg;
+        if (feedTok) { curTok += command.slice(i + 1); tokQuoted = true; }
         break;
       }
       const seg = command.slice(i, end + 1);
       out += seg;
+      if (feedTok) { curTok += command.slice(i + 1, end); tokQuoted = true; }
       i = end + 1;
       continue;
     }
     if (ch === '"') {
+      // same feed rule as the single-quote branch. Content with $( )/backticks/
+      // escapes matches no closed set -- the safe direction, same as a dynamic
+      // word.
+      const feedTok = curTok === "" && cmdPosNext;
       commitTok();
+      funcAwaitBody = false; // a quoted word is not a function body
       // closing quote hunt: $() and backticks reopen quote context
       let j = i + 1;
       while (j < n && command[j] !== '"') {
@@ -714,16 +871,19 @@ function scanBash(command: string, convOff = true): BashScanResult {
       }
       if (j >= n) {
         const seg = command.slice(i);
-          out += scanDq(seg); // $( ) inside an unclosed quote still executes
+        out += scanDq(seg); // $( ) inside an unclosed quote still executes
+        if (feedTok) { curTok += command.slice(i + 1); tokQuoted = true; }
         break;
       }
       const seg = command.slice(i, j + 1);
       out += scanDq(seg);
+      if (feedTok) { curTok += command.slice(i + 1, j); tokQuoted = true; }
       i = j + 1;
       continue;
     }
     if (ch === "<" && command[i + 1] === "<") {
       commitTok();
+      funcAwaitBody = false; // a heredoc is not a function body
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
@@ -749,20 +909,21 @@ function scanBash(command: string, convOff = true): BashScanResult {
     }
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
+      funcAwaitBody = false; // a separator or the paren-as-body settles the slot
       if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") {
         caseRegion = "pattern"; // ";;" ends the body: the next pattern follows
       }
       if (ch === "(") {
         // classify the paren and remember the OUTER command position at open
-        // time: $( opens a substitution, foo( is a function definition
-        // ("{ cmd" follows), a "( pattern" wrapper inside a case PATTERN
-        // region is closed by the pattern's ")", anything else is a group /
-        // subshell opener. The saved position decides what the closing ")"
-        // restores: "count=$(...) cmd" opened from an assignment prefix
-        // (position alive -- bash runs cmd), while "echo $(...) cmd" opened
-        // from an argument (cmd is data). A "$" consumed as \$ is literal
-        // (the "(" after it is a bash syntax error), so it never classifies
-        // as a substitution opener (escapedDollar).
+        // time: $( opens a substitution, <( / >( a process substitution,
+        // foo( is a function definition ("{ cmd" follows), a "( pattern"
+        // wrapper inside a case PATTERN region is closed by the pattern's ")",
+        // anything else is a group / subshell opener. The saved position
+        // decides what the closing ")" restores: "count=$(...) cmd" opened
+        // from an assignment prefix (position alive -- bash runs cmd), while
+        // "echo $(...) cmd" opened from an argument (cmd is data). A "$"
+        // consumed as \$ is literal (the "(" after it is a bash syntax error),
+        // so it never classifies as a substitution opener (escapedDollar).
         const kind =
           caseRegion === "pattern"
             ? "case"
@@ -770,7 +931,9 @@ function scanBash(command: string, convOff = true): BashScanResult {
               ? "subst"
               : /[A-Za-z0-9_]/.test(command[i - 1] ?? "")
                 ? "func"
-                : "group";
+                : command[i - 1] === "<" || command[i - 1] === ">"
+                  ? "procsubst"
+                  : "group";
         parenStack.push({ kind, pos: cmdPosNext });
       }
       // pipeline / command end : the staged assignment never met a real
@@ -787,6 +950,7 @@ function scanBash(command: string, convOff = true): BashScanResult {
     }
     if (ch === "&") {
       commitTok();
+      funcAwaitBody = false;
       if (command[i - 1] !== ">" && command[i - 1] !== "<") {
         cmdPosNext = true; // 2>&1's & is no separator
         clearTok();
@@ -798,6 +962,7 @@ function scanBash(command: string, convOff = true): BashScanResult {
     }
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
+      funcAwaitBody = false; // a close/redirect is not a function body
       // whether the close RESTORES a command position still owed its command
       // word (the tight form `VAR=/c/x$(pwd) node` closes the assignment
       // value here): it keeps the staged assignment so the following word
@@ -811,24 +976,45 @@ function scanBash(command: string, convOff = true): BashScanResult {
           // substitution's entry -- "echo $(case 1 in 1) x;; esac) cmd //c
           // ver", where cmd is echo's argument). It closes the optional
           // "( pattern" wrapper only, and the body (a command list) starts:
-          // command position.
+          // command position. A new WORD begins after it ("a)#c" is a
+          // comment, measured).
           if (parenStack.length && parenStack[parenStack.length - 1]!.kind === "case") {
             parenStack.pop();
           }
           cmdPosNext = true;
           caseRegion = "body";
+          parenContinuesWord = false;
         } else {
           // an ordinary paren close -- also inside a case BODY: the ")" of
           // "case x in a) echo $(pwd) cmd" must pop, leaving cmd as echo's
           // argument. Restore what the matching "(" saved: "count=$(...)
           // cmd" (assignment prefix -- bash runs cmd) keeps the position,
-          // "echo $(...) cmd" ends it; "foo()" and a stray ")" keep it.
+          // "echo $(...) cmd" ends it; "foo()" keeps it. A GROUP/subshell
+          // close does NOT reopen a command position: `( … ) word` is a bash
+          // syntax error (measured), so rewriting `cmd //c` there is dead
+          // text. A stray ")" is a syntax error too -- stay inert.
           const fr = parenStack.pop();
-          cmdPosNext =
-            fr === undefined || fr.kind === "func" || fr.kind === "case"
-              ? true
-              : fr.pos;
+          if (fr === undefined || fr.kind === "group") {
+            cmdPosNext = false;
+          } else if (fr.kind === "func") {
+            // a function body must be a compound command: defer the position
+            // to the next token (see FUNC_BODY_STARTERS)
+            cmdPosNext = false;
+            funcAwaitBody = true;
+          } else if (fr.kind === "case") {
+            cmdPosNext = true;
+          } else {
+            cmdPosNext = fr.pos;
+          }
           restoreTrue = fr !== undefined && (fr.kind === "func" || (fr.kind === "subst" && fr.pos === true));
+          // Word continuation after ")" (measured): a substitution close --
+          // $( ), $(( )) and <( )/>( ) -- continues the word, so "#" stays
+          // literal; a group/subshell/function/arithmetic-command close starts
+          // a new word, so the next "#" is a COMMENT (dead text, never
+          // rewritten). A stray ")" (bash syntax error) keeps the old
+          // continuation to avoid inventing a rule for dead input.
+          parenContinuesWord =
+            fr === undefined ? true : fr.kind === "subst" || fr.kind === "procsubst";
         }
         clearTok();
       } else {
@@ -850,6 +1036,7 @@ function scanBash(command: string, convOff = true): BashScanResult {
       // by a real command position
       const inWord = curTok !== "";
       commitTok();
+      funcAwaitBody = false; // a substitution is not a function body
       if (!inBacktick) {
         // opening: command position inside; remember whether the enclosing
         // word is an assignment prefix ("x=`y` cmd //c" -- bash runs cmd)
@@ -866,18 +1053,23 @@ function scanBash(command: string, convOff = true): BashScanResult {
       i++;
       continue;
     }
-    // cmd doubled flags: only in command position relative to cmd (incl. tight cmd//c)
-    if (ch === "/" && command[i + 1] === "/") {
+    // cmd doubled flags: only when `cmd` is a CLOSED word in command position
+    // (a space always separates the flag from the program name).
+    // Gated on convOff like the envp rewrite: with conversion ON the native
+    // layer converts //c itself, and a rewrite would BE the side effect.
+    // The tight spelling cmd//c is a different word to bash (a program name),
+    // so it is deliberately NOT rewritten: natively it fails loudly
+    // (`No such file or directory`, 127) in both conversion states -- a model
+    // typo, not an environment fault (spec.md deliberate-no-fix).
+    if (convOff && ch === "/" && command[i + 1] === "/") {
       const atCmd =
-        curTok === ""
-          ? (prevTokCmdPos && isCmdTok(prevTok)) || (cmdFlagZone && prevTok.startsWith("/"))
-          : cmdPosNext && isCmdTok(curTok);
+        curTok === "" &&
+        ((prevTokCmdPos && isCmdTok(prevTok, prevTokQuoted)) || (cmdFlagZone && prevTok.startsWith("/")));
       if (atCmd) {
         cmdFlag.lastIndex = i;
         const m = cmdFlag.exec(command);
         if (m) {
-          // tight cmd//c: cmd was already emitted, insert the separator space
-          out += (curTok === "" ? "" : " ") + "/" + m[1];
+          out += "/" + m[1];
           i += m[0].length;
           curTok = "/" + m[1];
           cmdFlagFixed = true;
@@ -889,11 +1081,35 @@ function scanBash(command: string, convOff = true): BashScanResult {
       i++;
       continue;
     }
-    // a `#` at the head of a word is a comment: the staged assignment ends
-    // here as a bash-side standalone (dropped BEFORE this `#` commits -- at
-    // word head in command position it would otherwise count as the command
-    // word and wrongly apply). `#` inside a word (a#b) is data, untouched.
-    if (ch === "#" && curTok === "") pendingEnv.length = 0;
+    // a `#` at the head of a WORD is a comment: bash ignores the rest of the
+    // line, so comment text is dead data that can never reach any program --
+    // copy it verbatim to end of line, like a heredoc body. (Before this, the
+    // comment was tokenized: a "(" inside was classified as a function
+    // definition and reopened command position, so `cmd //c ver # note (cmd
+    // //x)` rewrote INSIDE the comment -- a zero-effect misfix: every rewrite
+    // must name a fault point, and dead text reaches none.) Word head per
+    // bash's own lexer rule -- input start or after a blank/operator. The
+    // word CONTINUES after a quote close ("a"#b keeps the # literal) and after
+    // a substitution close ($(pwd)#z, <(pwd)#z keep it too, measured); group/
+    // subshell/function/arithmetic-command ")") and a case-PATTERN ")" start a
+    // new word ((true)#c, a)#c are comments, measured). The staged assignment
+    // ends here as a bash-side standalone (dropped BEFORE this `#` commits --
+    // at word head in command position it would otherwise count as the command
+    // word and wrongly apply). `#` mid-word (a#b) is data, untouched. The
+    // trailing \n is left to the whitespace branch so the next line starts a
+    // fresh command context.
+    const atWordHead =
+      out === "" ||
+      " \t\n;|&(<>".includes(out[out.length - 1]!) ||
+      (out.endsWith(")") && !parenContinuesWord);
+    if (ch === "#" && curTok === "" && atWordHead) {
+      pendingEnv.length = 0;
+      let lineEnd = command.indexOf("\n", i);
+      if (lineEnd === -1) lineEnd = n;
+      out += command.slice(i, lineEnd);
+      i = lineEnd;
+      continue;
+    }
     curTok += ch;
     out += ch;
     i++;
@@ -928,17 +1144,44 @@ const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
 // Counts how often the guarded tools actually run and which fixes fire, to
 // measure the plugin's real hit rate. Same taxonomy as the pi sibling:
 // denominator toolCalls[tool] bumps POST-gate (off-platform calls and
-// foreign shells never inflate the base); numerator fixes[key] bumps per
-// actual rewrite, keyed by fault point, same-nature variants merged into
-// one key (path.temp / shell.cmdFlag / shell.envPath; OC-only keys:
-// glob.tempPrefix, patch.tempLine, shell.workdir.temp). Storage: ctx.storage
-// (the host's official plugin-scoped durable JSON -- lands in opencode.db's
-// kv table; read it read-only with sqlite, never by guessing at the db
-// schema from the plugin). Write timing lives in the functions below; every
-// failure is swallowed: telemetry must never change what a tool call does.
-// must never change what a tool call does.
+// foreign shells never inflate the base); numerator fixes[key] bumps ONLY in
+// the branch where the value actually changed.
+// KEY = fault mechanism; same mechanism's spellings merge, different
+// mechanisms stay apart. The temp families split by mechanism on every
+// surface (fixing /tmp's mount mapping does not fix $TEMP's expansion):
+//   path.tempMount / path.tempVar / path.other
+//   glob.tempMount / glob.tempVar (split only returns temp mechanisms)
+//   patch.tempMount / patch.tempVar / patch.other
+//   shell.workdir.tempMount / shell.workdir.tempVar / shell.workdir.other
+//   shell.cmdFlag  (//c, //k, multi-flag, quoted name, basename path: one
+//                   mechanism -- msys argv flag conversion is off)
+//   shell.envPath  (drive value and /tmp value: one mechanism -- msys envp
+//                   conversion is off)
+// `.other` is a visible fallback: a future rewrite that changes a value
+// without a classified mechanism is counted there, never silently merged.
+// The old `path.temp`/`glob.tempPrefix`/`patch.tempLine`/`shell.workdir.temp`
+// keys are left untouched in existing files (historical totals; new counts
+// use the split keys). Storage: ctx.storage (the host's official
+// plugin-scoped durable JSON -- lands in opencode.db's kv table; read it
+// read-only with sqlite, never by guessing at the db schema from the plugin).
+// Write timing lives in the functions below; every failure is swallowed:
+// telemetry must never change what a tool call does.
 
 const STATS_KEY = "stats";
+
+// Explicit numerator names: a typo cannot silently create a new key.
+// (The same mechanism on a different surface is a different key -- different
+// code path; see the taxonomy comment above.)
+type FixKey =
+  | `path.${TempMechanism}`
+  | "path.other"
+  | `glob.${TempMechanism}`
+  | `patch.${TempMechanism}`
+  | "patch.other"
+  | `shell.workdir.${TempMechanism}`
+  | "shell.workdir.other"
+  | "shell.cmdFlag"
+  | "shell.envPath";
 
 interface Stats {
   schema: 1;
@@ -993,7 +1236,7 @@ function bumpTool(tool: string): void {
   }
 }
 
-function bumpFix(key: string): void {
+function bumpFix(key: FixKey): void {
   if (!stats) return;
   stats.fixes[key] = (stats.fixes[key] ?? 0) + 1;
   flushStats(); // numerators are rare: persist at once, nothing is lost on unload
@@ -1028,10 +1271,12 @@ export default define({
       if (tool === "patch") {
         bumpTool("patch");
         if (typeof input.patchText === "string") {
-          const rewritten = rewritePatchText(input.patchText);
-          if (rewritten !== input.patchText) {
-            input.patchText = rewritten;
-            bumpFix("patch.tempLine");
+          const fix = rewritePatchTextFix(input.patchText);
+          if (fix.text !== input.patchText) {
+            input.patchText = fix.text;
+            // one patch call may touch both mechanisms; bump each once
+            if (fix.mechanisms.length) for (const m of fix.mechanisms) bumpFix(`patch.${m}`);
+            else bumpFix("patch.other"); // a future non-temp rewrite stays visible
           }
         }
         return;
@@ -1046,15 +1291,15 @@ export default define({
           if (split) {
             input.pattern = split.rest;
             input.path = split.dir;
-            bumpFix("glob.tempPrefix");
+            bumpFix(`glob.${split.mechanism}`);
           }
         }
       }
       if (typeof input.path !== "string") return;
-      const rewritten = rewritePath(input.path);
-      if (rewritten !== input.path) {
-        input.path = rewritten;
-        bumpFix("path.temp");
+      const fix = rewritePathFix(input.path);
+      if (fix.value !== input.path) {
+        input.path = fix.value;
+        bumpFix(fix.mechanism ? `path.${fix.mechanism}` : "path.other");
       }
     });
 
@@ -1066,10 +1311,10 @@ export default define({
       // C:\tmp" -- measured), so the same temp forms rewrite to the anchor
       // bash itself uses. Independent of the //c gate below.
       if (typeof event.cwd === "string") {
-        const cwd = rewritePath(event.cwd);
-        if (cwd !== event.cwd) {
-          event.cwd = cwd;
-          bumpFix("shell.workdir.temp");
+        const fix = rewritePathFix(event.cwd);
+        if (fix.value !== event.cwd) {
+          event.cwd = fix.value;
+          bumpFix(fix.mechanism ? `shell.workdir.${fix.mechanism}` : "shell.workdir.other");
         }
       }
       if (!pathConvDisabled(event.shell)) return;

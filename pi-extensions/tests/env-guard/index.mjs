@@ -6,14 +6,16 @@
 // and asserts every documented guard plus every deliberately-not-fixed form,
 // so the "刻意不修" decisions stay pinned instead of drifting back.
 //
-// The source now has one runtime import only the host resolves
-// (getAgentDir from @earendil-works/pi-coding-agent). Like the OC battery,
-// the import is swapped for a stub and the source is loaded from a
-// throwaway copy in the system temp dir (nothing added to the repo).
-// EG_AGENT_DIR points the stub at a scratch agent dir so the stats
-// persistence is exercised without touching ~/.pi. Worker scenarios reuse
-// the scratch via EG_SCRATCH (their scrubbed envs make mkdtempSync
-// impossible, so the parent provides the dir).
+// The source has two runtime imports only the host resolves
+// (getAgentDir and getShellConfig from @earendil-works/pi-coding-agent).
+// Like the OC battery, both are swapped for stubs and the source is loaded
+// from a throwaway copy in the system temp dir (nothing added to the repo).
+// EG_AGENT_DIR points the getAgentDir stub at a scratch agent dir so the stats
+// persistence is exercised without touching ~/.pi. EG_SHELL drives the
+// getShellConfig stub (the probe wiring itself — verifyMsysBash, cygpath,
+// MSYS_NO_PATHCONV — still runs for real against that shell). Worker
+// scenarios reuse the scratch via EG_SCRATCH (their scrubbed envs make
+// mkdtempSync impossible, so the parent provides the dir).
 //
 // The cmd //c rewrite is gated on a probe of MSYS_NO_PATHCONV inside a spawned
 // bash, so its expected result depends on the machine: this box's bashrc sets
@@ -27,18 +29,43 @@ import {dirname, join} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
-import {readFileSync, writeFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync} from 'node:fs';
+import {readFileSync, writeFileSync, mkdirSync, mkdtempSync, readdirSync, existsSync, rmSync} from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const selfPath = fileURLToPath(import.meta.url);
 const srcPath = join(here, '..', '..', 'env-guard', 'index.ts');
 const src = readFileSync(srcPath, 'utf8').replace(
-  'import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";',
-  'const getAgentDir = () => process.env.EG_AGENT_DIR ?? "";',
+  'import { getAgentDir, getShellConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+  [
+    'const getAgentDir = () => process.env.EG_AGENT_DIR ?? "";',
+    'const getShellConfig = (p) => { const s = p ?? process.env.EG_SHELL; if (!s) throw new Error("EG_SHELL unset"); return { shell: s, args: ["-c"] }; };',
+  ].join('\n'),
 );
 const scratch = process.env.EG_SCRATCH ?? mkdtempSync(join(tmpdir(), 'env-guard-pi-'));
 if (!process.env.EG_SCRATCH) writeFileSync(join(scratch, 'index.ts'), src, 'utf8');
 const mod = await import(pathToFileURL(join(scratch, 'index.ts')).href);
+
+// The extension resolves its probe shell through pi's own getShellConfig
+// (stubbed above via EG_SHELL). The battery needs a real MSYS bash for the
+// same purpose (gate direction, enable -a, worker scenarios), so it scans
+// PATH itself — skipping System32 (the WSL launcher stub) and verifying
+// uname, the same identity check the extension runs on getShellConfig's
+// answer. An already-set EG_SHELL (worker scenarios) wins: the parent chose
+// that shell on purpose.
+const findBashForTest = () => {
+  for (const d of (process.env.PATH ?? '').split(';').filter(Boolean)) {
+    if (/\\System32(\\|$)/i.test(d)) continue;
+    const c = join(d, 'bash.exe');
+    if (!existsSync(c)) continue;
+    try {
+      const p = spawnSync(c, ['-c', 'uname -s'], {encoding: 'utf8', timeout: 5000});
+      if (/^(MINGW|MSYS)/.test((p.stdout ?? '').trim())) return c;
+    } catch { /* next candidate */ }
+  }
+  return null;
+};
+const msysBash = findBashForTest();
+if (msysBash && !process.env.EG_SHELL) process.env.EG_SHELL = msysBash;
 
 // Probe/machine worker modes: cached results mean each scenario needs its own
 // process.
@@ -52,10 +79,12 @@ if (process.argv.includes('--noanchor')) {
   console.log(JSON.stringify({temp: mod.realTempDir(), rewritten: mod.rewritePath('/tmp/x')}));
   process.exit(0);
 }
-if (process.argv.includes('--shellpath')) {
-  // Configured shell (pi's settings.shellPath) decides the probe target.
-  const p = process.argv[process.argv.indexOf('--shellpath') + 1] ?? '';
-  mod.setConfiguredShell(() => p);
+if (process.argv.includes('--report')) {
+  // Probe wiring report: the shell comes from EG_SHELL (the getShellConfig
+  // stub). EG_CFG plays settings.shellPath (setConfiguredShell) and must win
+  // over detection — the same priority pi's own getShellConfig(customShellPath)
+  // applies when it spawns bash.
+  if (process.env.EG_CFG) mod.setConfiguredShell(() => process.env.EG_CFG);
   console.log(JSON.stringify({
     gate: mod.pathConvDisabled(),
     temp: mod.realTempDir(),
@@ -96,6 +125,41 @@ check('P: C:\\tmp untouched (native write ok)', rt('C:\\tmp\\x') === 'C:\\tmp\\x
 check('P: relative untouched', rt('relative/x') === 'relative/x', JSON.stringify(rt('relative/x')));
 check('P: ~ untouched (tool expands)', rt('~/x') === '~/x', JSON.stringify(rt('~/x')));
 
+// rewritePathFix（值＋族別同源）與薄包裝 rewritePath 必須一致
+for (const input of ['/tmp/x', '$TEMP/x', '/c/Users/x', 'plain.txt']) {
+  check(`S: rewritePath === rewritePathFix().value for ${JSON.stringify(input)}`,
+    mod.rewritePath(input) === mod.rewritePathFix(input).value,
+    JSON.stringify({a: mod.rewritePath(input), b: mod.rewritePathFix(input)}));
+}
+
+// --- 統計分類：temp 修復的兩個故障點必須分開（不是同名 variant）---
+// /tmp 是「host 不套 MSYS 映射」、$TEMP 是「host 不展開變數」——修好一邊
+// 不等於修好另一邊，所以各有自己的 key；driver2 以外的值不進這兩類。
+const cls = (p) => mod.classifyTempFix(p);
+check('S: /tmp classified as mount form', cls('/tmp/x') === 'path.tempMount', String(cls('/tmp/x')));
+check('S: /TMP classified as mount form (case-insensitive)', cls('/TMP') === 'path.tempMount', String(cls('/TMP')));
+check('S: $TEMP classified as var form', cls('$TEMP/x') === 'path.tempVar', String(cls('$TEMP/x')));
+check('S: ${TMPDIR} classified as var form', cls('${TMPDIR}/x') === 'path.tempVar', String(cls('${TMPDIR}/x')));
+check('S: %TMP% classified as var form', cls('%TMP%' + String.fromCharCode(92) + 'x') === 'path.tempVar', String(cls('%TMP%' + String.fromCharCode(92) + 'x')));
+check('S: non-temp path has no temp key', cls('/c/Users/x') === null && cls('plain.txt') === null, String(cls('/c/Users/x')));
+check('S: /tmpfoo is not the mount form', cls('/tmpfoo/x') === null, String(cls('/tmpfoo/x')));
+
+// 改寫與計數必須同源：classification 說「不屬於 temp 族」時 rewritePath 不該動；
+// 說屬於某一族時 rewritePath 必須真的改（除非平台／錨點不允許，測試環境是 win32
+// 且有錨點）。新增 temp 形態只改一邊就會在這裡炸。
+for (const [input, kind] of [
+  ['/tmp/x', 'path.tempMount'],
+  ['$TEMP/x', 'path.tempVar'],
+  ['${TMPDIR}/x', 'path.tempVar'],
+  ['%TEMP%' + String.fromCharCode(92) + 'x', 'path.tempVar'],
+  ['/c/Users/x', null],
+  ['C:' + String.fromCharCode(92) + 'tmp' + String.fromCharCode(92) + 'x', null],
+]) {
+  const out = rt(input);
+  const rewritten = out !== input;
+  check(`S: rewrite and count agree for ${JSON.stringify(input)}`, cls(input) === kind && rewritten === (kind !== null), JSON.stringify({kind: cls(input), out}));
+}
+
 // --- rewritePath: MSYS drive letters — deliberately NOT fixed in pi ---
 // pi's own resolveToCwd -> normalizeWindowsShellPath already maps /c/Users/x
 // -> C:\Users\x (plus /mnt/d, /cygdrive/e), verified e2e (write to /c/tgprobe
@@ -127,12 +191,30 @@ const flagCase = (label, input, expectedWhenOn) => {
 flagCase('cmd //c -> /c', 'cmd //c ver', 'cmd /c ver');
 flagCase('cmd //k -> /k', 'cmd //k dir', 'cmd /k dir');
 flagCase('multi-flag //q //c both fixed', 'cmd //q //c ver', 'cmd /q /c ver');
-flagCase('tight cmd//c form', 'cmd//c ver', 'cmd /c ver');
 flagCase('command position after ;', 'ls; cmd //c ver', 'ls; cmd /c ver');
 flagCase('nested $( ) fixed', 'echo "v: $(cmd //c ver)"', 'echo "v: $(cmd /c ver)"');
 flagCase('backtick nested fixed', 'echo v: `cmd //c ver`', 'echo v: `cmd /c ver`');
 flagCase('//c fixed, quoted payload kept', 'cmd //c "dir > nul"', 'cmd /c "dir > nul"');
 flagCase('env-assignment prefix keeps position', 'x=1 cmd //c ver', 'x=1 cmd /c ver');
+// 獨立成詞的引號指令字：去引號後參與 token 判定（引號不改變 word 身分）
+flagCase('quoted cmd name', '"cmd" //c ver', '"cmd" /c ver');
+flagCase('single-quoted cmd name', "'cmd' //c ver", "'cmd' /c ver");
+// 程序替換 <( )：內部是新指令語境（bash 會真執行）——本來就會修，釘住防漂移
+flagCase('process substitution', 'cat <(cmd //c ver)', 'cat <(cmd /c ver)');
+// cmd 的指令字用 basename 比對：這些拼法在 bash 裡都是同一顆 cmd（實測三形在
+// 轉換關閉時都進互動式 banner＝同一個故障），整詞比對會把它們留在漏修臺
+// bash 會吃掉未引號詞裡的反斜線，所以比對用的是**去跳脫後的詞**：
+// `\cmd`／`c\md` 的實際程式名都是 cmd（實測轉換關閉時都進互動 banner）→ 修；
+// `C:\Windows\…\cmd.exe` 去跳脫後是 `C:Windows…cmd.exe`（不存在、原生 127）→ 不改。
+flagCase('backslash-escaped cmd name', '\\cmd //c ver', '\\cmd /c ver');
+flagCase('backslash inside the name (c\md)', 'c\\md //c ver', 'c\\md /c ver');
+flagCase('POSIX absolute path cmd', '/c/Windows/System32/cmd.exe //c ver', '/c/Windows/System32/cmd.exe /c ver');
+flagCase('quoted absolute path cmd', '"C:/Windows/System32/cmd.exe" //c ver', '"C:/Windows/System32/cmd.exe" /c ver');
+flagCase('cmd.exe spelling', 'cmd.exe //c ver', 'cmd.exe /c ver');
+// 程序替換的同一個"詞延續"規則：`<(true)#` 的 # 是字面資料，後面的 $( ) 是
+// 真的會執行的替換（實測轉換關閉時 banner 真的出來）——不能當註解杒掉
+flagCase('word continues past <( ) close', 'echo <(true)# $(cmd //c ver)', 'echo <(true)# $(cmd /c ver)');
+flagCase('arithmetic keeps word continuation', 'echo $((1+1))# $(cmd //c ver)', 'echo $((1+1))# $(cmd /c ver)');
 
 // --- rewriteBashCommand: prefix-assignment POSIX paths (probe-gated) ---
 // 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把 VAR=/c/foo
@@ -181,9 +263,36 @@ envMiss('A=/c/x B= ');
 envMiss('A=/c/x eval "echo $A"');
 envMiss('A=/c/x read line');
 envMiss('A=/c/x [[ -d /c/x ]]');
-// 引號指令字不被掃描器當 token：單獨形＝漏修（原生會轉換 C:/x——實測
-// A=/c/x "node" -e … 原生 C:/x），方向安全；帶參數時由後續詞觸發而正確
-envMiss('A=/c/x "node"');
+// 引號指令字：獨立成詞且在指令位置時，去引號内容參與 token 判定（引號不改
+// 變 word 身分）——"bash"/"echo" 是內建 → 不觸發（未 token 化前下一個詞會以
+// 指令位置誤觸套用＝靜默誤修，實測兩種轉換狀態原生皆 [/c/x]）；"node" 是
+// 真指令字 → 觸發（原生會轉換）
+envMiss('A=/c/x "bash" -c "echo $A"');
+envMiss("A=/c/x 'bash' -c 'echo $A'");
+envMiss('A=/c/x "sh" -c "echo $A"');
+envMiss('A=/c/x "echo" hi');
+// 引號指令字單獨形（EOF 收尾）：去引號後就是指令字 → 觸發（實測原生會轉換
+// [/c/x→C:/x]）＝與原生一致
+envCase('quoted command word alone', 'A=/c/x "node"', 'A=C:/x "node"');
+// env 是 POSIX 外部程式：X= 參數跨 msys→native 邊界（實測 env X=/c/x node
+// 原生轉換 C:/x）→ 照「賦值前綴」同樣處理——由後續指令字觸發
+envCase('env assignment forwards to external', 'env X=/c/x node x', 'env X=C:/x node x');
+envCase('env assignment after another prefix', 'A=/c/x env X=/c/y node x', 'A=C:/x env X=C:/y node x');
+// exec/command/builtin 後的賦值形是參數（bash 把 X=/c/x 當指令名跑、原生就
+// 大聲失敗——實測 127/127/1 同訊息）→ 不暫存、不觸發
+envMiss('command X=/c/x node x');
+envMiss('exec X=/c/x node x');
+envMiss('builtin X=/c/x node x');
+// 引號詞裡的伪賦值形（`"B=/c/y"`）：bash 的賦值前綴判定在 quote removal 之前，
+// 引號詞是指令字不是前綴（實測 `A=/c/x "B=/c/y" node` → bash: B=/c/y: No such
+// file or directory、127）→ 不暫存、不套用。這幾條同時釘住跨度算術：引號詞
+// 在 out 裡帶著前後引號，用 curTok 長度回推跨度會吃掉收尾引號（實測曾輸出
+// `A=C:/x "BB=C:/y node x`，引號配對被破壞）
+envMiss('A=/c/x "B=/c/y" node x');
+envMiss("A=/c/x 'B=/c/y' node x");
+envMiss('A=/c/x "B=/tmp/y" node x');
+envMiss('"B=/c/y" node x');
+envMiss('B=/c/y "C=/c/z" node x');
 // env 本身是 MSYS 程式：msys→msys 邊界不轉 envp（實測 A=/c/x env 印
 // A=/c/x）→ 不動＝原生行為（非漏修）
 envMiss('A=/c/x env');
@@ -220,10 +329,33 @@ envMiss('A=/c/x <<EOF\nEOF\ncmd');
 // ）——詞首 # 要把暫存賦值丟掉，否則註解裡的詞被當指令字觸發誤修
 envMiss('A=/c/x # comment');
 envMiss('A=/c/x # cmd');
+// 註解內容是死文字、到達不了任何程式——整段照原樣複製到行尾（同 heredoc
+// 本體）。曾把註解照一般掃描：註解裡的 `(` 被分類成函式定義、重開指令位置，
+// 死文字裡的 //x 也被改寫＝零效應誤修（每項修復必須指名故障點，死文字沒有
+// ——已修＋釘樁）。詞首判準照 bash lexer：引號／替換收尾後詞延續（實測
+// `"a"#b`、`$(pwd)#z` 的 # 是字面），樣式區 `)` 後開新詞（實測 `a)#c` 是註解）。
+const commentCase = (input, expectedWhenOn) => {
+  const r = bc(input);
+  if (gateOn) check(`P: comment dead text ${JSON.stringify(input)}`, r.command === expectedWhenOn, JSON.stringify(r));
+  else check(`P: comment dead text ${JSON.stringify(input)} [gate off: untouched]`, r.command === input && !r.cmdFlagFixed, JSON.stringify(r));
+};
+commentCase('cmd //c ver # note (cmd //x)', 'cmd /c ver # note (cmd //x)');
+commentCase('cmd //c ver # see $(cmd //c ver)', 'cmd /c ver # see $(cmd //c ver)');
+commentCase('echo a # note (cmd //x)\ncmd //c ver', 'echo a # note (cmd //x)\ncmd /c ver');
+commentCase('echo "a"# $(cmd //c ver)', 'echo "a"# $(cmd /c ver)');
+commentCase('echo $(pwd)# $(cmd //c ver)', 'echo $(pwd)# $(cmd /c ver)');
+commentCase('case x in a)# note (cmd //x)\ncmd //c ver;; esac', 'case x in a)# note (cmd //x)\ncmd /c ver;; esac');
+// 群組／子殼的 `)` 結尾也是新詞的開頭（實測 `(true)#c` 的 # 是註解）——註解
+// 本文不掃；但替換 `$( )` 結尾的詞延續（上面 `echo $(pwd)#` 那條）
+commentCase('(true)# note (cmd //x)', '(true)# note (cmd //x)');
+commentCase('(true)# note (cmd //x)\ncmd //c ver', '(true)# note (cmd //x)\ncmd /c ver');
+// 對照：替換 `$( )` 結尾詞還沒結束，後面的 `#` 是字面資料——那段 `(cmd //x)`
+// 是活的子殼（bash 實測 `#` 是字面、`(` 是運算子），所以照常改寫
+commentCase('x=$(pwd)# note (cmd //x)\ncmd //c ver', 'x=$(pwd)# note (cmd /x)\ncmd /c ver');
 // && 左側是賦值敘述（shell 變數，不進 envp——實測 process.env.A undefined）
 envMiss('A=/c/x && node -e y');
 envMiss('A=/c/x&&node -e y');
-// wrapper 選項之後的詞在參數位置（選項結構＝開放集合）→ 留在漏修臺
+// env 選項交錯形（-u 之後的詞在參數位置——選項結構＝開放集合）→ 留在漏修臺
 envMiss('env -u V XDG=/c/foo node x');
 // A=x (…) 實測是 syntax error＝死文字，套用與否都無效果；群組內的詞是內建
 // （echo）不再觸發套用——不動同樣安全。釘實際行為防止意外漂移。
@@ -275,6 +407,19 @@ const hdHyphen = 'cat <<E-O\ncmd //c ver\nE-O';
 check('P: bare hyphen delimiter recognised', bc(hdHyphen).command === hdHyphen, JSON.stringify(bc(hdHyphen).command));
 const hdDot = 'cat <<EOF.v2\ncmd //c ver\nEOF.v2';
 check('P: dotted delimiter recognised', bc(hdDot).command === hdDot, JSON.stringify(bc(hdDot).command));
+// 未加引號的定界符可以含任意非元字元字元（實測 `cat <<EOF/x … EOF/x`、`<<EOF#x`
+// 都合法）——字元類窄了就會把本體當指令改寫（誤修）。空引號 `<<""` 也是
+// 合法定界符（終止行＝空行，實測）：引號分支的 `+` 會讓本體被掃。
+for (const [label, text] of [
+  ['slash delimiter', 'cat <<EOF/x\ncmd //c ver\nEOF/x'],
+  ['hash delimiter', 'cat <<EOF#x\ncmd //c ver\nEOF#x'],
+  ['equals delimiter', 'cat <<EOF=x\ncmd //c ver\nEOF=x'],
+  ['star delimiter', 'cat <<E*F\ncmd //c ver\nE*F'],
+  ['empty quoted delimiter', 'cat <<""\ncmd //c ver\n\necho after'],
+  ['empty single-quoted delimiter', "cat <<''\ncmd //c ver\n\necho after"],
+]) {
+  check(`P: ${label} recognised (body is data)`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
 const shift = 'echo $((1<<2))';
 check('P: arithmetic shift is not a heredoc', bc(shift).command === shift, JSON.stringify(bc(shift)));
 // 定界符是 bash 的 word：引號內可含任意內容、也可是跳脫形式（<<\EOF）
@@ -347,6 +492,11 @@ const caseFixes = [
   ['case x in a) x=$(pwd) cmd //c ver;; esac', 'case x in a) x=$(pwd) cmd /c ver;; esac'],
   ['case x in a) true;; b) cmd //c ver;; esac', 'case x in a) true;; b) cmd /c ver;; esac'],
   ['case x in a) echo 1;;& b) cmd //c ver;; esac', 'case x in a) echo 1;;& b) cmd /c ver;; esac'],
+  // 資料位置的 esac 不再把區段打掉（echo esac 後的 cmd 仍被修）；樣式字面
+  // esac）是 bash 語法錯誤（實測兩種轉換狀態皆 error）——掃描器照語法繼續
+  // 追蹤、改寫落在死文字上，輸出仍同為語法錯誤＝回傳≡原生
+  ['case $x in a) echo esac; cmd //c ver;; esac', 'case $x in a) echo esac; cmd /c ver;; esac'],
+  ['case $x in esac) cmd //c ver;; esac', 'case $x in esac) cmd /c ver;; esac'],
   ['echo $(case $x in a) cmd //c ver;; esac)', 'echo $(case $x in a) cmd /c ver;; esac)'],
   ['x=$(case 1 in 1) x;; esac) cmd //c ver', 'x=$(case 1 in 1) x;; esac) cmd /c ver'],
   ['case x in a) echo $(case y in b) cmd //c ver;; esac);; esac', 'case x in a) echo $(case y in b) cmd /c ver;; esac);; esac'],
@@ -377,7 +527,7 @@ for (const c of caseData) {
 
 // --- rewriteBashCommand: deliberate misses (same in both gate states) ---
 // Wrappers would need per-program argument layouts (open-ended guessing);
-// absolute/quoted/escaped cmd is native-correct here but never written in
+// absolute/escaped cmd is native-correct here but never written in
 // practice; `cmd //?`, `cmd ///c` also fail on stock git-bash (model error).
 const misses = [
   'echo cmd //c ver',
@@ -385,18 +535,51 @@ const misses = [
   'echo "$(pwd)" cmd //c ver',
   'timeout 5 cmd //c ver',
   'xargs cmd //c ver',
-  '/c/Windows/System32/cmd.exe //c ver',
-  '"cmd" //c ver',
-  '\\cmd //c ver',
+  // 死文字形：bash 會吃掉未引號反斜線／路徑本身就不存在 → 原生 127，改寫沒有
+  // 任何執行效果（文字有變、行為完全一樣）→ 不動（零效應改寫不新增）
+  'C:\\Windows\\System32\\cmd.exe //c ver',
+  '/c/Windows\\System32\\cmd.exe //c ver',
   'cmd //?',
   'cmd ///c ver',
   'printf %s cmd //c',
+  // 緊貼形（cmd//c、"cmd"//c）不改：bash 把 cmd//c 當程式名，原生是
+  // `bash: cmd//c: No such file or directory`、exit 127（兩種轉換狀態實測一致）
+  // ——沒有環境故障點支撐；改寫它在 gate ON 時反而把大聲 127 變成 banner 的
+  // 靜默失敗。原生的正確回報留給模型看
+  'cmd//c ver',
+  'cmd//k',
+  '"cmd"//c ver',
+  'x=1 cmd//c ver',
+  // 反斜線換行續接：跳脫對被併進 token、指令字身分失效（實測：轉換開＝
+  // 續接後 //c 轉成 /c 真跑；本機＝banner 靜默 exit 0）→ 漏修臺
+  'cmd \\\n//c ver',
   // / 前綴原生工具：與 cmd //c 同一個故障點（實測 taskkill //IM
   // exit 1 報『無效參數』；失敗大聲但大聲≠豁免，回傳≠原生才是判準），
   // 留在漏修臺（見 docs/spec.md）——釘住不升級成誤修
   'taskkill //IM media-downloader.exe //F',
   'taskkill //F //IM x.exe',
   'sc //query wuauserv',
+  // 引號 payload 被內層程式整體執行：bash/sh -c、node -e、python -c——哪些
+  // 程式把首參數當腳本是開放集合 → 留在漏修臺（實測：轉換開＝payload 真跑
+  // 、轉換關＝互動模式靜默 exit 0——同一故障深一層；掃描器把引號內容一律
+  // 當資料）
+  "bash -c 'cmd //c ver'",
+  'bash -c "cmd //c ver"',
+  // time -p：裸 time 關鍵字已涵蓋、-p 被當普通詞終結指令位置（實測轉換關
+  // 進互動模式）；有機頻率≈0，按紀律先記臺
+  'time -p cmd //c ver',
+  // --- 以下釘住 spec〈只能靠「寫對」的形〉的 A/B 表：這些形一律不動 ----
+  // A：刻意不修（回傳≡原生）
+  'cmd //server/share',
+  'del x',
+  'dir /b',
+  'echo hi > C:' + String.fromCharCode(92) + 'tmp' + String.fromCharCode(92) + 'eg.txt',
+  'echo hi > nul',
+  '( echo x ) cmd //c ver', // 原生語法錯誤（子殼後不能直接接指令）
+  // B：無法修復（回傳≠原生但靜態不可判定）
+  'python /tmp/x.py',   // 原生 exe 的 POSIX 路徑參數（實測兩態解析到不同位置）
+  'git -F /tmp/x',
+  'taskkill /IM x.exe /F', // gate ON 的正確寫法（單斜線）：不該被改寫
 ];
 for (const c of misses) {
   const r = bc(c);
@@ -493,11 +676,14 @@ check(
   JSON.stringify(noAnchor),
 );
 
-// --- configured shell (pi settings.shellPath) is the probe target ---
+// --- probe target = pi's own spawn decision (getShellConfig) ---
 // Reading the host's own value is exact, not a guess: a configured non-MSYS
-// shell (pwsh/cmd/WSL) means neither rewrite applies at all.
+// shell (pwsh/cmd/WSL) means neither rewrite applies at all. The worker
+// drives the getShellConfig stub through EG_SHELL; EG_CFG plays
+// settings.shellPath (setConfiguredShell) and must win over detection —
+// the same priority pi's own getShellConfig(customShellPath) applies.
 const shellRun = (shellPath) => JSON.parse(
-  spawnSync(process.execPath, [selfPath, '--shellpath', shellPath], {env: {...process.env, EG_SCRATCH: scratch}, encoding: 'utf8'}).stdout.trim(),
+  spawnSync(process.execPath, [selfPath, '--report'], {env: {...process.env, EG_SCRATCH: scratch, EG_SHELL: shellPath}, encoding: 'utf8'}).stdout.trim(),
 );
 const nonMsys = (process.env.SystemRoot ?? 'C:\\Windows') + '\\System32\\cmd.exe';
 const cfgNonMsys = shellRun(nonMsys);
@@ -509,14 +695,88 @@ check(
   JSON.stringify(cfgNonMsys),
 );
 check('P: configured non-MSYS shell -> anchor is null or a drive path', cfgNonMsys.temp === null || /^[A-Za-z]:[\\/]/.test(cfgNonMsys.temp), JSON.stringify(cfgNonMsys.temp));
-const msysBash = mod.findBash();
 if (msysBash) {
   const cfgMsys = shellRun(msysBash);
   check('P: configured MSYS bash -> gate matches bashrc', cfgMsys.gate === gateOn, JSON.stringify(cfgMsys));
   check('P: configured MSYS bash -> anchor is a drive path', typeof cfgMsys.temp === 'string' && /^[A-Za-z]:[\\/]/.test(cfgMsys.temp), JSON.stringify(cfgMsys));
   check('P: configured MSYS bash -> cmd rewritten like the default path', cfgMsys.cmd === bc('cmd //c ver').command, JSON.stringify(cfgMsys));
+  // settings.shellPath wins over PATH detection (pi spawns the configured shell
+  // even when another MSYS bash is detectable)
+  const cfgWins = JSON.parse(
+    spawnSync(process.execPath, [selfPath, '--report'], {env: {...process.env, EG_SCRATCH: scratch, EG_SHELL: msysBash, EG_CFG: nonMsys}, encoding: 'utf8'}).stdout.trim(),
+  );
+  check('P: settings shellPath wins over detection (configured non-MSYS)', cfgWins.gate === false, JSON.stringify(cfgWins));
 } else {
   check('P: configured MSYS bash (skipped: no MSYS bash on this machine)', true, '');
+}
+
+// 宿主能力缺失也要誠實：舊 pi（< 0.48.0）沒有 getShellConfig export → 整體
+// inert（不刺探、不改寫），而不是拋錯或默默改個不同的對象。
+const noCapSrc = readFileSync(srcPath, 'utf8').replace(
+  'import { getAgentDir, getShellConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+  'const getAgentDir = () => process.env.EG_AGENT_DIR ?? "";\nconst getShellConfig = undefined;',
+);
+const noCapScratch = mkdtempSync(join(tmpdir(), 'env-guard-nocap-'));
+writeFileSync(join(noCapScratch, 'index.ts'), noCapSrc, 'utf8');
+const noCap = await import(pathToFileURL(join(noCapScratch, 'index.ts')).href);
+check('P: host without getShellConfig -> gate off', noCap.pathConvDisabled() === false, JSON.stringify(noCap.pathConvDisabled()));
+check('P: host without getShellConfig -> cmd untouched', noCap.rewriteBashCommand('cmd //c ver').command === 'cmd //c ver', JSON.stringify(noCap.rewriteBashCommand('cmd //c ver').command));
+check('P: host without getShellConfig -> anchor falls back to the tmpdir fact', noCap.realTempDir() === mod.realTempDir() || noCap.realTempDir() === null, JSON.stringify(noCap.realTempDir()));
+// 默默 inert 看不出原因——第一次 tool_call 要通知一次（且只一次）
+const noCapHooks = [];
+noCap.default({on: (ev, fn) => noCapHooks.push([ev, fn]), getSettings: () => ({})});
+const noCapToolCall = noCapHooks.find(([e]) => e === 'tool_call')?.[1];
+const notes = [];
+const noteCtx = {hasUI: true, ui: {notify: (m, l) => notes.push([m, l])}};
+const noCapInput = {command: 'cmd //c ver'};
+noCapToolCall({toolName: 'bash', input: noCapInput}, noteCtx);
+check('P: host gap announced on the first tool call', notes.length === 1 && /getShellConfig/.test(notes[0][0]), JSON.stringify(notes));
+check('P: host gap leaves the command untouched', noCapInput.command === 'cmd //c ver', JSON.stringify(noCapInput.command));
+noCapToolCall({toolName: 'bash', input: {command: 'cmd //c ver'}}, noteCtx);
+check('P: host gap announced only once', notes.length === 1, JSON.stringify(notes));
+rmSync(noCapScratch, {recursive: true, force: true});
+
+// --- E2E: parity with the native conversion layer (envp family) ---
+// 上面所有 envp 案例只是字串比對（"我們預期 C:/x"）；這裡才是真正的驗証：
+// 把指令送進真 bash 跑兩次——原生（MSYS_NO_PATHCONV 未設＝MSYS 自己做 envp 轉換）
+// 與改寫後（MSYS_NO_PATHCONV=1＝本機配置）。stdout 與 exit 必須一致，否則
+// 就是「我們的改寫規則 ≠ MSYS 的轉換規則」。兩邊都 --norc、不設 BASH_ENV，
+// 只留 MSYS_NO_PATHCONV 一個變數在控制（與 bashrc 無關）。
+// cmd //c 家族不在此列：互動模式會掛、而且那是旗標不是 envp。
+if (msysBash) {
+  const baseEnv = {...process.env};
+  delete baseEnv.BASH_ENV;
+  delete baseEnv.MSYS_NO_PATHCONV;
+  const nativeEnv = {...baseEnv}; // 轉換 ON（原生預設）
+  const fixedEnv = {...baseEnv, MSYS_NO_PATHCONV: '1'}; // 轉換 OFF（本機配置）
+  const runBash = (cmd, env) => spawnSync(msysBash, ['--norc', '-c', cmd], {env, encoding: 'utf8', timeout: 30000});
+  const parity = (label, cmd, {statusOnly = false} = {}) => {
+    if (!gateOn) { check(`E2E parity: ${label} (skipped: gate off, nothing rewritten)`, true, ''); return; }
+    const r = bc(cmd);
+    const nat = runBash(cmd, nativeEnv);
+    const got = runBash(r.command, fixedEnv);
+    const outNat = (nat.stdout ?? '').trim();
+    const outGot = (got.stdout ?? '').trim();
+    const same = statusOnly ? nat.status === got.status : nat.status === got.status && outNat === outGot;
+    check(
+      `E2E parity: ${label}`,
+      same,
+      JSON.stringify({input: cmd, rewritten: r.command, native: [nat.status, outNat], fixed: [got.status, outGot]}),
+    );
+  };
+  parity('prefix assignment', "A=/c/x node -e 'process.stdout.write(String(process.env.A))'");
+  parity('env wrapper forwards', "env X=/c/x node -e 'process.stdout.write(String(process.env.X))'");
+  parity('quoted command word', "A=/c/x \"node\" -e 'process.stdout.write(String(process.env.A))'");
+  parity('/tmp value', "TMPDIR=/tmp node -e 'process.stdout.write(String(process.env.TMPDIR))'");
+  parity('/tmp/sub value', "TMPDIR=/tmp/sub node -e 'process.stdout.write(String(process.env.TMPDIR))'");
+  parity('chained assignments', "A=/c/x B=/d/y node -e 'process.stdout.write(process.env.A+process.env.B)'");
+  // 修前是靜默誤修的那條：原生兩態（轉換開／關）都印 /c/x——改寫不該動手
+  parity('quoted bash command word is never rewritten', "A=/c/x \"bash\" -c 'echo [$A]'");
+  // 大聲失敗形：兩邊都應是 127（訊息含 bash 自己的路徑，故只比 exit）
+  parity('quoted pseudo-assignment still fails loudly', 'A=/c/x "B=/c/y" node -e 1', {statusOnly: true});
+  parity('command X= still fails loudly', 'command X=/c/x node -e 1', {statusOnly: true});
+} else {
+  check('E2E parity (skipped: no MSYS bash on this machine)', true, '');
 }
 
 // --- non-Windows: the whole extension registers nothing ---
@@ -547,6 +807,7 @@ const shutdown = registered.find(([e]) => e === 'session_shutdown')?.[1];
 check('S: session_shutdown flush registered', typeof shutdown === 'function', JSON.stringify(registered.map(([e]) => e)));
 const uiCtx = { hasUI: false, ui: { notify: () => {} } };
 toolCall({ toolName: 'read', input: { path: '/tmp/x' } }, uiCtx);
+toolCall({ toolName: 'read', input: { path: '$TEMP/y' } }, uiCtx); // 同一個 temp 修復、不同故障點
 toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx);
 toolCall({ toolName: 'find', input: {} }, uiCtx);       // denominator even without a path field
 toolCall({ toolName: 'webfetch', input: {} }, uiCtx);   // outside the guard list: not counted
@@ -571,16 +832,31 @@ if (msysBash) {
 }
 
 const saved = JSON.parse(readFileSync(statsPath, 'utf8'));
-check('S: denominators merged with prior (read 9, find 1, bash 3)',
-  saved.toolCalls.read === 9 && saved.toolCalls.find === 1 && saved.toolCalls.bash === 3,
+check('S: denominators merged with prior (read 10, find 1, bash 3)',
+  saved.toolCalls.read === 10 && saved.toolCalls.find === 1 && saved.toolCalls.bash === 3,
   JSON.stringify(saved.toolCalls));
 check('S: unguarded tool not counted', saved.toolCalls.webfetch === undefined, JSON.stringify(saved.toolCalls));
-check('S: path.temp merged on top', saved.fixes['path.temp'] === 4, JSON.stringify(saved.fixes));
+check('S: temp mount fix counted under its own key (path.tempMount)', saved.fixes['path.tempMount'] === 1, JSON.stringify(saved.fixes));
+check('S: temp var fix counted separately (path.tempVar)', saved.fixes['path.tempVar'] === 1, JSON.stringify(saved.fixes));
+check('S: legacy path.temp key left untouched (old totals are not renamed)', saved.fixes['path.temp'] === 3, JSON.stringify(saved.fixes));
 check('S: cmd flag counted only when the gate is on', saved.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
 check('S: env path counted only when the gate is on', saved.fixes['shell.envPath'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
 check('S: non-ASCII command untouched (no detection, no count)', saved.fixes['shell.cmdNonAscii'] === undefined, JSON.stringify(saved.fixes));
 check('S: since preserved across runs', saved.since === '2025-01-01T00:00:00.000Z', JSON.stringify(saved.since));
 check('S: no tmp leftovers after flush (per-PID tmp is renamed away)', readdirSync(agentDir).filter((f) => f.endsWith('.tmp')).length === 0, JSON.stringify(readdirSync(agentDir)));
+
+// --- 並發 sessions 的寫前合併（write-before-read）---
+// 另一個 session 在本 session 載入之後、落盤之前寫入了增量；直寫現値
+// （last-writer-wins）會吃掉對方的計數——落盤前重讀、增量疊加後兩邊都要在。
+const external = JSON.parse(readFileSync(statsPath, 'utf8'));
+external.toolCalls.read += 5; // 「另一個 session」落盤的增量
+writeFileSync(statsPath, JSON.stringify(external));
+toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx); // 本 session 再 +1
+shutdown({}, uiCtx);
+const merged = JSON.parse(readFileSync(statsPath, 'utf8'));
+check('S: concurrent increments merged (read 10+5+1)', merged.toolCalls.read === 16, JSON.stringify(merged.toolCalls));
+check('S: concurrent merge keeps other keys (find/bash)', merged.toolCalls.find === 1 && merged.toolCalls.bash === 3, JSON.stringify(merged.toolCalls));
+check('S: concurrent merge preserves since', merged.since === '2025-01-01T00:00:00.000Z', JSON.stringify(merged.since));
 
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== pi unit battery: ${pass} passed, ${failures.length} failed (gate ${gateOn ? 'ON: path conversion disabled' : 'OFF: conversion enabled'}) ===`);

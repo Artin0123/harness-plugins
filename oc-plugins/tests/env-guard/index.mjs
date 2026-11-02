@@ -99,12 +99,21 @@ check('P: cmd //k -> /k', bc('cmd //k dir') === 'cmd /k dir', JSON.stringify(bc(
 const multi = bc('cmd //q //c ver');
 check('P: multi-flag //q //c both fixed', multi === 'cmd /q /c ver', JSON.stringify(multi));
 const tight = bc('cmd//c ver');
-check('P: tight cmd//c form', tight === 'cmd /c ver', JSON.stringify(tight));
+check('P: tight cmd//c form untouched (bash sees a program name; native 127)', tight === 'cmd//c ver', JSON.stringify(tight));
 const tightInSeq = bc('FOO=1 cmd//c ver');
-check('P: tight form after env prefix', tightInSeq === 'FOO=1 cmd /c ver', JSON.stringify(tightInSeq));
+check('P: tight form after env prefix untouched', tightInSeq === 'FOO=1 cmd//c ver', JSON.stringify(tightInSeq));
+const tightQuoted = bc('"cmd"//c ver');
+check('P: quoted tight form untouched', tightQuoted === '"cmd"//c ver', JSON.stringify(tightQuoted));
 
 // --- rewriteBashCommand: position awareness ---
 check('P: data position untouched', bc('echo cmd //c ver') === 'echo cmd //c ver', JSON.stringify(bc('echo cmd //c ver')));
+// a standalone quoted command word carries the same identity (quote removal is
+// part of bash's word parsing; measured native: conv-OFF `"cmd" //c ver` starts
+// the interactive cmd -- silent)
+check('P: quoted cmd name fixed', bc('"cmd" //c ver') === '"cmd" /c ver', JSON.stringify(bc('"cmd" //c ver')));
+check('P: single-quoted cmd name fixed', bc("'cmd' //c ver") === "'cmd' /c ver", JSON.stringify(bc("'cmd' //c ver")));
+check('P: quoted full-path cmd.exe fixed', bc('"C:/Windows/System32/cmd.exe" //c ver') === '"C:/Windows/System32/cmd.exe" /c ver', JSON.stringify(bc('"C:/Windows/System32/cmd.exe" //c ver')));
+check('P: quoted word in argument position untouched', bc('echo "cmd" //c ver') === 'echo "cmd" //c ver', JSON.stringify(bc('echo "cmd" //c ver')));
 const afterSemi = bc('ls; cmd //c ver');
 check('P: command position after ; fixed', afterSemi === 'ls; cmd /c ver', JSON.stringify(afterSemi));
 const nested = bc('echo "v: $(cmd //c ver)"');
@@ -164,9 +173,64 @@ check('E: fd redirect interleaved is a documented miss', bc('A=/c/x 2>&1 node x'
 check('E: bare fd tail persists unconverted', bc('A=/c/x 2>&1') === 'A=/c/x 2>&1', JSON.stringify(bc('A=/c/x 2>&1')));
 check('E: heredoc redirect standalone discards', bc('A=/c/x <<EOF\nbody\nEOF\nnode') === 'A=/c/x <<EOF\nbody\nEOF\nnode', JSON.stringify(bc('A=/c/x <<EOF\nbody\nEOF\nnode')));
 check('E: word-head # comment discards', bc('A=/c/x # note') === 'A=/c/x # note', JSON.stringify(bc('A=/c/x # note')));
+// --- word-head # is a comment: bash ignores the rest of the line, so the
+// comment text is dead data that can never reach any program -- copied
+// verbatim, never scanned. (Before the fix the comment was tokenized: a "("
+// inside was classified as a function definition and reopened command
+// position, so `cmd //c ver # note (cmd //x)` rewrote INSIDE the comment --
+// a zero-effect misfix.) Word head follows bash's lexer rule: the word
+// CONTINUES after a quote or substitution close ("a"#b / $(pwd)#z keep the
+// # literal, measured), while a group/subshell/function/arithmetic-command
+// ")" and a case-PATTERN ")" open a new word ((true)#c, a)#c are comments,
+// measured). ---
+check('B: comment content untouched (dead text, not scanned)',
+  bc('cmd //c ver # note (cmd //x)') === 'cmd /c ver # note (cmd //x)', JSON.stringify(bc('cmd //c ver # note (cmd //x)')));
+check('B: comment with $( ) untouched',
+  bc('cmd //c ver # see $(cmd //c ver)') === 'cmd /c ver # see $(cmd //c ver)', JSON.stringify(bc('cmd //c ver # see $(cmd //c ver)')));
+check('B: comment ends at newline; next line is a command',
+  bc('echo a # note (cmd //x)\ncmd //c ver') === 'echo a # note (cmd //x)\ncmd /c ver', JSON.stringify(bc('echo a # note (cmd //x)\ncmd //c ver')));
+check('B: # adjacent to a closed quote is data (word continues)',
+  bc('echo "a"# $(cmd //c ver)') === 'echo "a"# $(cmd /c ver)', JSON.stringify(bc('echo "a"# $(cmd //c ver)')));
+check('B: # adjacent to a substitution close is data',
+  bc('echo $(pwd)# $(cmd //c ver)') === 'echo $(pwd)# $(cmd /c ver)', JSON.stringify(bc('echo $(pwd)# $(cmd //c ver)')));
+check('B: # adjacent to a process-substitution close is data',
+  bc('echo <(true)# $(cmd //c ver)') === 'echo <(true)# $(cmd /c ver)', JSON.stringify(bc('echo <(true)# $(cmd //c ver)')));
+check('B: # adjacent to a case-pattern ) is a comment',
+  bc('case x in a)# note (cmd //x)\ncmd //c ver;; esac') === 'case x in a)# note (cmd //x)\ncmd /c ver;; esac', JSON.stringify(bc('case x in a)# note (cmd //x)\ncmd //c ver;; esac')));
+check('B: # adjacent to a group ) is a comment',
+  bc('(true)# note (cmd //x)') === '(true)# note (cmd //x)', JSON.stringify(bc('(true)# note (cmd //x)')));
+check('B: # adjacent to an arithmetic-command ) is a comment',
+  bc('((1))# note (cmd //x)') === '((1))# note (cmd //x)', JSON.stringify(bc('((1))# note (cmd //x)')));
+check('B: # adjacent to a function-definition ) is a comment',
+  bc('f()# note (cmd //x)') === 'f()# note (cmd //x)', JSON.stringify(bc('f()# note (cmd //x)')));
+check('B: data-position esac does not end the case section (substitution shape)',
+  bc('echo $(case b in a) echo esac;; b) cmd //c ver;; esac)') === 'echo $(case b in a) echo esac;; b) cmd /c ver;; esac)',
+  JSON.stringify(bc('echo $(case b in a) echo esac;; b) cmd //c ver;; esac)')));
+check('B: esac as the case subject / quoted pattern is not a terminator',
+  bc('echo $(case esac in "esac") cmd //c ver;; esac)') === 'echo $(case esac in "esac") cmd /c ver;; esac)',
+  JSON.stringify(bc('echo $(case esac in "esac") cmd //c ver;; esac)')));
 check('E: builtin command word never applies', bc('A=/c/x echo hi') === 'A=/c/x echo hi', JSON.stringify(bc('A=/c/x echo hi')));
 check('E: quoted command word applying via a later word', bc('A=/c/x "node" -e 1') === 'A=C:/x "node" -e 1', JSON.stringify(bc('A=/c/x "node" -e 1')));
-check('E: quoted command word alone is a known miss', bc('A=/c/x "node"') === 'A=/c/x "node"', JSON.stringify(bc('A=/c/x "node"')));
+// 引號指令字（去引號後參與 token 判定）：bash 的賦值前綴規則在 quote
+// removal 之前，所以 "bash"/"echo" 是指令字不是前綴；此前引號隱形，下一個
+// 詞被當指令字而誤觸套用（A=/c/x "bash" -c … 實測兩種轉換狀態原生皆 [/c/x]）
+check('E: quoted command word alone applies', bc('A=/c/x "node"') === 'A=C:/x "node"', JSON.stringify(bc('A=/c/x "node"')));
+check('E: quoted bash command word never applies', bc('A=/c/x "bash" -c "echo $A"') === 'A=/c/x "bash" -c "echo $A"', JSON.stringify(bc('A=/c/x "bash" -c "echo $A"')));
+check('E: single-quoted bash command word never applies', bc("A=/c/x 'bash' -c 'echo $A'") === "A=/c/x 'bash' -c 'echo $A'", JSON.stringify(bc("A=/c/x 'bash' -c 'echo $A'")));
+check('E: quoted sh command word never applies', bc('A=/c/x "sh" -c x') === 'A=/c/x "sh" -c x', JSON.stringify(bc('A=/c/x "sh" -c x')));
+check('E: quoted echo command word never applies', bc('A=/c/x "echo" hi') === 'A=/c/x "echo" hi', JSON.stringify(bc('A=/c/x "echo" hi')));
+// 引號偽賦值形是指令字（實測 127）；引號詞在 out 裡帶著引號，走跨度算術會
+// 吃掉收尾引號，所以這類詞只當普通指令字
+check('E: quoted pseudo-assignment is a command word', bc('A=/c/x "B=/c/y" node x') === 'A=/c/x "B=/c/y" node x', JSON.stringify(bc('A=/c/x "B=/c/y" node x')));
+check('E: quoted pseudo-assignment alone', bc('"B=/c/y" node x') === '"B=/c/y" node x', JSON.stringify(bc('"B=/c/y" node x')));
+// exec/command/builtin 後的賦值是參數不是前綴：bash 把 X=/c/x 當指令名跑、
+// 原生就大聲失敗（實測 127/127/1，兩種轉換狀態同訊息）→ 不暫存
+check('E: command-assignment argument is not a prefix', bc('command X=/c/x node x') === 'command X=/c/x node x', JSON.stringify(bc('command X=/c/x node x')));
+check('E: exec-assignment argument is not a prefix', bc('exec X=/c/x node x') === 'exec X=/c/x node x', JSON.stringify(bc('exec X=/c/x node x')));
+check('E: builtin-assignment argument is not a prefix', bc('builtin X=/c/x node x') === 'builtin X=/c/x node x', JSON.stringify(bc('builtin X=/c/x node x')));
+// env is a POSIX external program: its X= argument crosses msys->native
+check('E: env assignment forwards to an external', bc('env X=/c/x node x') === 'env X=C:/x node x', JSON.stringify(bc('env X=/c/x node x')));
+check('E: env assignment after another prefix both apply', bc('A=/c/x env X=/c/y node x') === 'A=C:/x env X=C:/y node x', JSON.stringify(bc('A=/c/x env X=/c/y node x')));
 check('E: tight closed form composes (prefix + verbatim suffix)', bc('VAR=/c/x$(pwd) node x') === 'VAR=C:/x$(pwd) node x', JSON.stringify(bc('VAR=/c/x$(pwd) node x')));
 // residual misses (native converts these; the scanner cannot see a full
 // unquoted value or program-specific argument semantics -- loud or the value
@@ -179,6 +243,13 @@ check('E: root-relative value -- miss (MSYS-root mount dependent)', bc('A=/usr/x
 check('E: single-letter drive roots convert too (letter-generic anchor, like native)', bc('A=/q/x node x') === 'A=Q:/x node x', JSON.stringify(bc('A=/q/x node x')));
 check('E: conversion ON -> apply suppressed (duplicate protection)', bcr('A=/c/x node x', false).command === 'A=/c/x node x', JSON.stringify(bcr('A=/c/x node x', false)));
 check('E: conversion ON also suppresses mid-command apply', bcr('A=/c/x foo; node x', false).command === 'A=/c/x foo; node x', JSON.stringify(bcr('A=/c/x foo; node x', false)));
+// both rewrites eat the same convOff gate; the exported default is FALSE --
+// a direct call without gate evidence is inert (uncertainty never enables
+// a rewrite)
+check('G: cmdFlag eats the same convOff gate (conversion ON -> no rewrite)',
+  (() => { const r = bcr('cmd //c ver', false); return r.command === 'cmd //c ver' && !r.cmdFlagFixed && !r.envPathFixed; })(), JSON.stringify(bcr('cmd //c ver', false)));
+check('G: default convOff is false (direct call without gate evidence is inert)',
+  mod.rewriteBashCommand('cmd //c ver').command === 'cmd //c ver', JSON.stringify(mod.rewriteBashCommand('cmd //c ver')));
 
 // N2 anti-drift: every `enable -a` builtin, used AS the command word, must
 // NOT trigger an apply (the value crosses no exec boundary there)
@@ -243,6 +314,18 @@ const s3 = evShell('cmd //c ver', process.execPath); shellBefore(s3);
 check('H: shell hook ignores a non-bash shell', s3.command === 'cmd //c ver', JSON.stringify(s3.command));
 const s4 = evShell('cmd //c ver', 'pwsh'); shellBefore(s4);
 check('H: shell hook ignores an unresolvable shell', s4.command === 'cmd //c ver', JSON.stringify(s4.command));
+// word identity + esac section tracking through the real hook + probe
+const s9 = evShell('"cmd" //c ver', bashPath); shellBefore(s9);
+check(gateOn ? 'H: shell hook rewrites a quoted command word' : 'H: quoted cmd left alone when the gate is OFF',
+  s9.command === (gateOn ? '"cmd" /c ver' : '"cmd" //c ver'), JSON.stringify(s9.command));
+const s10 = evShell('echo $(case b in a) echo esac;; b) cmd //c ver;; esac)', bashPath); shellBefore(s10);
+check(gateOn ? 'H: shell hook keeps the case section across a data-position esac'
+  : 'H: case-in-substitution left alone when the gate is OFF',
+  s10.command === (gateOn ? 'echo $(case b in a) echo esac;; b) cmd /c ver;; esac)' : 'echo $(case b in a) echo esac;; b) cmd //c ver;; esac)'),
+  JSON.stringify(s10.command));
+const s11 = evShell(`A=/c/x "bash" -c 'echo [$A]'`, bashPath); shellBefore(s11);
+check('H: quoted builtin command word keeps the assignment unconverted',
+  s11.command === `A=/c/x "bash" -c 'echo [$A]'`, JSON.stringify(s11.command));
 
 const s5 = evShell('pwd', bashPath, '/tmp'); shellBefore(s5);
 check('H: shell hook rewrites workdir /tmp', s5.cwd === T, JSON.stringify(s5.cwd));
@@ -278,9 +361,52 @@ check('P: glob $TMP backslash splits', !!gp3 && gp3.rest === 'a/b.txt', JSON.str
 check('P: glob unrelated pattern untouched', split('src/**/*.ts') === null, JSON.stringify(split('src/**/*.ts')));
 check('P: glob bare $TEMP untouched', split('$TEMP') === null, JSON.stringify(split('$TEMP')));
 
+// --- temp mechanism classification is the SAME source as the rewrite ------
+// (a value rewrite without its mechanism was how counts used to drift)
+const cls = (p) => mod.classifyTempPath(p);
+check('S: /tmp classified as tempMount', cls('/tmp/x') === 'tempMount', String(cls('/tmp/x')));
+check('S: /TMP classified as tempMount (case-insensitive)', cls('/TMP') === 'tempMount', String(cls('/TMP')));
+check('S: $TEMP classified as tempVar', cls('$TEMP/x') === 'tempVar', String(cls('$TEMP/x')));
+check('S: ${TMPDIR} classified as tempVar', cls('${TMPDIR}/x') === 'tempVar', String(cls('${TMPDIR}/x')));
+check('S: %TMP% classified as tempVar', cls('%TMP%\\x') === 'tempVar', String(cls('%TMP%\\x')));
+check('S: /tmpfoo is not a temp dir', cls('/tmpfoo/x') === null, String(cls('/tmpfoo/x')));
+check('S: $TEMPFILE is not a temp var', cls('$TEMPFILE/x') === null, String(cls('$TEMPFILE/x')));
+const rvf = mod.rewritePathFix('/tmp/x');
+check('S: rewritePathFix returns value + mechanism together',
+  rvf.value === N + 'x' && rvf.mechanism === 'tempMount', JSON.stringify(rvf));
+const rvfNone = mod.rewritePathFix('plain.txt');
+check('S: rewritePathFix reports no mechanism for a non-temp path',
+  rvfNone.value === 'plain.txt' && rvfNone.mechanism === null, JSON.stringify(rvfNone));
+const pf = mod.rewritePatchTextFix('*** Add File: ${TEMP}/x\n*** Add File: /tmp/y\n');
+check('S: one patch reports both mechanisms it rewrote',
+  pf.mechanisms.length === 2 && pf.mechanisms.includes('tempVar') && pf.mechanisms.includes('tempMount'),
+  JSON.stringify(pf.mechanisms));
+const gpMount = split('/tmp/*.txt');
+check('S: glob prefix reports its mechanism', !!gpMount && gpMount.mechanism === 'tempMount', JSON.stringify(gpMount));
+const gpVar = split('${TEMP}/*.txt');
+check('S: glob var prefix reports tempVar', !!gpVar && gpVar.mechanism === 'tempVar', JSON.stringify(gpVar));
+
 // --- command position: shells keywords, groups, case patterns, path forms ---
 const fullPath = bc('C:\\Windows\\System32\\cmd.exe //c ver');
-check('P: full-path cmd.exe fixed', fullPath === 'C:\\Windows\\System32\\cmd.exe /c ver', JSON.stringify(fullPath));
+check('P: unquoted backslash Windows path untouched (bash eats the backslashes: native 127)', fullPath === 'C:\\Windows\\System32\\cmd.exe //c ver', JSON.stringify(fullPath));
+const fullPathEscaped = bc('C:\\\\Windows\\\\System32\\\\cmd.exe //c ver');
+check('P: double-backslash Windows path untouched (host -c fold + lexer leaves C:Windows…)', fullPathEscaped === 'C:\\\\Windows\\\\System32\\\\cmd.exe //c ver', JSON.stringify(fullPathEscaped));
+const fullPathPosix = bc('/c/Windows/System32/cmd.exe //c ver');
+check('P: POSIX full-path cmd.exe fixed', fullPathPosix === '/c/Windows/System32/cmd.exe /c ver', JSON.stringify(fullPathPosix));
+const fullPathMixed = bc('/c/Windows\\System32\\cmd.exe //c ver');
+check('P: unquoted mixed-separator path is not a program (untouched)', fullPathMixed === '/c/Windows\\System32\\cmd.exe //c ver', JSON.stringify(fullPathMixed));
+const quotedWinPath = bc('"C:\\Windows\\System32\\cmd.exe" //c ver');
+check('P: quoted Windows path fixed (quoted backslashes are literal separators)', quotedWinPath === '"C:\\Windows\\System32\\cmd.exe" /c ver', JSON.stringify(quotedWinPath));
+const quotedMixedPath = bc('"/c/Windows\\System32\\cmd.exe" //c ver');
+check('P: quoted mixed-separator path fixed (MSYS resolves it)', quotedMixedPath === '"/c/Windows\\System32\\cmd.exe" /c ver', JSON.stringify(quotedMixedPath));
+const quotedRelPath = bc('"c\\md" //c ver');
+check('P: quoted relative backslash word is not cmd (basename md)', quotedRelPath === '"c\\md" //c ver', JSON.stringify(quotedRelPath));
+const trailingBackslash = bc('cmd\\\\ //c ver');
+check('P: trailing backslash pair is not cmd (it escapes the separator: native 127)', trailingBackslash === 'cmd\\\\ //c ver', JSON.stringify(trailingBackslash));
+const escapedName = bc('\\cmd //c ver');
+check('P: escaped cmd name fixed (bash runs cmd)', escapedName === '\\cmd /c ver', JSON.stringify(escapedName));
+const midEscapedName = bc('c\\md //c ver');
+check('P: mid-word escaped cmd name fixed', midEscapedName === 'c\\md /c ver', JSON.stringify(midEscapedName));
 const thenKw = bc('if true; then cmd //c ver; fi');
 check('P: cmd after then', thenKw === 'if true; then cmd /c ver; fi', JSON.stringify(thenKw));
 const doKw = bc('for f in a b; do cmd //c ver; done');
@@ -297,11 +423,29 @@ const envCmd = bc('env FOO=1 cmd //c ver');
 check('P: cmd after env', envCmd === 'env FOO=1 cmd /c ver', JSON.stringify(envCmd));
 check('P: quoted word in argument position untouched', bc('echo "if" cmd //c ver') === 'echo "if" cmd //c ver', JSON.stringify(bc('echo "if" cmd //c ver')));
 check('P: cmd as xargs argument untouched', bc('ls | xargs cmd //c ver') === 'ls | xargs cmd //c ver', JSON.stringify(bc('ls | xargs cmd //c ver')));
-// Known miss, pinned on purpose: a quoted command name ("cmd") is not
-// recognised. It is fixable in principle but has zero organic occurrences
-// (0/508 real commands in this machine's log), so handling it would only add
-// scanner risk. Left as-is: pre-plugin behaviour.
-check('P: quoted cmd left alone (known miss)', bc('"cmd" //c ver') === '"cmd" //c ver', JSON.stringify(bc('"cmd" //c ver')));
+// A quoted command name ("cmd") is handled by the word-identity feed (pin
+// above); what remains a known miss is a quoted payload an inner program
+// executes.
+// Known misses (open-set ledger, spec.md 漏修臺帳): a quoted payload an inner
+// program executes (`bash -c 'cmd //c ver'` -- the scanner treats quoted
+// content as data, and which programs take their first argument as a script
+// is an open set; measured: conv-ON prints ver's output, conv-OFF starts
+// the interactive-cmd silent failure), and `time -p` (bare `time` is a
+// covered keyword, `-p` ends the position; same silent failure, organic
+// frequency ~0).
+check('P: nested single-quoted payload left alone (known miss)',
+  bc("bash -c 'cmd //c ver'") === "bash -c 'cmd //c ver'", JSON.stringify(bc("bash -c 'cmd //c ver'")));
+check('P: nested double-quoted payload left alone (known miss)',
+  bc('bash -c "cmd //c ver"') === 'bash -c "cmd //c ver"', JSON.stringify(bc('bash -c "cmd //c ver"')));
+check('P: time -p left alone (known miss)',
+  bc('time -p cmd //c ver') === 'time -p cmd //c ver', JSON.stringify(bc('time -p cmd //c ver')));
+// 反斜線換行續接：跳脫對被併進 token、`cmd` 的指令字身分失效（實測：轉換開
+// ＝bash 詞法先移除續接對、`//c` 經原生轉換成 `/c`、ver 正常；本機轉換關＝
+// cmd 收到字面 `//c` 進互動模式 banner、exit 0）→ 漏修臺（pi / oc 同形）
+check('P: backslash-newline continuation left alone (known miss)',
+  bc('cmd \\\n//c ver') === 'cmd \\\n//c ver', JSON.stringify(bc('cmd \\\n//c ver')));
+check('E: backslash-newline after an assignment still composes',
+  bc('A=/c/x \\\n node x') === 'A=C:/x \\\n node x', JSON.stringify(bc('A=/c/x \\\n node x')));
 
 // --- escaped \$ ( : literal data, not a substitution opener ---
 // bash: "\$(x)" inside double quotes prints $(x) literally (the $ is
@@ -367,6 +511,51 @@ check('B: echo $(for...done) cmd //c ver untouched', bc('echo $(for i in 1; do e
 check('B: echo $( { x; } ) cmd //c ver untouched', bc('echo $( { x; } ) cmd //c ver') === 'echo $( { x; } ) cmd //c ver', JSON.stringify(bc('echo $( { x; } ) cmd //c ver')));
 const caseSubst = bc('echo $(case 1 in 1) x;; esac) cmd //c ver');
 check('B: case-pattern ")" in substitution keeps the stack', caseSubst === 'echo $(case 1 in 1) x;; esac) cmd //c ver', JSON.stringify(caseSubst));
+
+// --- zero-effect rewrites removed (measured with real bash) --------------
+// A word after a compound-command terminator (or a group-subshell close)
+// without a separator is a bash syntax error; a loop/list slot is data.
+// Rewriting `cmd //c` there changed text only (or changed DATA), so the
+// scanner stays inert. Live bodies (then/do, after ; &&) still rewrite.
+check('B: group close does not open a command position (native syntax error)',
+  bc('(true) cmd //c ver') === '(true) cmd //c ver', JSON.stringify(bc('(true) cmd //c ver')));
+check('B: brace close does not open a command position (native syntax error)',
+  bc('{ true; } cmd //c ver') === '{ true; } cmd //c ver', JSON.stringify(bc('{ true; } cmd //c ver')));
+check('B: fi does not open a command position (native syntax error)',
+  bc('if true; then true; fi cmd //c ver') === 'if true; then true; fi cmd //c ver', JSON.stringify(bc('if true; then true; fi cmd //c ver')));
+check('B: done does not open a command position (native syntax error)',
+  bc('while true; do break; done cmd //c ver') === 'while true; do break; done cmd //c ver', JSON.stringify(bc('while true; do break; done cmd //c ver')));
+check('B: esac does not open a command position (native syntax error)',
+  bc('case x in a) true;; esac cmd //c ver') === 'case x in a) true;; esac cmd //c ver', JSON.stringify(bc('case x in a) true;; esac cmd //c ver')));
+check('B: for-list words are data',
+  bc('for x in cmd //c ver; do echo "$x"; done') === 'for x in cmd //c ver; do echo "$x"; done', JSON.stringify(bc('for x in cmd //c ver; do echo "$x"; done')));
+check('B: for variable named cmd does not arm the flag zone',
+  bc('for cmd in cmd //c; do echo "$cmd"; done') === 'for cmd in cmd //c; do echo "$cmd"; done', JSON.stringify(bc('for cmd in cmd //c; do echo "$cmd"; done')));
+check('B: empty-case esac does not steal the substitution close',
+  bc('echo $(case x in esac) cmd //c ver') === 'echo $(case x in esac) cmd //c ver', JSON.stringify(bc('echo $(case x in esac) cmd //c ver')));
+check('B: unquoted esac pattern line is dead text (untouched)',
+  bc('case x in esac) cmd //c ver;; esac') === 'case x in esac) cmd //c ver;; esac', JSON.stringify(bc('case x in esac) cmd //c ver;; esac')));
+check('B: then body still fixed', bc('if true; then cmd //c ver; fi') === 'if true; then cmd /c ver; fi', JSON.stringify(bc('if true; then cmd //c ver; fi')));
+check('B: do body still fixed', bc('while true; do cmd //c ver; break; done') === 'while true; do cmd /c ver; break; done', JSON.stringify(bc('while true; do cmd //c ver; break; done')));
+check('B: group close followed by ; still fixed', bc('(true); cmd //c ver') === '(true); cmd /c ver', JSON.stringify(bc('(true); cmd //c ver')));
+check('B: group close followed by && still fixed', bc('(true) && cmd //c ver') === '(true) && cmd /c ver', JSON.stringify(bc('(true) && cmd //c ver')));
+check('B: fi followed by ; still fixed', bc('if true; then true; fi; cmd //c ver') === 'if true; then true; fi; cmd /c ver', JSON.stringify(bc('if true; then true; fi; cmd //c ver')));
+check('B: done followed by ; still fixed', bc('while true; do break; done; cmd //c ver') === 'while true; do break; done; cmd /c ver', JSON.stringify(bc('while true; do break; done; cmd //c ver')));
+check('B: esac followed by ; still fixed', bc('case x in a) true;; esac; cmd //c ver') === 'case x in a) true;; esac; cmd /c ver', JSON.stringify(bc('case x in a) true;; esac; cmd //c ver')));
+check('B: brace group followed by ; still fixed', bc('{ true; }; cmd //c ver') === '{ true; }; cmd /c ver', JSON.stringify(bc('{ true; }; cmd //c ver')));
+// function definitions: the body must be a compound command (f() cmd is a
+// syntax error); a compound starter keeps the body writable.
+check('B: function body simple command is dead text (native syntax error)',
+  bc('f() cmd //c ver') === 'f() cmd //c ver', JSON.stringify(bc('f() cmd //c ver')));
+check('B: function body brace is fixed', bc('f() { cmd //c ver; }') === 'f() { cmd /c ver; }', JSON.stringify(bc('f() { cmd //c ver; }')));
+check('B: function body subshell is fixed', bc('f() (cmd //c ver)') === 'f() (cmd /c ver)', JSON.stringify(bc('f() (cmd //c ver)')));
+check('B: function body on the next line is fixed', bc('f()\n{ cmd //c ver; }') === 'f()\n{ cmd /c ver; }', JSON.stringify(bc('f()\n{ cmd //c ver; }')));
+check('B: function body if is fixed', bc('f() if true; then cmd //c ver; fi') === 'f() if true; then cmd /c ver; fi', JSON.stringify(bc('f() if true; then cmd //c ver; fi')));
+check('B: function body case is fixed', bc('f() case x in a) cmd //c ver;; esac') === 'f() case x in a) cmd /c ver;; esac', JSON.stringify(bc('f() case x in a) cmd //c ver;; esac')));
+// known miss: `function NAME { … }` (the scanner does not track the name
+// slot; use the `f() { … }` spelling, which is rewritten)
+check('P: function-keyword body left alone (known miss; write f() { … })',
+  bc('function f { cmd //c ver; }') === 'function f { cmd //c ver; }', JSON.stringify(bc('function f { cmd //c ver; }')));
 // ... while a top-level case pattern still opens command position
 check('B: top-level case pattern still fixed', bc('case x in a) cmd //c ver;; esac') === 'case x in a) cmd /c ver;; esac', JSON.stringify(bc('case x in a) cmd //c ver;; esac')));
 // a $( ) in the case BODY is an ordinary paren: its ")" must pop, so the
@@ -518,6 +707,13 @@ if (bash && gateOn) {
   check('E: assignment-prefix rewrite executes (GUARD_OK2, exit 0)',
     r2.status === 0 && (r2.stdout?.toString() ?? '').includes('GUARD_OK2'),
     JSON.stringify({ sent: sentAssign, status: r2.status, out: (r2.stdout?.toString() ?? '').slice(0, 80) }));
+  // a standalone quoted command word runs through the same path (native
+  // conv-OFF would start the interactive cmd: banner, no GUARD_OK3)
+  const sentQuoted = bc('"cmd" //c echo GUARD_OK3');
+  const r3 = spawnSync(bash, ['-c', sentQuoted], { timeout: 15000, windowsHide: true });
+  check('E: quoted cmd rewrite executes (GUARD_OK3, exit 0)',
+    r3.status === 0 && (r3.stdout?.toString() ?? '').includes('GUARD_OK3'),
+    JSON.stringify({ sent: sentQuoted, status: r3.status, out: (r3.stdout?.toString() ?? '').slice(0, 80) }));
 }
 // e2e, envp cross-check: the fault exists only while the tool's return
 // differs from native, so the rewritten command must produce EXACTLY the
@@ -530,14 +726,25 @@ if (bashPath) {
     const env = { ...process.env };
     delete env.MSYS_NO_PATHCONV;
     delete env.BASH_ENV;
+    // PWD is environment-dependent (this harness exports a Windows-form
+    // value; a real bash exports /c/...): $(pwd) would differ between the
+    // native and guarded runs for reasons unrelated to the rewrite.
+    delete env.PWD;
     return spawnSync(bashPath, ['-c', cmd], { env, timeout: 20000, windowsHide: true });
   };
-  const guarded = (cmd) => spawnSync(bashPath, ['-c', bc(cmd)], { timeout: 20000, windowsHide: true });
+  const guarded = (cmd) => {
+    const env = { ...process.env };
+    delete env.PWD; // same isolation as the native side (see convOn)
+    return spawnSync(bashPath, ['-c', bc(cmd)], { env, timeout: 20000, windowsHide: true });
+  };
   const envpE2E = [
     ['A=/c/x node -e "console.log(process.env.A)"', 'C:/x'],
     ['VAR=/c/x$(pwd) node -e "console.log(process.env.VAR)"', 'C:/x/'],
     ["A=/c/x bash -c 'echo $A'", '/c/x'],
+    ["A=/c/x \"bash\" -c 'echo $A'", '/c/x'],
+    ["A=/c/x 'bash' -c 'echo $A'", '/c/x'],
     ['A=/c/x env node -e "console.log(process.env.A)"', 'C:/x'],
+    ['env X=/c/x node -e "console.log(process.env.X)"', 'C:/x'],
   ];
   for (const [orig, want] of envpE2E) {
     const nat = convOn(orig);
@@ -579,25 +786,36 @@ const sA = A.h['shell:create.before'];
 check('S: setup registers both hooks', !!tA && !!sA, Object.keys(A.h).join(','));
 
 await tA({ tool: 'read', input: { path: '/tmp/x' } });
+await tA({ tool: 'read', input: { path: '$TEMP/x' } });
 await tA({ tool: 'read', input: { path: 'plain.txt' } });
 await tA({ tool: 'webfetch', input: {} }); // outside the guard list: no denominator
 await tA({ tool: 'glob', input: { pattern: '${TEMP}/*.txt' } });
+await tA({ tool: 'glob', input: { pattern: '/tmp/*.log' } });
 await tA({ tool: 'patch', input: { patchText: '*** Add File: ${TEMP}/x\n' } });
+await tA({ tool: 'patch', input: { patchText: '*** Add File: /tmp/y\n' } });
 await sA({ shell: bash, cwd: '/tmp/sub', command: 'echo hi' }); // MSYS shell: bash denominator
 await sA({ shell: process.execPath, cwd: '/tmp/sub', command: 'cmd //c ver' }); // non-MSYS shell: skipped
 await sA({ shell: bash, cwd: '/tmp/sub', command: 'cmd //c ver' }); // cmd flag numerator
 await sA({ shell: bash, cwd: '/tmp/sub', command: 'A=/c/x node' }); // envp numerator
+await sA({ shell: bash, cwd: '$TEMP/sub', command: 'echo hi' }); // var-mechanism workdir
 
 const snapA = mod.statsSnapshot();
-check('S: denominators (read 2, glob 1, patch 1, bash 3)',
-  snapA.toolCalls.read === 2 && snapA.toolCalls.glob === 1 && snapA.toolCalls.patch === 1 && snapA.toolCalls.bash === 3,
+check('S: denominators (read 3, glob 2, patch 2, bash 4)',
+  snapA.toolCalls.read === 3 && snapA.toolCalls.glob === 2 && snapA.toolCalls.patch === 2 && snapA.toolCalls.bash === 4,
   JSON.stringify(snapA.toolCalls));
 check('S: unguarded tool not counted', snapA.toolCalls.webfetch === undefined, JSON.stringify(snapA.toolCalls));
-check('S: non-MSYS shell does not bump bash', snapA.toolCalls.bash === 3, JSON.stringify(snapA.toolCalls));
-check('S: path.temp numerator', snapA.fixes['path.temp'] === 1, JSON.stringify(snapA.fixes));
-check('S: glob.tempPrefix numerator', snapA.fixes['glob.tempPrefix'] === 1, JSON.stringify(snapA.fixes));
-check('S: patch.tempLine numerator', snapA.fixes['patch.tempLine'] === 1, JSON.stringify(snapA.fixes));
-check('S: shell.workdir.temp numerator (one per MSYS shell event)', snapA.fixes['shell.workdir.temp'] === 3, JSON.stringify(snapA.fixes));
+check('S: non-MSYS shell does not bump bash', snapA.toolCalls.bash === 4, JSON.stringify(snapA.toolCalls));
+check('S: path.tempMount numerator', snapA.fixes['path.tempMount'] === 1, JSON.stringify(snapA.fixes));
+check('S: path.tempVar numerator', snapA.fixes['path.tempVar'] === 1, JSON.stringify(snapA.fixes));
+check('S: glob.tempVar numerator', snapA.fixes['glob.tempVar'] === 1, JSON.stringify(snapA.fixes));
+check('S: glob.tempMount numerator', snapA.fixes['glob.tempMount'] === 1, JSON.stringify(snapA.fixes));
+check('S: patch.tempVar numerator', snapA.fixes['patch.tempVar'] === 1, JSON.stringify(snapA.fixes));
+check('S: patch.tempMount numerator', snapA.fixes['patch.tempMount'] === 1, JSON.stringify(snapA.fixes));
+check('S: shell.workdir.tempMount numerator (one per MSYS shell event)',
+  snapA.fixes['shell.workdir.tempMount'] === 3, JSON.stringify(snapA.fixes));
+check('S: shell.workdir.tempVar numerator',
+  snapA.fixes['shell.workdir.tempVar'] === 1, JSON.stringify(snapA.fixes));
+check('S: legacy path.temp not bumped', snapA.fixes['path.temp'] === undefined, JSON.stringify(snapA.fixes));
 check('S: cmd flag numerator (gate-conditional)', snapA.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(snapA.fixes));
 check('S: envp numerator (gate-conditional, its own key -- not cmdFlag)', snapA.fixes['shell.envPath'] === (gateOn ? 1 : undefined), JSON.stringify(snapA.fixes));
 
@@ -607,7 +825,7 @@ const persisted = savedSets[savedSets.length - 1] ?? null; // null when the clea
 check('S: persisted value matches the snapshot',
   persisted && persisted.schema === 1 &&
   persisted.toolCalls.read === snapA.toolCalls.read &&
-  persisted.fixes['path.temp'] === snapA.fixes['path.temp'],
+  persisted.fixes['path.tempMount'] === snapA.fixes['path.tempMount'],
   JSON.stringify(persisted));
 
 // reload adopts what was persisted (history survives a restart)
@@ -615,7 +833,7 @@ const B = mkStatsCtx(persisted);
 const cleanupB = await mod.default.setup(B.ctx);
 const snapB = mod.statsSnapshot();
 check('S: reload adopts prior counts',
-  snapB.toolCalls.read === snapA.toolCalls.read && snapB.fixes['path.temp'] === snapA.fixes['path.temp'],
+  snapB.toolCalls.read === snapA.toolCalls.read && snapB.fixes['path.tempMount'] === snapA.fixes['path.tempMount'],
   JSON.stringify(snapB));
 check('S: reload keeps the original since', snapB.since === persisted?.since, JSON.stringify(snapB.since));
 await B.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/y' } });
@@ -623,6 +841,30 @@ await cleanupB(); // awaited: the +1 read must be persisted when this resolves
 check('S: second run adds on top (read-modify-write)',
   savedSets[savedSets.length - 1]?.toolCalls.read === snapA.toolCalls.read + 1,
   JSON.stringify(savedSets[savedSets.length - 1]));
+
+// a call that rewrites nothing must not bump ANY fix key (the old
+// "hint/stats without a rewrite" class): denominator only
+const Z = mkStatsCtx(undefined);
+const cleanupZ = await mod.default.setup(Z.ctx);
+await Z.h['tool:execute.before']({ tool: 'read', input: { path: 'plain.txt' } });
+await Z.h['tool:execute.before']({ tool: 'patch', input: { patchText: '*** Add File: src/x.ts\n+a\n' } });
+await Z.h['shell:create.before']({ shell: bash, cwd: 'C:\\tmp', command: 'echo hi' });
+const snapZ = mod.statsSnapshot();
+check('S: no rewrite -> no numerator (only tool calls)',
+  snapZ.toolCalls.read === 1 && snapZ.toolCalls.patch === 1 && snapZ.toolCalls.bash === 1 &&
+  Object.keys(snapZ.fixes).length === 0,
+  JSON.stringify({ toolCalls: snapZ.toolCalls, fixes: snapZ.fixes }));
+await cleanupZ();
+
+// legacy key in an existing file: historical totals are never renamed; new
+// counts use the split keys
+const L = mkStatsCtx({ schema: 1, since: 'SINCE-L', toolCalls: {}, fixes: { 'path.temp': 3 } });
+const cleanupL = await mod.default.setup(L.ctx);
+await L.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/legacy' } });
+const snapL = mod.statsSnapshot();
+check('S: legacy path.temp kept untouched', snapL.fixes['path.temp'] === 3, JSON.stringify(snapL.fixes));
+check('S: new count goes to the split key (path.tempMount)', snapL.fixes['path.tempMount'] === 1, JSON.stringify(snapL.fixes));
+await cleanupL();
 
 // malformed saved data: shape-checked and coerced, never fatal
 const C = mkStatsCtx({ schema: 1, since: 'SINCE', toolCalls: { read: '5', bad: -1 }, fixes: 'nope' });

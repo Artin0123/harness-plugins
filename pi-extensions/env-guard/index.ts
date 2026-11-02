@@ -20,18 +20,27 @@
 // 不修的事（此處只列清單防回歸誤加；逐條病理與實測在 spec）：
 //   刻意不修（回傳≡原生）：C:\tmp、nul 重導向與 <nul/2>&nul、重導向目標的
 //     雙斜線（bash 自己開檔、不經被關掉的 argv 轉換層）、原生就壞的 cmd
-//     雙斜線形（//? ///c //server/share）、del 與 dir /b 等 cmd-ism
+//     雙斜線形（//? ///c //server/share）、緊貼形（cmd//c／"cmd"//c：bash 把它
+//     當程式名、原生 127 大聲失敗——插空格拆詞＝替模型改錯字）、exec/command/
+//     builtin 後的賦值形與引號詞裡的偽賦值形（bash 把它當指令名跑、原生就
+//     大聲失敗）、del 與 dir /b 等 cmd-ism
 //   漏修（回傳≠原生，但靜態修法＝開放集合的猜測、誤修風險大於漏修）：
 //     外部 wrapper 後的 cmd、taskkill/sc/net/reg/findstr/robocopy 等原生
-//     工具的 //x 旗標、原生 exe 的 POSIX 路徑參數、絕對路徑/引號/跳脫的
-//     cmd、envp 殘餘值形（見 convertEnvPath 與 spec「envp 殘餘形」）
+//     工具的 //x 旗標、原生 exe 的 POSIX 路徑參數、
+//     反斜線換行續接後的 cmd //c（\⟨newline⟩ 被當跳脫對併進 token、指令字
+//     身分失效）、bash -c '…' 引號內的指令碼、envp 殘餘值形（env 選項交錯形
+//     env -u V X=…、賦值值的引號/清單/根相對形等；見 convertEnvPath 與 spec
+//     「envp 殘餘形」）、指令字串裡成對的反斜線抵達 bash 時只剩一個（病灶已
+//     量到：git-bash 對 `-c` 操作數的引號處理把成對反斜線縮一層，stdin／檔案
+//     傳輸保真；資訊在 hook 之前就丟了，加倍反斜線會破壞合法的跳脫＝誤修，
+//     見 spec 臺帳）
 
 
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getShellConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // 不直接信 os.tmpdir()：TEMP 可能是 "/tmp" 這種 MSYS 映射值，而 Node 對它
 // 會驗證失敗後回退（實測 TEMP=TMP=/tmp 時回退到使用者 temp）——回退值不
@@ -46,20 +55,27 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 // 惰性求值：探測要 spawn 兩顆行程（uname + cygpath，實測 ~370ms），不能在
 // 模組載入時就付（pi 也不會用到檔案工具的命令照樣載入擴充）。
 let tempAnchor: string | null | undefined; // undefined＝尚未探測；null＝探不到錨點
-// bash 偵測結果快取（findBash 會被 realTempDir 與 pathConvDisabled 多次呼叫，
-// 掃描+uname 驗證有成本，結果算一次就定）
-let bashCache: string | null | undefined;
 
 // ===== 探測對象：pi 實際會 spawn 的 shell =====
-// 兩項改寫（/tmp 錨點、MSYS_NO_PATHCONV 閘門）都盡量問「真的會執行命令的那顆
-// shell」，否則就是猜。pi 的設定值（settings.shellPath）由 factory 注入：
-//   有設 → 只信它：驗證是 MSYS bash 才拿來探測；不是（pwsh/cmd/WSL/Cygwin）→ null，
-//          cmd 旗標改寫直接停用（`//c` 的故障點是 MSYS 轉換層的事）；temp 錨點
-//          則退回 os.tmpdir() 這個環境事實（有的話）——檔案工具不管 shell 是什麼
-//          都在 host 端解析，`/tmp` 一樣會錯位，所以不全面停用。
-//   沒設 → pi 自己會去挑 git-bash，用 findBash() 的掃描+驗證結果
+// 兩項改寫（/tmp 錨點、MSYS_NO_PATHCONV 閘門）都問「真的會執行命令的那顆
+// shell」，否則就是猜。pi 的 spawn 決策就是 getShellConfig(settings.shellPath)
+//（agent-session 讀 settings → bash 工具 → getShellConfig）；擴充呼叫同一個
+// 函式＝由構造保證探測對象≡spawn 對象——先前的自製掃描（findBash）解析順序
+// 與 pi 不同（pi 先看 Program Files 的 Git，掃描先看 PATH），在「Program Files
+// 有 Git ＋ PATH 上另有 MSYS2」的機器上兩者會漂移，已移除。settings.shellPath
+// 由 factory 注入（pi.getSettings）；getShellConfig 找不到 shell、或 settings.
+// shellPath 指到不存在的檔（它對這兩種都 throw）→ probeShell 回 null（整體
+// inert）。回傳的 shell 也可能非 MSYS（pwsh、PATH
+// fallback 不跳 System32 → 可能是 WSL 啟動器）→ verifyMsysBash 擋下：cmd 旗標
+// 改寫停用、錨點退 os.tmpdir()——與 pi 真的 spawn 該 shell 的原生行為一致。
 let configuredShell: (() => string | undefined) | null = null;
 let probeShellCache: string | null | undefined;
+// 宿主能力缺失的紀錄（只在 tool_call 的第一個呼叫通知一次）：pi 的
+// getShellConfig 自 0.48.0 起才 export（CHANGELOG #766）。舊宿主上 import 會是
+// undefined → 下面丟錯被吞、整體 inert——依「閘門失敗一律停用」正確，但
+// 默默停用看不出原因，所以記下來在第一次工具呼叫時告知。
+let hostGap: string | null = null;
+let hostGapNotified = false;
 
 export function setConfiguredShell(fn: () => string | undefined): void {
   configuredShell = fn;
@@ -68,14 +84,20 @@ export function setConfiguredShell(fn: () => string | undefined): void {
 function probeShell(): string | null {
   if (probeShellCache !== undefined) return probeShellCache;
   probeShellCache = null;
+  if (typeof getShellConfig !== "function") {
+    // 舊 pi（< 0.48.0）沒這個 export：探測對象不可得＝不改寫（寧可漏修）
+    hostGap = "this pi version does not export getShellConfig (needs >= 0.48.0); shell probe disabled, so no rewriting";
+    return probeShellCache;
+  }
   try {
-    const configured = configuredShell?.();
-    if (configured) {
-      if (existsSync(configured) && verifyMsysBash(configured)) probeShellCache = configured;
-      return probeShellCache; // 設定值存在就只信它（非 MSYS → gate 停用）
+    const cfg = getShellConfig(configuredShell?.()) as { shell?: unknown } | undefined;
+    const shell = cfg?.shell;
+    if (typeof shell === "string" && shell && existsSync(shell) && verifyMsysBash(shell)) {
+      probeShellCache = shell;
     }
-  } catch { /* 讀不到設定 → 退回偵測 */ }
-  probeShellCache = findBash();
+  } catch {
+    /* 無 bash／pi API 失敗 → null＝整體不改寫（寧可漏修，不可誤修） */
+  }
   return probeShellCache;
 }
 
@@ -106,35 +128,17 @@ export function realTempDir(): string | null {
 //   模型可自行修正；誤修則是沉默破壞正確語法——寧可漏修，不可誤修）
 // MSYS 的判定是「變數存在即停用」（實測 //c 在 0／空字串／false 下都原樣抵達
 // 原生程式），所以探測只問存在性，不比對值。
-// 前提：探測對象＝實際 spawn 的 bash（settings.shellPath，由 factory 注入；
-// 沒設才退回 findBash() 的掃描）——兩者同源，沒有「探測 ≠ spawn」的漂移。
+// 前提：探測對象＝getShellConfig(configuredShell?.())＝pi 實際 spawn 的 shell
+//——兩者同一個呼叫，沒有「探測 ≠ spawn」的漂移。
 let noPathConvCache: boolean | null = null;
 
-// ---- bash 自動偵測（掃描 + 驗證身份，不寫死任何安裝路徑）----
-// 陷阱：C:\Windows\System32\bash.exe 是 WSL 啟動器（永遠在 PATH 且常排前面）；
-// 天真掃 PATH 會抓到它。正確解是「掃描 + 驗證」：每個候選都用 `uname -s` 驗
-// 身份——Git Bash = MINGW*_NT-*、MSYS2 = MSYS_NT-*、WSL = Linux、
-// Cygwin = CYGWIN_NT-*（別信 OSTYPE：Git Bash 回報 "cygwin"，無法判別）。
-// 全部落空 → 回傳 null，相關功能整體停用（inert）：漏修的 cmd 大聲失敗
-// 可自修，猜錯路徑後的結果是靜默出錯。
-// 候選來源（依優先序，刻意不做套件管理器列舉）：
-//   1. PATH 掃描（僅跳過 System32——WSL stub 所在地）
-//   2. PATH 上的 git.exe 反推安裝根目錄；同目錄若有 git.shim 則解析 path= 拿
-//      真實位置。shim 是必要分支：scoop 這類安裝既不把 bash.exe 放上 PATH
-//      也不寫註冊表，git.shim 是唯一的軌跡；winget/choco/Ninite 的 git.exe
-//      本尊就在 PATH 上，用不到這分支。這是通用的「跟著 git.exe 找」，
-//      不針對任何套件管理器——它們要么把 git 放上 PATH，要么走同一個
-//      安裝程式寫下 GitForWindows 註冊表鍵，兩者都已覆蓋。
-//   3. Git for Windows 註冊表鍵（安裝程式式安裝會登記 InstallPath）
-//   4. 環境變數推導的程式根目錄（覆蓋無註冊表的使用者層安裝）
+// ---- shell 身分驗證 ----
+// getShellConfig 不驗身份：PATH fallback（`where bash.exe` 取第一個命中）不跳
+// System32，可能挑到 WSL 啟動器。用 `uname -s` 驗——Git Bash = MINGW*_NT-*、
+// MSYS2 = MSYS_NT-*、WSL = Linux、Cygwin = CYGWIN_NT-*（別信 OSTYPE：Git Bash
+// 回報 "cygwin"，無法判別）。非 MSYS → 不拿來探測（該 shell 沒有 MSYS 轉換層
+// 故障點，改寫即誤修）。
 const MSYS_UNAME = /^(MINGW|MSYS)/;
-
-// Git for Windows 安裝程式登記的註冊表鍵
-const GIT_REG_KEYS = [
-  "HKLM\\SOFTWARE\\GitForWindows",
-  "HKLM\\SOFTWARE\\WOW6432Node\\GitForWindows",
-  "HKCU\\SOFTWARE\\GitForWindows",
-];
 
 function verifyMsysBash(candidate: string): boolean {
   try {
@@ -144,88 +148,6 @@ function verifyMsysBash(candidate: string): boolean {
     return false;
   }
 }
-
-function registryBashRoots(): string[] {
-  const roots: string[] = [];
-  for (const key of GIT_REG_KEYS) {
-    try {
-      const p = spawnSync("reg", ["query", key, "/v", "InstallPath"], {
-        timeout: 5000,
-        windowsHide: true,
-      });
-      const m = /InstallPath\s+REG_SZ\s+(.+)/i.exec(p.stdout?.toString() ?? "");
-      if (m) roots.push(m[1]!.trim());
-    } catch { /* 鍵不存在或 reg 不可用 */ }
-  }
-  return roots;
-}
-
-function extraBashRoots(): string[] {
-  const envRoots = [
-    process.env.ProgramFiles && path.join(process.env.ProgramFiles, "Git"),
-    process.env["ProgramFiles(x86)"] && path.join(process.env["ProgramFiles(x86)"], "Git"),
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs", "Git"),
-  ].filter((p): p is string => Boolean(p));
-  return [...registryBashRoots(), ...envRoots];
-}
-
-// 從安裝根目錄推導 bash 候選（Git for Windows 兩個位置都可能）
-function bashCandidatesFromRoot(root: string, out: string[], seen: Set<string>) {
-  const add = (p: string) => {
-    const k = p.toLowerCase();
-    if (!seen.has(k)) { seen.add(k); out.push(p); }
-  };
-  add(path.join(root, "usr", "bin", "bash.exe"));
-  add(path.join(root, "bin", "bash.exe"));
-}
-
-
-export function findBash(): string | null {
-  if (bashCache !== undefined) return bashCache;
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const add = (p: string) => {
-    const k = p.toLowerCase();
-    if (!seen.has(k)) { seen.add(k); out.push(p); }
-  };
-  const pathDirs = (process.env.PATH ?? "").split(";").filter(Boolean);
-
-  // 1) 單次 PATH 掃描：每個目錄可能有 bash.exe 本尊，或 git.exe 可反推安裝根。
-  //    這是通用邏輯—— winget/choco/Ninite 都把 Git\cmd 放上 PATH，與其他安裝
-  //    同一個迴圈覆蓋，不需特例。找到即回傳；registry/env 根目錄只在 PATH
-  //    全軍覆沒時才查（省去每次啟動的 3 個 reg query 子行程）。
-  for (const d of pathDirs) {
-    const base = d.replace(/[\\]+$/, "");
-    if (/\\System32(\\|$)/i.test(base)) continue; // WSL 啟動器 stub 所在地
-    add(path.join(base, "bash.exe"));
-    const git = path.join(base, "git.exe");
-    if (!existsSync(git)) continue;
-    let root = path.dirname(git); // 通常是 <安裝根>\cmd
-    // shim 只是轉發器：真實 git.exe 的路徑在旁邊的 git.shim（path=，值可能帶引號）。
-    // 只有 PATH 上的 git.exe 是 shim 時才會走到這（見上方候選來源註解）。
-    const shim = path.join(root, "git.shim");
-    if (existsSync(shim)) {
-      try {
-        const m = /^path\s*=\s*(.+)$/im.exec(readFileSync(shim, "utf8"));
-        if (m) root = path.dirname(m[1]!.trim().replace(/^"+|"+$/g, ""));
-      } catch { /* shim 讀不了就當作沒有 */ }
-    }
-    bashCandidatesFromRoot(path.dirname(root), out, seen);
-  }
-  for (const c of out) {
-    if (existsSync(c) && verifyMsysBash(c)) { bashCache = c; return c; }
-  }
-  // 2) 註冊表 + 環境變數推導的根目錄，最後手段（同樣過 uname 驗證才算數）
-  const out2: string[] = [];
-  const seen2 = new Set<string>(out.map((p) => p.toLowerCase()));
-  for (const root of extraBashRoots()) bashCandidatesFromRoot(root, out2, seen2);
-  for (const c of out2) {
-    if (existsSync(c) && verifyMsysBash(c)) { bashCache = c; return c; }
-  }
-  bashCache = null;
-  return null;
-}
-
 export function pathConvDisabled(): boolean {
   if (noPathConvCache === null) {
     noPathConvCache = false; // 失敗時維持「不改寫」
@@ -307,38 +229,64 @@ function matchParen(s: string, from: number): number {
   return -1;
 }
 
-export function rewritePath(p: string): string {
+// 統計分類：temp 修復的兩個**不同故障點**（不是同名 variant）：
+//   tempMount＝`/tmp` 這種 MSYS 掛載路徑——host 不套 MSYS 映射，解析到碟根
+//   tempVar＝`$TEMP`／`%TEMP%` 這種變數——host 根本不展開，建成字面資料夾
+// 兩者結果一樣（→ 真實 temp）但機制不同，修好一邊≠修好另一邊，所以分開計。
+// （`shell.envPath` 不拆：碟符值與 /tmp 值都是「同一個」envp 轉換層被關掉。）
+// **單一來源**：族別與後缀都在這裡決定，改寫與計數都問它——兩套 regex 並存時，
+// 新增一個形態只改到一邊就會計入錯的鍵（label 與動作脫釣）。
+const TEMP_FAMILIES: { kind: "path.tempMount" | "path.tempVar"; re: RegExp }[] = [
+  // POSIX /tmp（MSYS 掛載不分大小寫、混合分隔符也擋：/tmp、/TMP/x、/tmp\foo）
+  { kind: "path.tempMount", re: /^\/tmp([\\/].*)?$/i },
+  // bash/cmd 風格的暫存變數：工具不展開任何變數，$TEMP 曾實際建成字面資料夾
+  //（$TEMP/$TMP/$TMPDIR、bash 的 ${TEMP} 大括號、cmd 的 %TEMP%/%TMP%）
+  { kind: "path.tempVar", re: /^\$(?:temp|tmp|tmpdir)([\\/].*)?$/i },
+  { kind: "path.tempVar", re: /^\$\{(?:temp|tmp|tmpdir)\}([\\/].*)?$/i },
+  { kind: "path.tempVar", re: /^%(?:temp|tmp)%([\\/].*)?$/i },
+];
+
+// 回傳族別與接續部分（rest）；不屬於 temp 族 → null
+function splitTempPath(p: string): { kind: "path.tempMount" | "path.tempVar"; rest: string } | null {
+  for (const f of TEMP_FAMILIES) {
+    const m = f.re.exec(p);
+    if (m) return { kind: f.kind, rest: m[1] ?? "" };
+  }
+  return null;
+}
+
+export function classifyTempFix(p: string): "path.tempMount" | "path.tempVar" | null {
+  return splitTempPath(p)?.kind ?? null;
+}
+
+// 回傳「改寫後的值 + 族別」：族別給統計用，值給工具用——同一次判斷同時餵兩邊，
+// 所以「改了值卻記到錯的鍵」在結構上不可能（hook 不需要再自己分類）。
+export function rewritePathFix(p: string): { value: string; kind: "path.tempMount" | "path.tempVar" | null } {
+  const none = { value: p, kind: null as null };
   // 故障點只在 Windows 的 tool 解析層（host 端不經 MSYS 映射、不展開變數）；
   // 其他平台的 /tmp、$TEMP 本來就是它們的語意，動它就是誤修。
-  if (process.platform !== "win32") return p;
+  if (process.platform !== "win32") return none;
   // 拿不到 bash 的 /tmp 錨點 → 不改寫（不猜佈局，見上方 realTempDir）
   const realTemp = realTempDir();
-  if (!realTemp) return p;
+  if (!realTemp) return none;
   // 接續部分統一用反斜線，避免混合分隔符（Windows API 雖兩者通吃，但輸出乾淨一致）
   const norm = (rest: string) => realTemp + rest.replace(/\//g, "\\");
-  let m: RegExpExecArray | null;
-  // POSIX /tmp（MSYS 掛載不分大小寫、混合分隔符也擋：/tmp、/TMP/x、/tmp\foo）
-  m = /^\/tmp([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
+  // temp 族（族別與接續部分由 splitTempPath 決定，與統計共用同一份 regex）
+  const hit = splitTempPath(p);
+  if (hit) return { value: norm(hit.rest), kind: hit.kind };
   // MSYS 盤符路徑（/c/Users/...）：刻意不修——pi 的檔案工具解析層
   // （resolveToCwd → normalizeWindowsShellPath）原生就把 /c/Users/x 正確映射成
   // C:\Users\x（含 /mnt/d、/cygdrive/e），實測 e2e 無 C:\c 錯位。盤符修復只在
   // 沒有這層正規化的 host（cmdc）才合理；在 pi 是重複防護＝純副作用。
-  // bash/cmd 風格的暫存變數：工具不展開任何變數，$TEMP 曾實際建成字面資料夾。
-  // $TEMP/$TMP/$TMPDIR（含 bash 的 ${TEMP} 大括號形式）不分大小寫與分隔符全擋
-  //（工具語境下任何寫法都不可能展開；實測 write '${TEMP}/x' 會在專案裡
-  // 建出字面 ${TEMP} 資料夾）
-  m = /^\$(?:temp|tmp|tmpdir)([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
-  m = /^\$\{(?:temp|tmp|tmpdir)\}([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
-  // cmd 風格 %TEMP%/%TMP%：同樣不被展開 → 字面 %TEMP% 資料夾
-  m = /^%(?:temp|tmp)%([\\/].*)?$/i.exec(p);
-  if (m) return norm(m[1] ?? "");
   // C:\tmp：刻意不修——原生寫入會成功（合法 Windows 路徑），原生不壞就不修。
   // 裸 nul / NUL：刻意不修。重測（轉換開／關皆驗）本機 bash 在 cwd 建實體
   // nul 檔（實測見 docs/spec.md）——bash 原生行為、非工具層問題，不修
-  return p;
+  return none;
+}
+
+// 薄包裝：只回值（測試與呼叫端習慣）
+export function rewritePath(p: string): string {
+  return rewritePathFix(p).value;
 }
 
 // 前綴賦值路徑值轉換（bash 掃描器用）：重現原生 git-bash envp 轉換層對
@@ -365,8 +313,10 @@ function convertEnvPath(v: string): string | null {
 
 // bash 指令改寫（語法感知掃描器，單次掃描處理兩件事）：
 //   1. cmd //c|//k → /c|/k：轉換關閉時 //c 原樣抵達 cmd、進互動模式（靜默錯）。
-//      只在「指令位置」改寫（echo cmd //c 等資料位置不動）；為何只修 cmd、
-//      其他 //x 工具為何留在漏修臺：docs/spec.md「刻意不修與漏修的分界」。
+//      只在「指令位置」改寫（echo cmd //c 等資料位置不動）；指令位置涵蓋獨立
+//      成詞的引號指令字（"cmd" //c、A=/c/x "bash" …——引號不改變 word 身分
+//      ，引號内含 $()/跳脫時不命中任何閉集合）；為何只修 cmd、其他 //x 工具
+//      為何留在漏修臺：docs/spec.md「刻意不修與漏修的分界」。
 //   2. 前綴賦值的 POSIX 路徑值 → Windows 值：只在「指令位置的賦值前綴＋後接
 //      指令字」改寫（值形錨點見 convertEnvPath；殘餘值形＝漏修，清單與逐條
 //      實測見 spec「envp 殘餘形」）。暫存-套用模型見 pendingEnv／
@@ -391,14 +341,19 @@ export function rewriteBashCommand(command: string): BashScanResult {
 
 function scanBash(command: string): BashScanResult {
   // heredoc 定界符是 bash 的 word：加引號時可含任意內容（`<<'END OF FILE'`，
-  // 終止行去引號比對），也可寫成 `<<\EOF`（跳脫＝字面化，定界符是 EOF）。
-  // 辨識不到就會把本體當指令掃描（＝改到資料）；起始字仍限字母/底線，
-  // 避免把 `$((1<<2))` 這種算術位移誤當 heredoc。
-  const heredoc = /<<(-?)[ \t]*(?:(["'])([^\r\n]+?)\2|\\?([A-Za-z_][A-Za-z0-9_.-]*))/y; // sticky 已錨定 lastIndex
+  // 終止行去引號比對；空引號 `<<""` 也是合法定界符——終止行是空行，實測），
+  // 也可寫成 `<<\EOF`（跳脫＝字面化，定界符是 EOF）。**未加引號的定界符可以含
+  // 任意非元字元字元**：/ # $ = : * [ ] . - 都實測合法（`<<EOF/x`、`<<EOF#x`
+  // 的終止行就是原字面）。辨識不到就會把本體當指令掃描（＝改到資料），所以
+  // 這個字元類要寬；起始字仍限字母/底線，避免把 `$((1<<2))` 這種算術位移
+  // 誤當 heredoc（排掉 ") 與反引號：它們會變成定界符本身的引號語法）
+  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([A-Za-z_][^\s"'><;&|()\\`]*))/y; // sticky 已錨定 lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
   // 指令位置不結束的固定集合（bash 語法/內建層，閉集合）——不是「猜哪些程式
   // 會轉發指令」：if/while/{/!/time 是語法關鍵字；exec/command/builtin 是 bash
-  // 內建、env 是 POSIX 標準程式，四者後接的第一個非選項詞就是被執行的指令
+  // 內建、env 是 POSIX 標準程式，四者後接的第一個詞就是被執行的指令（例外
+  // ：exec/command/builtin 後的賦值形會被當指令名跑、原生就錯 → 不暫存，見
+  // commitTok；env 的 X= 參數會跨 msys→native 邊界 → 照常暫存）
   //（實測 env/exec/command cmd //c ver 原生跑 ver、本機進互動模式——與裸
   // cmd //c 同一故障；與 oc 版 SHELL_KEYWORDS 對齊）。界線仍在 shell 語法層
   // ：timeout/nice/xargs 這類外部 wrapper 的參數結構才是開放集合（漏修臺見
@@ -441,14 +396,28 @@ function scanBash(command: string): BashScanResult {
   let prevTokCmdPos = false;
   let cmdPosNext = true;
   let cmdFlagZone = false; // cmd 之後的旗標區（cmd //q //c 的第二個旗標也要改）
+  // 本 token 的內容是否來自「引號詞餵入」（feedTok）：引號詞的內容在 out 裡
+  // 帶著前後引號，長度與 curTok 不一致——依它算出的暫存跨度會錯（實測
+  // `A=/c/x "B=/c/y" node` 曾被改成 `A=C:/x "BB=C:/y node`＝吃掉收尾引號）。
+  // 而且引號詞在 bash 裡本来就不是賦值前綴（quote removal 後才解析指令字）
+  // → 不暫存（見 commitTok）。
+  let tokQuoted = false;
+  // 上一個 token 是否來自引號詞（isCmdTok 的跳脫規則需要它：引號內的反斜線
+  // 不被 bash 當跳脫，未引號的才是）
+  let prevTokQuoted = false;
   let inBacktick = false; // 反引號開/關（\` 由跳脫分支吃掉，所以是單層）
   const btPos: boolean[] = []; // 每層反引號開頭的「外層是否在指令位置」
-  // 括號堆疊：每個 ( 記下「收尾時要還原的指令位置」
-  //   foo(  → true（函式定義，後面接 { … } 群組，cmd 仍在指令位置）
-  //   $(    → 還原 commit 後的位置：賦值前綴（count=$(…)）→ true，bash 真的跑 cmd；
-  //           獨立替換（$(…)）→ false，替換結果本身就是指令名，後面的 cmd 只是參數
-  //   群組 ( → false（`( … ) word` 原生就是語法錯誤，不改寫）
-  const parenRestore: boolean[] = [];
+  // 括號堆疊：每層 ( 記下 kind ＋「開括號時的外層指令位置」
+  //   foo(       → func：函式定義，`)` 之後接 { … } 群組（cmd 仍在指令位置）
+  //   $( / $((   → subst：還原開括號時的位置——賦值前綴（count=$(…)）→ true，
+  //                bash 真的跑 cmd；獨立替換（$(…)）→ false，替換結果本身就是
+  //                指令名、後面的 cmd 只是參數。詞**延續**到括號外（`$(pwd)#z`）
+  //   <( / >(   → procsubst：同上還原位置，詞也延續（實測 `echo <(true)#z`）
+  //   樣式包裹 ( → case：`)` 是樣式終止符（不是這層的）；不要與外層混淆
+  //   群組 ( … ) → group：`( … ) word` 原生就是語法錯誤，`)` 後不開命令位置
+  //                （不改寫死文字）；`(true)#c` 的 # 是註解（實測）
+  // 單一堆疊（kind 與位置同進同出）——兩張平行陣列會漂移
+  const parenStack: { kind: "subst" | "procsubst" | "func" | "group" | "case"; pos: boolean }[] = [];
   // 被 \$ 跳脫分支成對消費的 "$" 位置：該 "$" 是字面——其後的 "(" 不是
   // $( 替換開頭（bash 剖析為語法錯誤），括號分類不得把它當開頭
   const escapedDollar = new Set<number>();
@@ -463,10 +432,25 @@ function scanBash(command: string): BashScanResult {
   //   會被誤判成樣式 `)`，把 echo 的參數當命令改寫（實測踩過）
   let caseRegion: "none" | "pattern" | "body" = "none";
   let casePending = false; // 看過 `case`、還沒看到它的 `in`
+  // 最後一個 `)` 收的是什麼決定詞是否延續到括號外：替換／程序替換→延續
+  // （`$(pwd)#z`、`<(true)#z` 的 # 是字面資料，實測）；群組／子殼／函式定義
+  // 收尾與樣式區的 `)` → 開新詞（`(true)#c`、`a)#c` 的 # 是註解，實測）。
+  // 判別依據＝parenStack 的 kind；stack 空（多餘的 `)`＝語法錯誤）→ 維持舊值
+  let parenContinuesWord = false;
 
-  const isCmdTok = (t: string) => {
-    const l = t.toLowerCase();
-    return l === "cmd" || l === "cmd.exe";
+  // cmd 指令字用 **bash 實際看到的字** 的 basename 比對：
+  //   `\cmd`、`c\md`、`/c/Windows/System32/cmd.exe`、`"C:/…/cmd.exe"` 都是同一顆
+  //   cmd（實測轉換關閉時全進互動式 banner＝同一個故障）
+  // 未引號詞裡的反斜線是 bash 的跳脫字元（`\c` → `c`、`C:\Win…` → `C:Win…`），
+  // 所以要比對的是**去跳脫後的詞**：不改的話 `C:\Windows\System32\cmd.exe` 會被
+  // basename 命中而改寫，但它原生是 127（不存在的程式名）⇒ 改寫只落在死文字上
+  // （文字有變、行為完全一樣＝零效應改寫，实测確認）。反之 `c\md //c` 去跳脫
+  // 後就是 `cmd`，是真的會跑的指令——這一條同時把那個漏修變成修復。
+  // 引號詞的內容不經跳脫（雙引號内 `\W` 保留反斜線），所以照原樣取 basename。
+  const isCmdTok = (t: string, quoted = false) => {
+    const word = quoted ? t : t.replace(/\\/g, "");
+    const base = word.split(/[\\/]/).pop()!.toLowerCase();
+    return base === "cmd" || base === "cmd.exe";
   };
 
   // 收尾/分隔符要把 token 狀態一起清掉：替換內累積的 prevTok（如 `echo $(cmd) //x`
@@ -493,40 +477,70 @@ function scanBash(command: string): BashScanResult {
     pendingEnv = [];
   };
 
+  const ASSIGN_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+  // 真指令字判定（三個決策點共用：commit 時 staging、真指令字落地時套用、EOF
+  // 收尾）：非賦值（含空值 B=）、非語法關鍵字、非內建、非純數字（fd 前緣
+  // 2>&1 的 2）。三處各寫一份會漂移（oc 版同一個 predicate）
+  const envpTrigger = (t: string) =>
+    !ASSIGN_PREFIX.test(t) && !RESERVED_WORD.test(t) && !BUILTIN_WORD.test(t) && !/^\d+$/.test(t);
+
   const commitTok = () => {
+    // 引號詞餵入的來源標記只管到下一個 token 收尾為止：先取再清（下面 `!curTok`
+    // 提前返回時也不留殘值——`""` 餵入空內容就是這種形）
+    const quotedTok = tokQuoted;
+    tokQuoted = false;
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
     if (cmdPosNext) {
       // FOO=bar 環境變數前綴、與 if/while/{/! 等語法關鍵字都不結束指令位置
-      cmdPosNext = RESERVED_WORD.test(curTok) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok);
+      cmdPosNext = RESERVED_WORD.test(curTok) || ASSIGN_PREFIX.test(curTok);
     }
     // case 區段追蹤（語法見上方註解）：`case` 要在命令位置才算；`in` 在參數位置，
-    // 位置 gate 不適用，所以只認「看過 case」（casePending）
+    // 位置 gate 不適用，所以只認「看過 case」（casePending）；`esac` 同 `case` 一樣
+    // 只認命令位置——資料位置的 esac（`echo esac`、樣式字面 esac）不能把區段
+    // 打掉（實測：`echo esac` 曾把 body 重設成 none，`case $x in esac) …` 的樣式
+    // 字面曾被當結束符、造成後續旗標漏修）。
     const lowTok = curTok.toLowerCase();
     if (lowTok === "case" && prevTokCmdPos) casePending = true;
     else if (lowTok === "in" && casePending) { caseRegion = "pattern"; casePending = false; }
-    else if (lowTok === "esac") { caseRegion = "none"; casePending = false; }
+    else if (lowTok === "esac" && prevTokCmdPos) { caseRegion = "none"; casePending = false; }
     // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
-    if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
+    if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) cmdFlagZone = true;
     // 前綴賦值路徑改寫的暫存／套用：賦值 token（整詞未引號、值可轉換）在
     // 指令位置 → 暫存；非賦值、非語法關鍵字的 token 在指令位置落地 ＝
     // simple command 的指令字 → 此時暫存賦值確定會進它的 envp，套用。
     // prevTokCmdPos 此時仍是本 token 的位置（commitTok 開頭賦的值）。
     if (prevTokCmdPos) {
       // 賦值判定與 keeper/EOF 一致（含空值 B=）：空值賦值既不暫存（無可轉換
-      // 值）也不觸發套用——套用必須是「真指令字」（見 BUILTIN_WORD 註解）
-      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok)) {
-        const em = /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok);
-        if (em) {
-          const conv = convertEnvPath(em[2]!);
-          if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
+      // 值）也不觸發套用——套用必須是「真指令字」（見 BUILTIN_WORD 註解）。
+      // exec/command/builtin 後的賦值形是參數不是前綴（bash 把 X=/c/x 當指令名
+      // 跑、原生就大聲失敗——實測三形在兩種轉換狀態下皆 127/127/1 同訊息）：
+      // 不暫存、照普通詞結束指令位置（其後的詞都是它的參數，原生命令也不會跑）。
+      // env 例外：POSIX 外部程式、X= 參數會跨 msys→native 邊界（實測
+      // env X=/c/x node 原生轉換 C:/x）→ 照舊暫存、由後續指令字觸發。
+      if (ASSIGN_PREFIX.test(curTok)) {
+        if (quotedTok) {
+          // 引號詞（`"B=/c/y"`）不是 bash 的賦值前綴：原生把它當指令字跑
+          // （實測 `A=/c/x "B=/c/y" node` → bash: B=/c/y: No such file or
+          // directory、127）→ 不暫存、照普通詞結束指令位置（不能走下面
+          // 的跨度算術：那些跨度假設 curTok 是 out 的字尾，引號詞不是）
+          cmdPosNext = false;
+        } else if (/^(?:exec|command|builtin)$/.test(prevTok)) {
+          cmdPosNext = false;
+        } else {
+          const em = /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok);
+          if (em) {
+            const conv = convertEnvPath(em[2]!);
+            if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
+          }
         }
-      } else if (!RESERVED_WORD.test(curTok) && !BUILTIN_WORD.test(curTok) && !/^\d+$/.test(curTok)) {
+      } else if (envpTrigger(curTok)) {
         applyPendingEnv();
       }
     }
     prevTok = curTok;
+    prevTokQuoted = quotedTok;
     curTok = "";
   };
 
@@ -625,19 +639,31 @@ function scanBash(command: string): BashScanResult {
       continue;
     }
     if (ch === "'") {
+      // 引號不改變 word 身分（bash 先做 quote removal 才解析指令字）：獨立成詞
+      //（引號前 curTok 為空＝前一詞已結束）且在指令位置時，把去引號內容餵給
+      // token——不餵的話下一個詞會以指令位置誤觸套用（A=/c/x "bash" -c …＝靜默
+      // 誤修：實測兩種轉換狀態原生皆印 /c/x）。詞中引號（A="…"、ba"sh"）維持
+      // 隱形＝舊行為：值的引號是漏修臺的「引號開頭值」形，詞中組合的身分本來
+      // 就不可靠，不猜。
+      const feedTok = curTok === "" && cmdPosNext;
       commitTok();
       const end = command.indexOf("'", i + 1);
       if (end === -1) {
         const seg = command.slice(i);
         out += seg;
+        if (feedTok) { curTok += command.slice(i + 1); tokQuoted = true; }
         break;
       }
       const seg = command.slice(i, end + 1);
       out += seg;
+      if (feedTok) { curTok += command.slice(i + 1, end); tokQuoted = true; }
       i = end + 1;
       continue;
     }
     if (ch === '"') {
+      // 去引號內容餵 token 的規則同單引號分支（見上）；內容含 $()/反引號/跳脫
+      // 時不會命中任何閉集合＝與動態詞同類（安全方向）。
+      const feedTok = curTok === "" && cmdPosNext;
       commitTok();
       // 找關閉引號：$() 與反引號內會重新開啟引號語境，需跳過整個命令取代區域
       let j = i + 1;
@@ -669,10 +695,12 @@ function scanBash(command: string): BashScanResult {
       if (j >= n) {
         const seg = command.slice(i);
         out += scanDq(seg); // 未閉合引號內的 $() 同樣會執行
+        if (feedTok) { curTok += command.slice(i + 1); tokQuoted = true; }
         break;
       }
       const seg = command.slice(i, j + 1);
       out += scanDq(seg);
+      if (feedTok) { curTok += command.slice(i + 1, j); tokQuoted = true; }
       i = j + 1;
       continue;
     }
@@ -681,7 +709,7 @@ function scanBash(command: string): BashScanResult {
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
-        pendingDelim = m[3] ?? m[4]!;
+        pendingDelim = m[3] ?? m[4] ?? m[5]!;
         pendingStripTabs = m[1] === "-";
         inHeader = true;
         out += m[0];
@@ -714,10 +742,20 @@ function scanBash(command: string): BashScanResult {
         // 留在 true，`$(` 則已被 commit 成一個普通 word → false（天然分流）
         // prev 是未被 \$ 跳脫的 "$" 才算 $( 替換開頭；被跳脫的 $ 後接 "(" 在
         // bash 是語法錯誤（字面 $），照群組括號處理
-        // 樣式區裡的 `(`（`case x in (a) …` 的選配包裹）不推堆疊：它的 `)` 就是
-        // 樣式終止符，由下面的 region 分支處理
+        // 樣式區裡的 `(`（`case x in (a) …` 的選配包裹）是樣式的一部分，`)` 由
+        // 下面的 region 分支當樣式終止符處理（這個堆疊項不是它的括號）
         const prev = command[i - 1] ?? "";
-        if (caseRegion !== "pattern") parenRestore.push(prev === "$" && !escapedDollar.has(i - 1) ? cmdPosNext : /[A-Za-z0-9_]/.test(prev));
+        const kind =
+          caseRegion === "pattern"
+            ? "case"
+            : prev === "$" && !escapedDollar.has(i - 1)
+              ? "subst"
+              : /[A-Za-z0-9_]/.test(prev)
+                ? "func"
+                : prev === "<" || prev === ">"
+                  ? "procsubst"
+                  : "group";
+        parenStack.push({ kind, pos: cmdPosNext });
       }
       clearTok();
       cmdPosNext = true; // 分隔符後是新的指令位置（含 $( 與反引號開頭）
@@ -741,14 +779,25 @@ function scanBash(command: string): BashScanResult {
       let restoreTrue = false;
       if (ch === ")") {
         if (caseRegion === "pattern") {
-          // 樣式終止：不 pop（防止偷走外層 $( 的堆疊項），重開命令位置並進 body
+          // 樣式終止：沒有自己的 `(`，所以不能 pop 外層堆疊（會偷走 $( 的項）；
+          // 只收掉 `case x in (a) …` 那種選配的 "case" 包裹。重開命令位置並
+          // 進 body；`)` 後開新詞（`a)#c` 是註解，實測）
+          if (parenStack.length && parenStack[parenStack.length - 1]!.kind === "case") parenStack.pop();
           cmdPosNext = true;
           caseRegion = "body";
+          parenContinuesWord = false;
         } else {
-          // 還原這個括號對應的位置；stack 空就維持現況
-          const restore = parenRestore.pop();
-          if (restore !== undefined) cmdPosNext = restore;
-          restoreTrue = restore === true;
+          // 還原這對括號的結果（stack 空＝多餘的 `)`、語法錯誤，維持現況）：
+          //   func/case → 指令位置（函式定義的 body 是命令列表）
+          //   subst/procsubst → 開括號時的位置（賦值前綴→true，參數→false）
+          //   group → 不開命令位置（`( … ) word` 原生就是語法錯誤，不改死文字）
+          const fr = parenStack.pop();
+          if (fr !== undefined) cmdPosNext = fr.kind === "func" || fr.kind === "case" ? true : fr.kind === "group" ? false : fr.pos;
+          restoreTrue = fr !== undefined && (fr.kind === "func" || (fr.kind === "subst" && fr.pos === true));
+          // 詞是否延續到括號外：替換與程序替換收尾＝延續（`$(pwd)#z`、
+          // `<(true)#z` 的 # 是字面，實測）；群組／子殼／函式定義收尾開新詞
+          // （`(true)#c` 的 # 是註解，實測）。stack 空→維持舊值
+          parenContinuesWord = fr === undefined ? true : fr.kind === "subst" || fr.kind === "procsubst";
         }
       }
       // 重導向目標由 bash 自己開檔（不經被關掉的 argv 轉換層），`)` 也結束該指令：
@@ -783,18 +832,24 @@ function scanBash(command: string): BashScanResult {
       i++;
       continue;
     }
-    // cmd 的雙斜線旗標：僅當 cmd 出現在指令位置（含緊貼形 cmd//c）
+    // cmd 的雙斜線旗標：僅當 cmd 是一個已收尾的詞（curTok 空）且在指令位置。
+    // 緊貼形 cmd//c 不改（原先會插一個空格把它拆成「cmd + //c」）：bash 把
+    // cmd//c 當程式名，原生是 `bash: cmd//c: No such file or directory`、
+    // exit 127——兩種轉換狀態都一樣（實測）。改寫它不是修環境層，而是替模型
+    // 改錯字：gate ON 時反而把「大聲 127」變成 banner＋exit 0 的靜默失敗。
+    // 同一詞的引號拼法（"cmd"//c）同理不改（實測原生也是 127）
     if (ch === "/" && command[i + 1] === "/") {
       const atCmd =
-        curTok === ""
-          ? (prevTokCmdPos && isCmdTok(prevTok)) || (cmdFlagZone && prevTok.startsWith("/"))
-          : cmdPosNext && isCmdTok(curTok);
+        curTok === "" &&
+        ((prevTokCmdPos && isCmdTok(prevTok, prevTokQuoted)) || (cmdFlagZone && prevTok.startsWith("/")));
       if (atCmd && pathConvDisabled()) {
         cmdFlag.lastIndex = i;
         const m = cmdFlag.exec(command);
-        if (m) {
-          // 緊貼形 cmd//c：cmd 已寫入 out，需補空格分離程式名與旗標
-          out += (curTok === "" ? "" : " ") + "/" + m[1];
+        // `//alpha/beta` 是 UNC 形（MSYS 不會轉它，cmd 當它是無效 switch）——
+        // 四種組合（原生/本機 × 原形/改寫）實測全是互動 banner ⇒ 改寫零效應，
+        // 不做（`cmd //server/share` 就是這種；電池釘樁）。
+        if (m && command[i + m[0].length] !== "/") {
+          out += "/" + m[1];
           i += m[0].length;
           curTok = "/" + m[1];
           cmdFlagFixed = true;
@@ -809,11 +864,25 @@ function scanBash(command: string): BashScanResult {
     // bash 註解（# 在詞首——bash 只在詞首認註解）：註解讓前綴賦值收尾成
     // standalone（`A=/c/x # c` 是 shell 變數賦值、值不進任何 envp，原生也
     // 不轉換）→ 丟棄暫存；丟棄要在 # 這個詞自己 commit 之前（詞首 # 在指令
-    // 位置會被當指令字觸發套用）。詞中的 #（a#b）不是註解，照常掃描；
-    // 註解內容照一般掃描——資料位置不會誤觸改寫， # 後面的指令字若真被
-    // 授權也只落在永不執行的死文字上。
-    if (ch === "#" && curTok === "") {
+    // 位置會被當指令字觸發套用）。詞中的 #（a#b）不是註解，照常掃描。
+    // 註解內容是死文字、到達不了任何程式——整段照原樣複製到行尾（同 heredoc
+    // 本體）。曾把註解內容照一般掃描：註解裡的 `(` 被分類成函式定義、重開
+    // 指令位置，`cmd //c ver # note (cmd //x)` 把死文字裡的 //x 也改寫了
+    // ＝零效應誤修（每項修復必須指名故障點，死文字沒有）。詞首判準照 bash
+    // lexer 的規則——輸入開頭或空白／運算子之後；引號／替換收尾後詞延續
+    // （實測 `"a"#b`、`$(pwd)#z` 的 # 是字面），樣式區 `)` 後開新詞（實測
+    // `a)#c` 是註解）。行尾的 \n 留給空白分支，讓下一行重開指令語境。
+    const atWordHead =
+      out === "" ||
+      " \t\n;|&(<>".includes(out[out.length - 1]!) ||
+      (out.endsWith(")") && !parenContinuesWord);
+    if (ch === "#" && curTok === "" && atWordHead) {
       pendingEnv = [];
+      let lineEnd = command.indexOf("\n", i);
+      if (lineEnd === -1) lineEnd = n;
+      out += command.slice(i, lineEnd);
+      i = lineEnd;
+      continue;
     }
     curTok += ch;
     out += ch;
@@ -822,7 +891,7 @@ function scanBash(command: string): BashScanResult {
   // EOF：檔尾 token 沒有分隔符觸發 commit——真指令字落在檔尾時前綴賦值一樣
   // 要套用（A=/c/x cmd 的 cmd 就是這種）。賦值（含空值）、語法關鍵字、
   // 內建、純數字詞＝收尾 standalone → 丟棄；參數位置照舊不套用。
-  if (curTok && cmdPosNext && !RESERVED_WORD.test(curTok) && !BUILTIN_WORD.test(curTok) && !/^\d+$/.test(curTok) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok)) {
+  if (curTok && cmdPosNext && envpTrigger(curTok)) {
     applyPendingEnv();
   }
   return { command: out, cmdFlagFixed, envPathFixed };
@@ -830,10 +899,15 @@ function scanBash(command: string): BashScanResult {
 
 // ===== 使用統計 =====
 // 量測外掛實際命中率：分母 toolCalls[tool]＝gate 之後的工具呼叫次數（統計
-// 範圍＝實際作用的範圍）；分子 fixes[key]＝真改寫次數，以故障點為 key、
-// 同性質 variant 合併（path.temp / shell.cmdFlag / shell.envPath 三個鍵對應
-// 三層故障：host 工具路徑解析、msys argv 旗標轉換、msys envp 賦值值轉換
-// ——合併會看不出哪層在觸發）。pi 沒有 per-extension 儲存 API
+// 範圍＝實際作用的範圍）；分子 fixes[key]＝真改寫次數，**以故障點（機制）
+// 為 key，同一機制的 variant 才合併**：
+//   path.tempMount   /tmp 這種 MSYS 掛載路徑（host 不套 MSYS 映射）
+//   path.tempVar     $TEMP／%TEMP% 這種變數（host 不展開）
+//   shell.cmdFlag    msys argv 旗標轉換被關 → //c|//k 原樣抵達（//c、//k、
+//                    多旗標、引號名、basename 路徑全算同一種）
+//   shell.envPath    msys envp 賦值值轉換被關（碟符值與 /tmp 值同一個機制）
+// 舊版的 path.temp 是兩個 temp 故障合在一起，已拆開（舊檔資料保留不動）。
+// pi 沒有 per-extension 儲存 API
 //（docs/extensions.md State 段）→ 用官方匯出的 getAgentDir()/
 // env-guard-stats.json（吃 PI_CODING_AGENT_DIR 覆蓋），不自己復刻路徑邏輯。
 // 分類學、儲存與寫入時機的完整設計（oc 共用）：docs/spec.md〈使用統計〉。
@@ -848,6 +922,10 @@ interface Stats {
 }
 
 let stats: Stats | null = null;
+// 載入時的基準快照：persistStats 用「現値−基準」計算本 session 的增量，
+// 與磁碟上的最新値合併（並發 sessions 各自 from-load 累加，後寫覆蓋先寫
+// 會吃掉對方的增量）
+let statsBase: { toolCalls: Record<string, number>; fixes: Record<string, number> } | null = null;
 let statsFileCache: string | null | undefined; // undefined＝未解析；null＝解析失敗（只留記憶體計數）
 let statsTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -860,10 +938,6 @@ function adoptCounts(saved: unknown): Record<string, number> {
     }
   }
   return out;
-}
-
-export function statsSnapshot(): Stats | null {
-  return stats && { ...stats, toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
 }
 
 function statsFile(): string | null {
@@ -888,6 +962,7 @@ function loadStats(): void {
       const saved = JSON.parse(readFileSync(file, "utf8")) as Partial<Stats>;
       if (saved && typeof saved === "object" && saved.schema === 1 && typeof saved.since === "string") {
         stats = { schema: 1, since: saved.since, toolCalls: adoptCounts(saved.toolCalls), fixes: adoptCounts(saved.fixes) };
+        statsBase = { toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
         return;
       }
     } catch {
@@ -895,12 +970,33 @@ function loadStats(): void {
     }
   }
   stats = { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
+  statsBase = { toolCalls: {}, fixes: {} };
 }
 
 function persistStats(): void {
   const file = statsFile();
   if (!file || !stats) return;
   try {
+    // 寫前重讀合併：把本 session 的增量（現値−載入基準）疊到檔上最新値，合併
+    // 結果同時成為新的記憶體値與基準（後續增量從此起算，重複 flush 不會雙計
+    // ）。採增量疊加而非 max：max 在鍵級會吞掉單側增量。計數僅 advisory，讀
+    // 不了/壞檔 → 照舊直寫現値。
+    try {
+      const saved = JSON.parse(readFileSync(file, "utf8")) as Partial<Stats>;
+      if (saved && typeof saved === "object" && saved.schema === 1) {
+        const merge = (cur: Record<string, number>, base: Record<string, number>, disk: Record<string, number>) => {
+          const out: Record<string, number> = {};
+          for (const k of new Set([...Object.keys(cur), ...Object.keys(disk)])) {
+            const delta = (cur[k] ?? 0) - (base[k] ?? 0);
+            out[k] = (disk[k] ?? 0) + Math.max(delta, 0);
+          }
+          return out;
+        };
+        stats.toolCalls = merge(stats.toolCalls, statsBase?.toolCalls ?? {}, adoptCounts(saved.toolCalls));
+        stats.fixes = merge(stats.fixes, statsBase?.fixes ?? {}, adoptCounts(saved.fixes));
+        statsBase = { toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
+      }
+    } catch { /* 檔不存在（首次）或讀不了：直寫現値 */ }
     const tmp = `${file}.${process.pid}.tmp`; // per-PID: concurrent sessions must not rename each other's half-written file
     writeFileSync(tmp, JSON.stringify(stats, null, 2) + "\n", "utf8");
     renameSync(tmp, file);
@@ -951,8 +1047,9 @@ export default function (pi: ExtensionAPI) {
   // 故障點全部是 Windows 的（host 端路徑解析、MSYS 轉換層）：非 Windows 整個擴充
   // 停用（那種機器上沒有 cmd.exe）
   if (process.platform !== "win32") return;
-  // 探測對象＝ pi 自己配置的 shell（settings.shellPath）；有設就只信它，
-  // 沒設才退回 findBash() 的掃描。這樣就不必「假設」pi 會 spawn 哪顆 bash。
+  // 探測對象＝pi 自己配置的 shell（settings.shellPath）交給 getShellConfig 解
+  // 析（與 pi spawn bash 的決策同一個呼叫），這樣就不必「假設」pi 會 spawn 哪顆
+  // bash。
   setConfiguredShell(() => {
     try {
       const s = pi.getSettings?.();
@@ -967,6 +1064,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", (event, ctx) => {
     const name = event.toolName;
 
+    // 宿主能力缺失（見 hostGap）：默默 inert 看不出原因 → 第一次呼叫告知一次。
+    // 先跑一次探測（単次快取）讓第一次呼叫就能判斷，而不是拖到第二次
+    if (!hostGapNotified) {
+      pathConvDisabled();
+      if (hostGap) {
+        hostGapNotified = true;
+        notifyUI(ctx, `env-guard: disabled — ${hostGap}`, "warning");
+      } else {
+        hostGapNotified = true; // 能力正常：不必再檢查
+      }
+    }
+
     // write / edit / read / grep / find / ls：改寫 path 參數
     //（grep/find/ls 同樣是 host 端解析（resolveToCwd），/tmp/$TEMP 也會出事，
     //  但它們是唯讀工具，失敗型態是「找不到目錄」大聲報錯——修掉是純獲益）
@@ -974,14 +1083,16 @@ export default function (pi: ExtensionAPI) {
       bumpTool(name);
       const input = event.input as { path?: string };
       if (typeof input?.path === "string") {
-        const rewritten = rewritePath(input.path);
-        if (rewritten !== input.path) {
+        const fix = rewritePathFix(input.path);
+        if (fix.value !== input.path) {
           const from = input.path;
-          input.path = rewritten;
-          bumpFix("path.temp");
+          input.path = fix.value;
+          // kind 與值同源（rewritePathFix 只在 splitTempPath 命中時改值）——萬一
+          // 以後新增了不屬於 temp 族的改寫，會落在 path.other，不會混進別人的鍵
+          bumpFix(fix.kind ?? "path.other");
           notifyUI(
             ctx,
-            `env-guard: path rewritten ${from} -> ${rewritten}`,
+            `env-guard: path rewritten ${from} -> ${fix.value}`,
             "info",
           );
         }
