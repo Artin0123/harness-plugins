@@ -166,7 +166,7 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法不同：
 | 項目                                                  | pi 版做法                                                                                                                                        |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                          |
-| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴（外部 wrapper 如 timeout/xargs 維持刻意不修） |
+| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴（外部 wrapper 如 timeout/xargs 維持不修＝漏修臺：靜態修法需開放集合的參數結構猜測） |
 | 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字） | 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把值轉成 Windows 形式；本機被 `MSYS_NO_PATHCONV` 停用 → 值原樣抵達、被當磁碟相對路徑寫到 `C:\c\...`（靜默錯位）。重現該層規則改寫（盤符→`C:/...`、`/tmp`→錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發，實測這些形原生不走 envp 轉換或方向安全） |
 
 **刻意不修**（原生行為或模型自身錯誤，讓它壞）：`C:\tmp`（原生寫入會成功）、
@@ -220,6 +220,7 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 | `patch` 的 `patchText`              | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾                                                                                                                                                                              | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動。四種都實測過（含改名與刪除）        |
 | `shell` 的 `workdir`                | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp`                                                                                                                                                                   | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`）                                                                                                                           |
 | `shell` 的 `command`                | `BASH_ENV` 指到的 `.bashrc` 設了 `MSYS_NO_PATHCONV=1`，`cmd //c` 原樣抵達 cmd → 進互動模式（實測 stdin 關閉時：exit 0，輸出是 banner＋版權聲明＋提示符，第一行與 `ver` 幾乎同形；GBK 編碼，沒改寫時模型會把 banner 讀成 `ver` 的答案） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、貼緊的 `cmd//c` 都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動      |
+| `shell` 的 `command`（賦值前綴）    | 同一個 `MSYS_NO_PATHCONV=1` 關掉 envp 轉換：`VAR=/c/foo node …` 的值原樣抵達，被 node 當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位、exit 0）                                                                                               | 只修**指令位置賦值＋後接真指令字**的靜態未引號整值：盤符形（字母通用，`/m`、`/q` 等皆經 mount 表）→ 大寫盤符＋正斜線、`/tmp` 形 → cygpath 錨點；standalone 賦值是 shell 變數（bash 端需要 POSIX 值）＋所有丟棄點（分隔符／背景 `&`／換行／重導向／heredoc／詞首 `#`／EOF）不動 |
 
 **刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
 （OpenCode 工具層自己解析正確）、`nul` 重導向（bash 原生行為）、cmd 的非 ASCII 亂碼
@@ -232,7 +233,7 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 
 與 pi 版同一套分類學：分母 `toolCalls`（清單內工具，gate 之後才算）、分子
 `fixes`（`path.temp` / `glob.tempPrefix` / `patch.tempLine` / `shell.workdir.temp`
-/ `shell.cmdFlag`，同類 variant 合計）。
+/ `shell.cmdFlag` / `shell.envPath`，同類 variant 合計）。
 
 儲存走官方 `ctx.storage`（plugin-scoped durable JSON），實體落在
 `~/.local/share/opencode/opencode.db` 的 `kv` 表。查看用唯讀 SQLite（WAL 模式

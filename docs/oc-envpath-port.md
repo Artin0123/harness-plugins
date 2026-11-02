@@ -1,5 +1,11 @@
 # oc 版 envp 前綴賦值移植指南
 
+> **狀態：已實作**（oc-plugins/env-guard/index.ts + oc-plugins/tests/env-guard/
+> index.mjs，電池全綠；pi 256、cmdc 175 重跑確認無跨 host 影響）。本指南保留為
+> 移植過程的事實基礎與陷阱記錄；第 0 步的驗證已在本機完成：oc 實際 bash =
+> `C:\Users\artin\scoop\apps\git\2.56.0\usr\bin\bash.exe`，與 `findBash()` 一致，
+> 「已釘死事實」重測全部吻合。
+
 給要在 oc-plugins/env-guard 補上「bash 前綴賦值 POSIX 路徑值改寫」（`shell.envPath`）的
 agent。pi 版已落地（見 pi-extensions/env-guard/index.ts 檔頭與 docs/spec.md〈掃描器要點〉
 ，commit cb4522a），但 **oc 環境與 pi 不同，不能直接抄 patch**——這份指南列出哪些是
@@ -31,6 +37,10 @@ A=/c/x 2>&1                     # 預期持久化 /c/x
 A=/c$(echo foo) node -e '...'   # 預期 <msys-root>/cfoo（組合律前提）
 ```
 
+電池執行備註：某些 `/c` 之外的形（如 `/d` 經 mount 表映射到 fusermount 類工具時
+）曾導致一次性逾時，屬探測環境的偶發（非轉換層規律），重跑即恢復——重測時遇到
+逾時先重跑再歸因。
+
 ## 1. 已釘死的事實（同一顆 bash ⇒ 沿用；細節見 pi 版檔頭註解與 spec）
 
 這些是 **bash 二進位行為**，與 host 無關，pi 版已逐一實測並寫進註解：
@@ -45,9 +55,11 @@ A=/c$(echo foo) node -e '...'   # 預期 <msys-root>/cfoo（組合律前提）
 - 緊貼形組合律：`VAR=/c/x$(pwd) node` ＝ 前綴改寫＋逐字後綴，e2e 與原生逐位元
   一致（已驗 C:/x/tmp）；前提＝動態尾部以 `/` 開頭，否則原生把整值當根相對路徑
   （`A=/c$(echo foo)` → `<msys-root>/cfoo`）。
-- 轉換規則只有兩個可驗錨點：`/c…`（不分大小寫入、大寫盤符出、正斜線）、
-  `/tmp…`（cygpath 錨點）；清單值（`:` 分隔）、含 `\`、根相對路徑、引號開頭
-  都不是這層的形態，不碰。
+- 轉換規則盤符形錨點是**字母通用**（本機重測：`/m /b /q /x /y /z` 皆經 msys mount
+  表解析並轉換，`A=/m/x node` → `M:/x`；先前的「只有 /c、/tmp 兩個錨點」是指南
+  措辭錯誤——盤符形走 mount 表、與具體盤符無關，`/tmp` 是另一種錨點）、
+  大寫盤符出、正斜線；`/tmp…` 形（cygpath 錨點）；清單值（`:` 分隔）、含 `\`、
+  根相對路徑、引號開頭都不是這層的形態，不碰。
 - 記錄在案的漏修（方向安全，照原樣）：`A=/c/x 2>&1 cmd`、`A=/c/x > log node`、
   `A=/c/x "node"`（單獨形）、`VAR=/c$(…)`（靜態前綴止於盤符）；
   記錄在案的 no-op＝原生：`A=/c/x env`（尾端）、`A=/c/x bash/sh -c`（direct-read）。
@@ -68,9 +80,11 @@ A=/c$(echo foo) node -e '...'   # 預期 <msys-root>/cfoo（組合律前提）
 
 oc 的 `scanBash` 需要新增的狀態與規則（對照 pi 版同名物）：
 
-1. `BUILTIN_WORD` 閉集合（含 `.`、`:`、`[`、`[[`、`]]`；**不含** command/exec/env/
-   builtin——它們在關鍵字集裡續位轉發）＋ `bash`/`sh`（msys→msys 邊界）＋純數字詞
-   （fd 前綴）。pi 版 regex 在 index.ts:548，可直接沿用字面集。
+1. `BUILTIN_WORD` 閉集合（含 `.`、`:`、`[`、`[[`、`]]`）＋ `bash`/`sh`（msys→msys
+   邊界）＋純數字詞（fd 前綴）。pi 版 regex 在 index.ts:548，**連同它的特例一併照
+   抄**：`builtin` 同時出現在 RESERVED_WORD（續位轉發）與 BUILTIN_WORD（作為指令字
+   時不觸發）兩個集合裡——這不是矛盾，是實測後的刻意形；`command`/`exec`/`env` 則
+   只在 RESERVED_WORD（後面的真指令字觸發套用）。照抄字面集，不要「整理」掉。
 2. `pendingEnv` 跨度暫存；統一賦值判定：**暫存**要求 `/^([A-Za-z_]\w*)=(.+)$/`
    （非空值），**觸發套用**要求「真指令字」＝非賦值（含空值 `B=`）、非關鍵字
    （大小寫敏感）、非 BUILTIN_WORD、非純數字。三個判定點（keeper/套用/EOF）
@@ -112,6 +126,12 @@ oc 的 `scanBash` 需要新增的狀態與規則（對照 pi 版同名物）：
   是程式名）。本移植不動 cmdFlag 面的既有行為。
 
 ## 5. 驗證要求（repo 紀律，缺一不算完成）
+
+> **已驗**（本機）：第 0 步 bash 身分記錄、修前對照、e2e 真實 spawn（含緊貼形與
+> no-op）、電池 oc 259 ＋ pi 256 ＋ cmdc 175 全綠、測試在 oc-plugins/tests/env-guard/
+> 。e2e 判準採平行形式——**改寫後的輸出必須 bit-identical 於原生轉換輸出**（原生
+> 側用 `env -u MSYS_NO_PATHCONV -u BASH_ENV` 的新鮮 bash 對照），這是「環境轉換層
+> 造成的失敗＝漏修」判準的驗證形式（工具回傳≡原生才算修對）。
 
 1. **修前修後對照**：每個釘樁案例先在 oc 現狀跑（確認漏修/誤修方向與預期一致），
    再實作、再跑綠。

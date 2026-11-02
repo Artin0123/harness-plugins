@@ -48,7 +48,10 @@ if (process.argv.includes('--noanchor')) {
 let pass = 0; const failures = [];
 const check = (name, ok, detail) => { if (ok) pass++; else failures.push(`${name} -> ${detail}`); };
 const rt = (p) => mod.rewritePath(p);
-const bc = (c) => mod.rewriteBashCommand(c);
+// structured result (per-fix flags for telemetry attribution);
+// bc() keeps returning the command so the pinned string comparisons read true
+const bcr = (c, convOff = true) => mod.rewriteBashCommand(c, convOff);
+const bc = (c) => bcr(c).command;
 const T = tmpdir();
 const N = T.endsWith('\\') ? T : T + '\\';
 
@@ -130,6 +133,64 @@ check('P: //c fixed, quoted payload kept', quoted === 'cmd /c "dir > nul"', JSON
 // --- /flag paths must not be confused with //flags ---
 const single = bc('cmd /c ver');
 check('P: single-slash flag untouched', single === 'cmd /c ver', JSON.stringify(single));
+
+// --- envp: prefix-assignment POSIX path values (measured fact base: native
+// git-bash converts the value grammar at the msys->native boundary,
+// name-agnostic; this machine's bashrc disables it, so the rewrite applies.
+// Flags first: attribution keys must stay separate (oc-1)) ---
+check('E: envp flag attribution separate from cmdFlag',
+  bcr('A=/c/x node x').envPathFixed === true && bcr('A=/c/x node x').cmdFlagFixed === false &&
+  bcr('cmd //c ver').cmdFlagFixed === true && bcr('cmd //c ver').envPathFixed === false,
+  JSON.stringify({ envp: bcr('A=/c/x node x'), flag: bcr('cmd //c ver') }));
+const TFS = T.replace(/\\/g, '/');
+// the native conversion output is reproduced exactly: /c form, capital drive,
+// forward slashes, case-insensitive input; /tmp form via the cygpath anchor
+check('E: A=/c/x node applies', bc('A=/c/x node x') === 'A=C:/x node x', JSON.stringify(bc('A=/c/x node x')));
+check('E: A=/C/x case-insensitive in', bc('A=/C/x node x') === 'A=C:/x node x', JSON.stringify(bc('A=/C/x node x')));
+check('E: bare drive root A=/c -> C:/', bc('A=/c node x') === 'A=C:/ node x', JSON.stringify(bc('A=/c node x')));
+check('E: A=/tmp/x -> anchor, forward slashes', bc('A=/tmp/x node x') === 'A=' + TFS + '/x node x', JSON.stringify(bc('A=/tmp/x node x')));
+check('E: multiple prefixes all apply', bc('A=/c/x B=/tmp/y node x') === 'A=C:/x B=' + TFS + '/y node x', JSON.stringify(bc('A=/c/x B=/tmp/y node x')));
+check('E: keyword continuation (env) still applies', bc('A=/c/x env node x') === 'A=C:/x env node x', JSON.stringify(bc('A=/c/x env node x')));
+check('E: exec/command continuation applies', bc('A=/c/x exec node x') === 'A=C:/x exec node x', JSON.stringify(bc('A=/c/x exec node x')));
+// empty-value assignment: neither stages (nothing convertible) nor triggers
+// apply -- but it does not BLOCK the earlier staged prefix either
+check('E: empty value B= applies nothing of itself, keeps earlier', bc('A=/c/x B= node x') === 'A=C:/x B= node x', JSON.stringify(bc('A=/c/x B= node x')));
+check('E: standalone assignment is a shell variable (never applies)', bc('A=/c/x') === 'A=/c/x', JSON.stringify(bc('A=/c/x')));
+check('E: newline standalone discards', bc('A=/c/x\nnode x') === 'A=/c/x\nnode x', JSON.stringify(bc('A=/c/x\nnode x')));
+check('E: ; / | discard the stage', bc('A=/c/x; node x') === 'A=/c/x; node x' && bc('A=/c/x | node x') === 'A=/c/x | node x', JSON.stringify([bc('A=/c/x; node x'), bc('A=/c/x | node x')]));
+check('E: background & discards', bc('A=/c/x & node x') === 'A=/c/x & node x', JSON.stringify(bc('A=/c/x & node x')));
+check('E: redirect after the assignment discards (interleaved form)', bc('A=/c/x > log node x') === 'A=/c/x > log node x', JSON.stringify(bc('A=/c/x > log node x')));
+check('E: fd redirect interleaved is a documented miss', bc('A=/c/x 2>&1 node x') === 'A=/c/x 2>&1 node x', JSON.stringify(bc('A=/c/x 2>&1 node x')));
+check('E: bare fd tail persists unconverted', bc('A=/c/x 2>&1') === 'A=/c/x 2>&1', JSON.stringify(bc('A=/c/x 2>&1')));
+check('E: heredoc redirect standalone discards', bc('A=/c/x <<EOF\nbody\nEOF\nnode') === 'A=/c/x <<EOF\nbody\nEOF\nnode', JSON.stringify(bc('A=/c/x <<EOF\nbody\nEOF\nnode')));
+check('E: word-head # comment discards', bc('A=/c/x # note') === 'A=/c/x # note', JSON.stringify(bc('A=/c/x # note')));
+check('E: builtin command word never applies', bc('A=/c/x echo hi') === 'A=/c/x echo hi', JSON.stringify(bc('A=/c/x echo hi')));
+check('E: quoted command word applying via a later word', bc('A=/c/x "node" -e 1') === 'A=C:/x "node" -e 1', JSON.stringify(bc('A=/c/x "node" -e 1')));
+check('E: quoted command word alone is a known miss', bc('A=/c/x "node"') === 'A=/c/x "node"', JSON.stringify(bc('A=/c/x "node"')));
+check('E: tight closed form composes (prefix + verbatim suffix)', bc('VAR=/c/x$(pwd) node x') === 'VAR=C:/x$(pwd) node x', JSON.stringify(bc('VAR=/c/x$(pwd) node x')));
+// residual misses (native converts these; the scanner cannot see a full
+// unquoted value or program-specific argument semantics -- loud or the value
+// side, never a silent syntax break):
+check('E: VAR=/c$(echo /x) static prefix, drive-letter end -- miss', bc('VAR=/c$(echo /x) node x') === 'VAR=/c$(echo /x) node x', JSON.stringify(bc('VAR=/c$(echo /x) node x')));
+check('E: quote-head value -- miss', bc('VAR="/c/x" node x') === 'VAR="/c/x" node x', JSON.stringify(bc('VAR="/c/x" node x')));
+check('E: backslash value -- miss', bc('A=/c\\/x node x') === 'A=/c\\/x node x', JSON.stringify(bc('A=/c\\/x node x')));
+check('E: colon-list value -- miss (native has its own rules)', bc('A=/c/a:/c/b node x') === 'A=/c/a:/c/b node x', JSON.stringify(bc('A=/c/a:/c/b node x')));
+check('E: root-relative value -- miss (MSYS-root mount dependent)', bc('A=/usr/x node x') === 'A=/usr/x node x', JSON.stringify(bc('A=/usr/x node x')));
+check('E: single-letter drive roots convert too (letter-generic anchor, like native)', bc('A=/q/x node x') === 'A=Q:/x node x', JSON.stringify(bc('A=/q/x node x')));
+check('E: conversion ON -> apply suppressed (duplicate protection)', bcr('A=/c/x node x', false).command === 'A=/c/x node x', JSON.stringify(bcr('A=/c/x node x', false)));
+check('E: conversion ON also suppresses mid-command apply', bcr('A=/c/x foo; node x', false).command === 'A=/c/x foo; node x', JSON.stringify(bcr('A=/c/x foo; node x', false)));
+
+// N2 anti-drift: every `enable -a` builtin, used AS the command word, must
+// NOT trigger an apply (the value crosses no exec boundary there)
+if (mod.findBash()) {
+  const enable = spawnSync(mod.findBash(), ['-c', 'enable -a'], { timeout: 10000, windowsHide: true });
+  const listed = (enable.stdout?.toString() ?? '').split(/\r?\n/).map((l) => l.trim().split(' ')[0]);
+  const forwarded = new Set(['exec', 'command', 'builtin']); // RESERVED continue: apply waits for the next word
+  const specials = ['.', ':', '[', '[[', ']]'];
+  for (const b of [...listed.filter((x) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(x)), ...specials]) {
+    check(`N2: enable-a builtin "${b}" never applies`, bc(`A=/c/x ${b} hi`) === `A=/c/x ${b} hi`, JSON.stringify(bc(`A=/c/x ${b} hi`)));
+  }
+}
 
 // --- hook wiring: the two mutation boundaries, exercised through a fake ctx ---
 const hooks = {};
@@ -429,6 +490,36 @@ if (bash && gateOn) {
     r2.status === 0 && (r2.stdout?.toString() ?? '').includes('GUARD_OK2'),
     JSON.stringify({ sent: sentAssign, status: r2.status, out: (r2.stdout?.toString() ?? '').slice(0, 80) }));
 }
+// e2e, envp cross-check: the fault exists only while the tool's return
+// differs from native, so the rewritten command must produce EXACTLY the
+// native conversion's output (converted fresh bash, env -u side) -- and a
+// no-op command must keep parity too (no divergence). Runs on any machine
+// config: the native side gets MSYS_NO_PATHCONV/BASH_ENV stripped, the
+// guarded side runs this machine's bash with whatever .bashrc does.
+if (bashPath) {
+  const convOn = (cmd) => {
+    const env = { ...process.env };
+    delete env.MSYS_NO_PATHCONV;
+    delete env.BASH_ENV;
+    return spawnSync(bashPath, ['-c', cmd], { env, timeout: 20000, windowsHide: true });
+  };
+  const guarded = (cmd) => spawnSync(bashPath, ['-c', bc(cmd)], { timeout: 20000, windowsHide: true });
+  const envpE2E = [
+    ['A=/c/x node -e "console.log(process.env.A)"', 'C:/x'],
+    ['VAR=/c/x$(pwd) node -e "console.log(process.env.VAR)"', 'C:/x/'],
+    ["A=/c/x bash -c 'echo $A'", '/c/x'],
+    ['A=/c/x env node -e "console.log(process.env.A)"', 'C:/x'],
+  ];
+  for (const [orig, want] of envpE2E) {
+    const nat = convOn(orig);
+    const gr = guarded(orig);
+    const no = (nat.stdout?.toString() ?? '').trim();
+    const go = (gr.stdout?.toString() ?? '').trim();
+    check('E2E: envp rewrite parity with native (' + want + ')',
+      nat.status === 0 && gr.status === 0 && no === go && no.includes(want),
+      JSON.stringify([orig, no, go, nat.status, gr.status]));
+  }
+}
 
 // --- usage telemetry: denominators post-gate, numerators per fix key ---
 // Fresh setup over an in-memory storage: the counters start at zero (the
@@ -466,18 +557,20 @@ await tA({ tool: 'patch', input: { patchText: '*** Add File: ${TEMP}/x\n' } });
 await sA({ shell: bash, cwd: '/tmp/sub', command: 'echo hi' }); // MSYS shell: bash denominator
 await sA({ shell: process.execPath, cwd: '/tmp/sub', command: 'cmd //c ver' }); // non-MSYS shell: skipped
 await sA({ shell: bash, cwd: '/tmp/sub', command: 'cmd //c ver' }); // cmd flag numerator
+await sA({ shell: bash, cwd: '/tmp/sub', command: 'A=/c/x node' }); // envp numerator
 
 const snapA = mod.statsSnapshot();
-check('S: denominators (read 2, glob 1, patch 1, bash 2)',
-  snapA.toolCalls.read === 2 && snapA.toolCalls.glob === 1 && snapA.toolCalls.patch === 1 && snapA.toolCalls.bash === 2,
+check('S: denominators (read 2, glob 1, patch 1, bash 3)',
+  snapA.toolCalls.read === 2 && snapA.toolCalls.glob === 1 && snapA.toolCalls.patch === 1 && snapA.toolCalls.bash === 3,
   JSON.stringify(snapA.toolCalls));
 check('S: unguarded tool not counted', snapA.toolCalls.webfetch === undefined, JSON.stringify(snapA.toolCalls));
-check('S: non-MSYS shell does not bump bash', snapA.toolCalls.bash === 2, JSON.stringify(snapA.toolCalls));
+check('S: non-MSYS shell does not bump bash', snapA.toolCalls.bash === 3, JSON.stringify(snapA.toolCalls));
 check('S: path.temp numerator', snapA.fixes['path.temp'] === 1, JSON.stringify(snapA.fixes));
 check('S: glob.tempPrefix numerator', snapA.fixes['glob.tempPrefix'] === 1, JSON.stringify(snapA.fixes));
 check('S: patch.tempLine numerator', snapA.fixes['patch.tempLine'] === 1, JSON.stringify(snapA.fixes));
-check('S: shell.workdir.temp numerator (one per MSYS shell event)', snapA.fixes['shell.workdir.temp'] === 2, JSON.stringify(snapA.fixes));
+check('S: shell.workdir.temp numerator (one per MSYS shell event)', snapA.fixes['shell.workdir.temp'] === 3, JSON.stringify(snapA.fixes));
 check('S: cmd flag numerator (gate-conditional)', snapA.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(snapA.fixes));
+check('S: envp numerator (gate-conditional, its own key -- not cmdFlag)', snapA.fixes['shell.envPath'] === (gateOn ? 1 : undefined), JSON.stringify(snapA.fixes));
 
 await cleanupA(); // the returned promise must cover the final write (Cleanup = () => Promise<void> | void)
 check('S: awaited cleanup flush persists (no sleep after cleanup)', savedSets.length >= 1, JSON.stringify(savedSets.length));

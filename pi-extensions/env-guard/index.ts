@@ -35,41 +35,12 @@
 //     以組合律處理：轉換是「前綴改寫、後綴逐字保留」，前綴改寫＋動態後綴＝
 //     對串接後完整值的原生轉換。
 //
-// 【刻意不修】原生行為或模型自身錯誤，一概讓它壞：
-//   - 外部 wrapper 指令後的 cmd（timeout 5 cmd //c …、xargs …、nice …）：
-//     原生（轉換開啟）可跑、本機被同一層弄壞（實測 timeout 2 cmd //c ver
-//     原生跑出 ver、本機只印 banner），但要在指令位置判定裡跳過 wrapper 的
-//     參數，就得知道每個 wrapper 的參數結構——開放集合＋猜測，違反「只留
-//     不變的部分」，故列為刻意漏修（漏修＝原生失敗，方向安全）。env/exec/
-//     command/builtin 不在此列：env 是 POSIX 標準程式、其餘是 bash 內建，
-//     「後接第一個非選項詞＝被執行的指令」是閉集合語法（已納入 RESERVED_WORD
-//     ；實測 env/exec/command cmd //c ver 原生跑 ver、本機 banner——同一
-//     故障，與 oc 版 SHELL_KEYWORDS 對齊）。
-//   - 原生程式的 POSIX 路徑參數（`git -F /tmp/x`、`git hash-object /tmp/x`、
-//     `python /tmp/x.py`…）：預設 git-bash 靠 argv 轉換才成立，本機轉換關閉就
-//     變成 `could not open '/tmp/…'`（實測；MSYS 程式如 cat/ls 不受影響）。
-//     不修的理由：判斷「哪個參數是路徑」需要各程式自己的參數語義（開放集合
-//     ＋猜測），把所有 /… 參數硬改成 Windows 路徑又會改壞字串／regex
-//     （`echo /tmp`、`grep /tmp`、`sed 's|/tmp|X|'`）；且失敗是大聲的，agent 可自癒。
-//   - 前綴賦值值的其他形態：根相對路徑（VAR=/usr、/foo…——原生映射到 MSYS
-//     安裝根，非不變式，fstab/nsswitch 可自訂）；引號開頭的值（VAR="/c/foo"
-//     ——引號切開 token，掃描器見不到整值）；清單值（VAR=/c/a:/c/b——原生
-//     清單轉換是另一套規則，輸出 C:\a;C:\b）；含 \ 的值（cmd-ism 分隔符）；
-//     wrapper 的賦值參數（env X=/c/…、export X=/c/…——argv 位置，同 wrapper
-//     cmd 的開放集合）；重導向交錯形（A=/c/x > log node——重導向後掃描器
-//     已當參數區，列為漏修）：一律照原樣。
-//   - 絕對路徑 cmd（C:\…\cmd.exe //c）、引號形式（"cmd" //c）、跳脫（\cmd //c）：
-//     同樣是原生可跑、本機壞，但模型實務不會這樣寫，加了只是多一個作用點。
-//   - 原生就壞的雙斜線形（cmd //?、cmd ///c、cmd //server/share）：實測轉換
-//     開啟時一樣進互動模式 → 模型自己寫錯，不修。
-//   - case 樣式的 `)`（`case $x in a) cmd //c ver;; esac`、以及它包在 `$( )` 裡的
-//     形）：bash 語法上這個 `)` 沒有對應的 `(`，要修得追蹤 case/in/esac 狀態，
-//     而 case body 裡合法的 `$( )` 一旦誤判（該 pop 變成不 pop）就會把資料改壞
-//     ——實測目前只落在漏修側（資料不會被改寫），故維持不追蹤（已釘樁）。
-//   - 重導向目標的雙斜線（`cmd //c "x" > //out`）：目標路徑是 bash 自己開檔時
-//     解析的，根本不經被 MSYS_NO_PATHCONV 關掉的 argv 轉換層——沒有故障點；
-//     原生就是大聲失敗（`//out: Is a directory`），改寫它反而會靜默寫到
-//     別的位置（`> /tmp/eg.log` 真的建檔），所以目標原樣不動。
+// 分類判準：「刻意不修」＝原生失敗——工具的回傳與原生相同，agent 看到的是
+// 真實原因、可自癒；環境轉換層造成的失敗（工具回傳≠原生）不論大聲或靜默都
+// 是漏修——大聲只是失敗的形態、不是不修的豁免；漏修留在臺帳，僅因每個靜態
+// 修法都需要開放集合的猜測（以誤修風險為界）。
+//
+// 【刻意不修＝原生失敗（工具回傳≡原生）】讓它壞：
 //   - C:\tmp：write 工具寫 C:\tmp 原生會成功（合法 Windows 路徑）——原生不壞就不修，
 //     模型真寫 C:\tmp 就讓它寫。
 //   - nul 重導向（> nul、2>nul、&>nul…）：重測（轉換開／關皆驗）本機 bash 在
@@ -81,14 +52,53 @@
 //     原生就會建真檔——實測 dir 可見，非 pi 加工）。
 //   - < nul：bash 直接報 ENOENT，錯誤訊息自己會說話
 //   - 2>&nul、<&nul：ambiguous redirect，大聲失敗且不造檔
+//   - 重導向目標的雙斜線（`cmd //c "x" > //out`）：目標路徑是 bash 自己開檔時
+//     解析的，根本不經被 MSYS_NO_PATHCONV 關掉的 argv 轉換層——沒有故障點；
+//     原生就是大聲失敗（`//out: Is a directory`），改寫它反而會靜默寫到
+//     別的位置（`> /tmp/eg.log` 真的建檔），所以目標原樣不動。
+//   - 原生就壞的雙斜線形（cmd //?、cmd ///c、cmd //server/share）：實測轉換
+//     開啟時一樣進互動模式 → 模型自己寫錯，不修。
+//   - 其他 cmd-ism（del、dir /b、robocopy //mir…）：bash 沒有這些指令——
+//     "command not found" 是 bash 自己的訊息（回傳≡原生），大聲失敗、agent 自矯正。
+//
+// 【漏修臺帳】環境轉換層造成（工具回傳≠原生），大聲≠豁免；留下的唯一理由＝
+// 靜態修法需要開放集合的猜測、誤修風險大於漏修：
+//   - 外部 wrapper 指令後的 cmd（timeout 5 cmd //c …、xargs …、nice …）：
+//     原生（轉換開啟）可跑、本機被同一層弄壞（實測 timeout 2 cmd //c ver
+//     原生跑出 ver、本機只印 banner）。要在指令位置判定裡跳過 wrapper 的
+//     參數，就得知道每個 wrapper 的參數結構——開放集合＋猜測，違反「只留
+//     不變的部分」。env/exec/command/builtin 不在此列：env 是 POSIX 標準
+//     程式、其餘是 bash 內建，「後接第一個非選項詞＝被執行的指令」是閉集合
+//     語法（已納入 RESERVED_WORD；實測 env/exec/command cmd //c ver 原生跑
+//     ver、本機 banner——同一故障，與 oc 版 SHELL_KEYWORDS 對齊）。
 //   - / 前綴原生工具的雙斜線旗標（taskkill //IM、sc //query、robocopy //mir、
 //     findstr //n…）：與 cmd //c 同一個故障點（原生靠 // 形成功、本機轉換關閉
 //     原樣抵達而失敗——實測 taskkill exit 1 大聲報『無效參數 //IM』；反向在
-//     原生環境把 /IM 轉成 C:/…/Git/IM 也失敗），但失敗大聲、agent 可自癒，
-//     靜態修復又需列舉「哪些程式吃 / 旗標」（開放集合＋猜測）→ 刻意漏修。
-//     cmd 是唯一例外：失敗靜默（互動模式、exit 0）且是 OS shell，納入判準
-//     見掃描器註解。
-//   - 其他 cmd-ism（del、dir /b、robocopy //mir…）：不是所有 shell 語法都能無風險改寫
+//     原生環境把 /IM 轉成 C:/…/Git/IM 也失敗）；失敗是大聲的（事件實錄：拿掉
+//     遮罩後下一步就改 /IM），靜態修復又需列舉「哪些程式吃 / 旗標」（開放集合
+//     ＋猜測）→ 留在漏修臺。cmd 是唯一例外：失敗靜默（互動模式、exit 0）且是
+//     OS shell，已修（判準見掃描器註解）。
+//   - 原生程式的 POSIX 路徑參數（`git -F /tmp/x`、`git hash-object /tmp/x`、
+//     `python /tmp/x.py`…）：預設 git-bash 靠 argv 轉換才成立，本機轉換關閉就
+//     變成 `could not open '/tmp/…'`（實測；MSYS 程式如 cat/ls 不受影響）。
+//     判斷「哪個參數是路徑」需要各程式自己的參數語義（開放集合＋猜測），把
+//     所有 /… 參數硬改成 Windows 路徑又會改壞字串／regex（`echo /tmp`、
+//     `grep /tmp`、`sed 's|/tmp|X|'`）。
+//   - 絕對路徑 cmd（C:\…\cmd.exe //c）、引號形式（"cmd" //c）、跳脫（\cmd //c）：
+//     同一故障層，但模型實務不會這樣寫（有機出現 0），加了只是多一個作用點。
+//   - case 樣式的 `)`（`case $x in a) cmd //c ver;; esac`、以及它包在 `$( )` 裡的
+//     形）：bash 語法上這個 `)` 沒有對應的 `(`，要修得追蹤 case/in/esac 狀態，
+//     而 case body 裡合法的 `$( )` 一旦誤判（該 pop 變成不 pop）就會把資料改壞
+//     ——實測目前只落在漏修側（資料不會被改寫），故維持不追蹤（已釘樁）。
+//
+// 【漏修臺帳（envp 層）】原生 envp 轉換會轉、掃描器無法靜態安全重現的值形：
+//   - 前綴賦值值的其他形態：根相對路徑（VAR=/usr、/foo…——原生映射到 MSYS
+//     安裝根，非不變式，fstab/nsswitch 可自訂）；引號開頭的值（VAR="/c/foo"
+//     ——引號切開 token，掃描器見不到整值）；清單值（VAR=/c/a:/c/b——原生
+//     清單轉換是另一套規則，輸出 C:\a;C:\b）；含 \ 的值（cmd-ism 分隔符）；
+//     wrapper 的賦值參數（env X=/c/…、export X=/c/…——argv 位置，同 wrapper
+//     cmd 的開放集合）；重導向交錯形（A=/c/x > log node——重導向後掃描器
+//     已當參數區）：一律照原樣。
 //
 // 位置：~/.pi/agent/extensions/env-guard/index.ts（全域生效，jiti 直接跑 TS；
 // 也可整包用 pi install git:github.com/Artin0123/harness-plugins 安裝）
@@ -461,7 +471,7 @@ function convertEnvPath(v: string): string | null {
 //     與 env/exec/command/builtin（bash 內建/POSIX 標準、後接指令字的閉集合）
 //     在指令位置時不結束指令位置，所以 `if cmd //c ver; then …`、`env cmd //c
 //     ver` 的 cmd 仍算指令位置；外部 wrapper（timeout/env 選項後/nice/xargs…
-//     ）刻意不列（見檔頭「刻意不修」）
+//     ）刻意不列（見檔頭「漏修臺」）
 //   - 重導向/`<`/`)` 之後不延續 cmd 旗標區：目標是 bash 自己解析的路徑，不是 argv
 //   - heredoc 終止符按 bash 規則整行等值比對（`<<-` 先去掉前導 tab），不用 trim()
 //   - heredoc 定界符是 bash 的 word：`<<'END OF FILE'`（引號內任意內容）、
@@ -525,7 +535,7 @@ function scanBash(command: string): BashScanResult {
   // 內建、env 是 POSIX 標準程式，四者後接的第一個非選項詞就是被執行的指令
   //（實測 env/exec/command cmd //c ver 原生跑 ver、本機進互動模式——與裸
   // cmd //c 同一故障；與 oc 版 SHELL_KEYWORDS 對齊）。界線仍在 shell 語法層
-  // ：timeout/nice/xargs 這類外部 wrapper 的參數結構才是開放集合（見檔頭刻意不修）
+  // ：timeout/nice/xargs 這類外部 wrapper 的參數結構才是開放集合（見檔頭漏修臺）
   //。刻意大小寫敏感：大寫 ENV 是路徑上的程式名、IF/TIME 不是 bash 關鍵字。
   const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|exec|command|builtin|env|[{}!])$/;
 

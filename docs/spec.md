@@ -63,14 +63,17 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   指令位置認定含 env/exec/command/builtin（bash 內建／POSIX 標準、後接指令字的
   閉集合，與 oc 版 SHELL_KEYWORDS 對齊）——實測 env/exec/command cmd //c ver
   原生跑 ver、本機 banner（同一故障）；外部 wrapper（timeout/nice/xargs）維持
-  刻意不修。
+  漏修（同一環境層故障，靜態修法需開放集合的參數結構猜測，見〈刻意不修與漏修
+  的分界〉）。
 - 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字）：原生
   git-bash 在 spawn 原生程式時對 envp 做「值語法」轉換（實測 name-agnostic：
   變數名不參與，`FOO` 與 `XDG_CACHE_HOME` 一視同仁），本機 `MSYS_NO_PATHCONV`
   一樣停用這層 → 值原樣抵達 node、被當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位
   、exit 0）。修法＝重現該層規則（不猜哪個變數是路徑）：只修「前綴賦值＋後接
   指令字」的靜態未引號整值——standalone 賦值是 shell 變數、bash 端需要 POSIX
-  值，改它是誤修；盤符形→`C:/...`、`/tmp` 形→cygpath 錨點（正斜線風格與原生
+  值，改它是誤修；盤符形→`C:/...`（錨點**字母通用**——實測 /m /b /q /x /y /z
+  皆經 mount 表轉換，如 `A=/m/x node` → `M:/x`，非只有 /c）、`/tmp` 形→cygpath
+  錨點（正斜線風格與原生
   envp 輸出一致）。**實測**：修前 node 收到 `/c/foo`、修後與原生（轉換開啟）
   同為 `C:/foo`；`/tmp` 形亦同。
 
@@ -81,14 +84,15 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 後續 UTF-8（非確定性重現）；bash 傳給 `cmd echo` 的 UTF-8 參數原樣往返（解釋
 了「無 chcp 也是 UTF-8」的現象）。
 
-### 刻意不修（完整理由）
+### 刻意不修與漏修的分界
 
-原生行為或模型自身錯誤，讓它壞：
+分類判準：**刻意不修＝原生失敗——工具的回傳與原生相同**（agent 看到的是真實原因
+、可自癒）；**環境轉換層造成的失敗（工具回傳≠原生）不論大聲或靜默都是漏修**——
+大聲只是失敗的形態、不是不修的豁免；漏修留在臺帳，僅因每個靜態修法都需要開放集合
+的猜測（以誤修風險為界：寧可漏修、不可誤修）。
 
-- 外部 wrapper 後的 cmd（`timeout 5 cmd //c`、`xargs cmd //c`、`nice …`）——
-  wrapper 參數結構是開放集合＋猜測；實測 timeout 2 cmd //c ver 原生跑 ver、
-  本機 banner（同一故障、刻意漏修）。env/exec/command/builtin 已納入關鍵字
-  （閉集合，見上）。
+**刻意不修（原生行為或模型自身錯誤，讓它壞）：**
+
 - `C:\tmp`——原生寫入會成功。
 - **MSYS 盤符路徑 `/c/...`**——pi 的檔案工具解析層內建 `normalizeWindowsShellPath`
   原生正確映射 `/c/Users/x`→`C:\Users\x`（含 `/mnt/d`、`/cygdrive/e`），e2e 實測
@@ -101,29 +105,38 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   write 工具 `path:"nul"` 同理（Node host 端原生建真檔，實測 dir 可見）。
 - `<nul`——bash 直接報 ENOENT；`2>&nul`/`<&nul`——ambiguous redirect，大聲失敗
   且不造檔（重測一致）。
+- 其他 cmd-ism（`del`、`dir /b`、`robocopy //mir`…）——bash 沒有這些指令，
+  "command not found" 是 bash 自己的訊息（工具回傳≡原生）、大聲失敗、agent 自矯正。
+
+**漏修臺帳（環境轉換層造成、工具回傳≠原生；大聲≠豁免，留下的唯一理由＝靜態
+修法是開放集合的猜測）：**
+
 - / 前綴原生工具的雙斜線旗標（`taskkill //IM`、`sc //query`、`net`、`reg`、
   `robocopy //mir`、`findstr //n`…）——與 `cmd //c` 同一個故障點（四向實測：
   本機 `//IM` exit 1 報『無效參數』、本機 `/IM` 成功、原生 `//IM` 成功、原生
-  `/IM` 被 argv 轉換改壞成 `C:/…/Git/IM` 而失敗），但失敗大聲、agent 看到即
-  自癒（事件實錄：拿掉遮罩後下一步就改 `/IM`；「靜默」是模型自己加的
-  `>/dev/null 2>&1`），且靜態修復需列舉「哪些程式吃 / 旗標」＝開放集合 →
-  刻意漏修。cmd 是唯一例外：失敗靜默（互動模式、exit 0）且是 OS shell。
-- 前綴賦值值的其他形態——根相對路徑（`VAR=/usr`——原生映射到 MSYS 安裝根，
-  非不變式）、引號開頭值（`VAR="/c/foo"`——引號切開 token，掃描器見不到整值
-  ）、清單值（`VAR=/c/a:/c/b`——原生清單轉換是另一套規則，輸出 `C:\a;C:\b`
-  ）、含 `\` 的值（cmd-ism）、wrapper 賦值參數（`env X=/c/…`、`export X=/c/…`
-  ——argv 位置）、standalone 賦值（`A=/c/x; cat $A`——不進 envp，bash 端需要
-  POSIX 值）。
-- 其他 cmd-ism（`del`、`dir /b`、`robocopy //mir`…）——bash 沒有這些指令，大聲
-  失敗、agent 自矯正。
-- **原生 exe 的 posix 路徑參數**（`python /tmp/x.py`）——`MSYS_NO_PATHCONV=1` 關掉
-  了對原生程式 argv 的路徑轉換，原生 exe 收到字面 `/tmp/...` 找不到檔；大聲失敗，
-  agent 可用 `cygpath -w` 自癒。全面改寫 argv 會誤傷依賴 posix 形式的 MSYS 工具
-  參數，誤修風險大於漏修。
+  `/IM` 被 argv 轉換改壞成 `C:/…/Git/IM` 而失敗）；事件實錄：拿掉遮罩後下一步
+  就改 `/IM`（大聲自癒，但失敗來自轉換層＝漏修形態），靜態修復需列舉「哪些
+  程式吃 / 旗標」＝開放集合 → 留在漏修臺。cmd 是唯一例外：失敗靜默（互動模式
+  、exit 0）且是 OS shell → 已修。
+- 外部 wrapper 後的 cmd（`timeout 5 cmd //c`、`xargs cmd //c`、`nice …`）——
+  同一故障層；wrapper 參數結構是開放集合＋猜測。env/exec/command/builtin 已納入
+  關鍵字（閉集合，見上）。
+- **原生 exe 的 posix 路徑參數**（`python /tmp/x.py`、`git -F /tmp/x`）——
+  `MSYS_NO_PATHCONV=1` 關掉了對原生程式 argv 的路徑轉換，原生 exe 收到字面
+  `/tmp/...` 找不到檔（實測 `could not open`；MSYS 程式如 cat/ls 不受影響）；
+  判斷「哪個參數是路徑」要各程式自己的參數語義＝開放集合，全面改寫 argv 又會
+  改壞字串／regex（`echo /tmp`、`grep /tmp`、`sed 's|/tmp|X|'`）、誤傷依賴
+  posix 形式的 MSYS 工具參數——誤修風險大於漏修。
 - **cmd 的非 ASCII 亂碼**——cmd 照 console code page（本機 936＝GBK）編碼輸出、
-  host 以 UTF-8 解碼 → 中文變亂碼。無忠實改寫：注入 `chcp 65001` 實測非確定性
-  （同命令有時 UTF-8 有時仍 GBK）且會把內建訊息切英文；治本在 host 的解碼層
-  （權限外）。亂碼本身是可見訊號，模型可自矯正（改用 bash 原生工具）。
+  host 以 UTF-8 解碼 → 工具回傳≠真實終端機所見 → 依分界屬漏修；無忠實改寫：
+  注入 `chcp 65001` 實測非確定性（同命令有時 UTF-8 有時仍 GBK）且會把內建訊息
+  切英文；治本在 host 的解碼層（權限外）——如實記錄並回報，不在自己的層打補丁
+  ；亂碼本身是可見訊號，模型可自矯正（改用 bash 原生工具）。
+- **envp 殘餘形**（本章〈掃描器要點〉末段）——根相對路徑值、引號開頭值、清單值
+  、含 `\` 的值、wrapper 賦值參數（`env X=/c/…`、`export X=/c/…`——argv 位置
+  ）、重導向交錯形（`A=/c/x > log node`）、引號指令字單獨形（`A=/c/x "node"`）、
+  緊貼形靜態前綴止於盤符（`VAR=/c$(…)`）、函式與其他 msys 程式讀回值的混合邊界
+  ——原生 envp 轉換會轉（或保留值），掃描器無法靜態看到整值或參數語義。
 
 通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
 
@@ -155,8 +168,10 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   `glob` 的 `pattern`）。
 - 指令類：`ctx.shell.hook("create.before")` 改 `event.command` 與 `event.cwd`。
 - 兩者都先驗證 `event.shell` 真的是 MSYS bash（`uname -s`，按執行檔快取），`//c`
-  改寫再加一道 `$MSYS_NO_PATHCONV` 探測（同樣按 shell 快取）。任何閘門失敗 → 整體
-  不動（漏修是大聲失敗、agent 可自癒；誤修是靜默破壞正確語法）。
+  改寫再加一道 `$MSYS_NO_PATHCONV` 探測（同樣按 shell 快取，envp 改寫共用同一道
+  閘門——轉換開啟時原生層會自己做，改寫是重複防護；掃描器內的 convOff 複查在此
+  配置下是無害冗餘）。任何閘門失敗 → 整體不動（不動時留在漏修臺＝環境層故障未
+  修；誤修是靜默破壞正確語法，比漏修嚴重）。
 
 ### 掃描器要點（pi / oc 共用語法感知規則）
 
@@ -175,16 +190,21 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   （cmd 是參數）；case 樣式的 `)` 沒有對應的 `(`，照 bash 語法追蹤
   case/in/esac/;; 區段，防止樣式 `)` 偷走外層 `$( ` 的堆疊項。
 - 替換／分隔符收尾清 token 狀態：替換內累積的 token 不能授權外面的改寫。
-- 前綴賦值路徑改寫（**pi 版**）：指令位置的賦值 token 暫存（記下在 out 的跨度
+- 前綴賦值路徑改寫（**pi / oc 兩 host 已落地，掃描器同源**）：指令位置的賦值
+  token 暫存（記下在 out 的跨度
   ），真指令字落地才套用——非賦值（含空值 `B=`）、非語法關鍵字、非
   BUILTIN_WORD（bash 內建與 bash/sh：值不經 msys→native 邊界——實測
   `A=/c/x eval 'echo $A'`、`A=/c/x bash -c 'echo $A'` 原生皆 [/c/x]；eval 的
   動態範圍内 spawn native 時原生會轉〔實測 C:/x〕，排除＝該側漏修、方向
   安全）、非純數字詞（fd 前綴；實測 `A=/c/x 2>&1` 原生持久化 [/c/x]）。
-  收尾＝standalone 賦值 → 丟棄：分隔符／重導向（含 fd 前綴）／heredoc
-  ／EOF／詞首 `#` 註解。`$(` 關閉還原到指令位置時不丟（緊貼形 `VAR=/c/x$(…)`
-  的值組合由後面的指令字收尾）；組合律前提＝動態尾部以 / 開頭（否則原生把
-  整值當根相對路徑——實測 `A=/c$(echo foo)` 原生 → msys 根/cfoo）。殘餘邊界
+  收尾＝standalone 賦值 → 丟棄：分隔符／背景 `&`／換行／重導向（含 fd 前綴）
+  ／heredoc／EOF／詞首 `#` 註解。`$(` 關閉還原到指令位置時不丟（緊貼形
+  `VAR=/c/x$(…)` 的值組合由後面的指令字收尾）；組合律前提＝動態尾部以 / 開頭
+  （否則原生把整值當根相對路徑——實測 `A=/c$(echo foo)` 原生 → msys 根/cfoo）。
+  盤符形錨點是**字母通用**（實測 /m /b /q /x /y /z 皆經 mount 表轉換：
+  `A=/m/x node` → `M:/x`），轉換輸出＝大寫盤符＋正斜線、與原生 bit-identical
+  （pin 測試＋e2e 電池用 `env -u MSYS_NO_PATHCONV -u BASH_ENV` 的原生輸出
+  當判準：改寫後輸出≡原生轉換輸出）；/tmp 形→cygpath 錨點。殘餘邊界
   如實記錄：函式名與其他 msys 程式（git/cat…）是開放集合且為混合邊界
   ——body/動態範圍内 spawn native 時原生會轉（實測 `f(){ node …; };
   A=/c/x f` → C:/x，與改寫一致）、直接讀值時原生不轉（實測 → [/c/x]、
@@ -192,8 +212,7 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   （`A=/c/x "node"`＝漏修，原生會轉換）、重導向交錯形（`A=/c/x 2>&1 cmd`＝
   漏修）、靜態前綴止於盤符的緊貼形（`VAR=/c$(…)`＝漏修，暫存值 `/c$` 不符
   轉換規則）。裸 `A=/c/x env` 不動＝原生（env 是 MSYS 程式、msys→msys 邊界不轉
-  envp——實測印 A=/c/x，非漏修）。oc 版尚未跟進——同一故障層，依「在本 host
-  重新量過才留」原則另行實作。
+  envp——實測印 A=/c/x，非漏修）。
 
 ## oc 版：邊界判準（「什麼算合理的 edge case」）
 
@@ -241,7 +260,7 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
 | `patch.tempLine`     | patch 指令行改寫（oc）      | 同上                                                      |
 | `shell.workdir.temp` | shell `workdir` 改寫（oc）  | 同上                                                      |
 | `shell.cmdFlag`      | cmd `//x` → `/x`            | `//c`、`//k`、多旗標、緊貼形全算同一種                    |
-| `shell.envPath`      | 前綴賦值路徑值改寫（pi）    | `VAR=/c/...`、`VAR=/tmp/...` 全算同一種                     |
+| `shell.envPath`      | 前綴賦值路徑值改寫（pi／oc）| `VAR=/c/...`、`VAR=/tmp/...` 全算同一種                     |
 
 - **分母** `toolCalls[tool]`：清單內工具每次呼叫 +1，且都在 gate 之後——統計範圍
   ＝外掛實際作用的範圍（非 win32／無 MSYS bash 時整體 inert，不灌水）。

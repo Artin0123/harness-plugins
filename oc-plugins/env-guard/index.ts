@@ -43,8 +43,29 @@
 //      would BE the side effect; a failed or inconclusive probe leaves
 //      everything alone (uncertainty never enables side effects; `/c` works in
 //      both configurations).
+//   3. bash prefix-assignment POSIX path values (`A=/c/x node ...`): measured
+//      native git-bash converts the VALUE at the msys->native envp boundary
+//      (name-agnostic value-grammar conversion: FOO and XDG_CACHE_HOME are
+//      treated alike; /c/foo -> C:/foo, /tmp -> its mount anchor, forward
+//      slashes), and this machine's .bashrc (sourced through BASH_ENV) disables
+//      that layer with MSYS_NO_PATHCONV like `//c`, so the raw value reaches
+//      the native child and is resolved as a drive-relative path -- Node
+//      writes to C:\c\foo with exit 0 (measured silent). The rewrite
+//      reproduces that layer fair: only command-position assignments followed
+//      by a real command word (the value then provably enters that command's
+//      environment); the two verifiable anchors /c and /tmp (deliberately
+//      conservative -- single-letter drive roots and colon-list values
+//      convert natively on this machine too and stay misses); staged and
+//      applied right-to-left via spans, discarded at every standalone
+//      boundary (separator, background &, newline, redirect, heredoc, word
+//      head `#`, EOF), kept through a closer restoring the command position
+//      so the tight dynamic-tail form composes (VAR=/c/x$(pwd) node).
+//      Scanner details and the native fact base live in the scanBash section
+//      below and in docs/spec.md (掃描器要點).
 //
-// Deliberately NOT fixed (native execution wins; let it fail where it fails):
+// NATIVE failures (the tool's return equals what native would return, so the
+// agent sees the real cause and self-corrects) stay untouched -- rewriting
+// them IS the side effect:
 //   - C:\\tmp in file tools: a legal Windows path, the native write simply
 //     succeeds (measured). The model choosing C:\\tmp is not environment
 //     breakage.
@@ -57,15 +78,44 @@
 //     pi sibling's machine) -- but this is bash-native behaviour, not
 //     something this environment's tooling inflicts, so it stays untouched;
 //     `rm ./nul` removes it.
-//   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled (measured;
-//     the same run that printed the version also produced the mojibake);
-//     there is no faithful rewrite and the mojibake itself is the visible,
-//     self-correcting signal.
+//   - cmd + non-ASCII: cmd's Chinese output arrives GBK-mangled, which is
+//     exactly what a native terminal would print (parity holds) -- the
+//     mojibake is the visible, self-correcting signal and there is no
+//     faithful rewrite.
+//   - `cmd //?`, `cmd ///c`, `cmd //server/share`: WAS-error without
+//     conversion as well -- the model's own syntax error, native.
+//
+// MISSED FIXES (漏修 ledger -- failures the environment's conversion layer
+// inflicts, so the tool's return does NOT equal the native return: a loud
+// failure does NOT exempt these, it just self-corrects where the message is
+// still faithful; they stay unfixed only where every static rewrite is an
+// open-set guess and the better-to-miss-than-mis-fix rule binds):
+//   - //flags for other native /-switch programs (taskkill //IM, sc, net,
+//     reg, robocopy //mir, findstr //n...): same fault as //c, but the
+//     failure is loud and the rewrite needs an open list of which programs
+//     take /-flags (open set + guessing).
+//   - cmd behind external wrappers (timeout 5 cmd //c ..., xargs..., nice...),
+//     quoted "cmd" //c, escaped \\cmd //c: same fault; wrapper argument
+//     structures are an open set (timeout/nice/xargs), the quoted and
+//     escaped spellings are not the builder's habit (measured: zero organic
+//     occurrences in this machine's command log).
+//   - POSIX path arguments of native programs (`git -F /tmp/x`, `python
+//     /tmp/x.py`): conversion is what makes them work natively; here they
+//     fail loudly. Deciding which argument is a path is per-program (open
+//     set) and rewriting every /... token would corrupt string/regex data.
+//   - envp residual boundaries (see the scanner section): quoted-leading and
+//     list/backslash values, root-relative and single-letter drive roots,
+//     tight VAR=/c$(...), redirect-interleaved prefixes, standalone "node",
+//     function bodies and msys internals that read the value back -- native
+//     converts these (or reads the value it kept); the scanner cannot see an
+//     unquoted full value or a program's argument semantics without the
+//     same open-set guessing.
 //
 // Scope discipline: NATIVE EXECUTION WINS -- agent errors and syntax that
 // fails under its own native execution are left loud. Uncertainty resolves to
 // "do not touch": an undetectable bash or a failed probe leaves the plugin
-// inert (漏修大聲失敗可自癒；誤修是靜默破壞正確語法).
+// inert (寧可漏修，不可誤修：誤修是靜默破壞正確語法；漏修是環境層未修的故障臺,
+// 大聲只是失敗形態,不是不修的豁免).
 
 import * as os from "node:os";
 import * as path from "node:path";
@@ -380,13 +430,81 @@ export function splitTempPrefix(pattern: string): { dir: string; rest: string } 
 
 // ---- shell command scan: cmd doubled flags, position-aware ----------------
 
-// The caller decides WHEN to rewrite: the hook gates on a verified MSYS shell
-// plus the path-conversion probe. The scanner itself always rewrites.
-export function rewriteBashCommand(command: string): string {
-  return scanBash(command);
+// Two rewrites, one position-aware scan:
+//   cmdFlag: `cmd //c|//k` -> /c|/k (the interactive-cmd failure above);
+//     fires only when the caller says the conversion layer is OFF (the hook
+//     probes it; with conversion ON `//c` is the spelling that works, so
+//     rewriting it would BE the side effect -- scanner trusts the caller).
+//   envPath: a command-position assignment prefix with a POSIX absolute path
+//     value (`A=/c/x node …`) gets the native envp conversion value. Measured
+//     on this machine (Git for Windows 2.56.0): with conversion ON, the
+//     msys->native exec boundary converts the VALUE grammar, name-agnostic
+//     (`A=/c/x node` -> node receives C:/x; `bash -c 'echo $A'` stays /c/x;
+//     `A=/c$(echo foo)` -> <msys-root>/cfoo; tight `A=/c/x$(pwd) node` >=
+//     prefix + verbatim suffix = native conversion of the joined value). This
+//     machine's .bashrc sets MSYS_NO_PATHCONV through BASH_ENV, so that layer
+//     is off here and the value arrives raw, resolved by Node as a
+//     drive-relative path (path.resolve('/c/x') -> C:\c\x, exit 0 -- silent).
+//     The rewrite reproduces ONLY that layer's two verifiable anchors
+//     (deliberate conservatism, NOT a claim that the native layer converts
+//     nothing else -- colon-list values convert natively with their own
+//     rule set, and are left as misses): the drive-letter form is
+//     LETTER-GENERIC (measured: /m /b /q /x /y /z all resolve through the
+//     msys mount table and convert natively -> M:/x etc.) and the /tmp
+//     anchor:
+//     `A=/<drive>[...]` -> X:<...> (case-insensitive in, capital drive,
+//     forward slashes, native-identical), `A=/tmp[...]` -> the realTempDir
+//     anchor.
+//     Staged per assignment token (span in the output), applied only when a
+//     real command word of the same simple command lands -- the value is then
+//     KNOWN to cross the exec boundary; standalone assignments are shell
+//     variables whose POSIX value is bash-side semantics (rewriting them IS
+//     the mis-fix). Drop points (each pins one discard path): separators,
+//     `&` background, newline, redirect (incl. fd targets), heredoc, `#` as
+//     the word head, EOF. The one keep: a closed `$( )` restoring command
+//     position -- `VAR=/c/x$(pwd) node` closes the value with the following
+//     command word.
+// Values deliberately not rewritten (residual misses -- the native layer
+//   converts them, the scanner cannot see an unquoted full value, and the
+//   direction is loud-or-native-safe): quoted-leading values, list / backslash
+//   values, root-relative values (/usr... -> MSYS install root, mount
+//   dependent), tight forms whose static prefix
+//   stops at the drive letter (VAR=/c$(...)), the standalone quoted word
+//   ("node"), and redirect-interleaved prefixes (A=/c/x > log node).
+// Mixed boundary, applied-bias kept (documented residual): functions and other
+//   msys programs are an open set -- when their dynamic scope spawns native,
+//   native converts just like this rewrite; when the value is only read
+//   back, native does not convert and the rewrite diverges (rare, silent).
+//
+// Returns flags separately (telemetry): an envPath rewrite must not be
+// counted under a synthetic "rewritten !== input" heuristic as a cmd-flag fix.
+export interface BashScanResult {
+  command: string;
+  cmdFlagFixed: boolean;
+  envPathFixed: boolean;
 }
 
-function scanBash(command: string): string {
+export function rewriteBashCommand(command: string, convOff = true): BashScanResult {
+  return scanBash(command, convOff);
+}
+
+// Value conversion for a prefix-assignment token: reproduce the native envp
+// layer's two verifiable anchors only; null = not convertible = leave it
+// (uncertainty never enables a side effect).
+function convertEnvPath(v: string): string | null {
+  if (/[:\\]/.test(v)) return null; // list separators or cmd-isms: other rules
+  let m = /^\/([a-zA-Z])(\/.*)?$/.exec(v);
+  if (m) return m[1]!.toUpperCase() + ":" + (m[2] ?? "/");
+  if (/^\/tmp(\/.*)?$/i.test(v)) {
+    const anchor = realTempDir();
+    if (!anchor) return null; // no anchor, no fix (no layout guess)
+    m = /^(\/tmp)(.*)$/i.exec(v)!;
+    return anchor.replace(/\\/g, "/") + m[2];
+  }
+  return null;
+}
+
+function scanBash(command: string, convOff = true): BashScanResult {
   // group 1: the <<- dash; group 2: the backslash of <<\EOF (literal body);
   // the delimiter is a bash WORD, quoted (any content, quotes stripped --
   // the terminator line compares bare, like bash) or unquoted starting with
@@ -407,6 +525,53 @@ function scanBash(command: string): string {
   let prevTokCmdPos = false;
   let cmdPosNext = true;
   let cmdFlagZone = false; // after cmd, /flags keep the zone alive (cmd //q //c)
+  let cmdFlagFixed = false;
+  let envPathFixed = false;
+  // Prefix-assignment path rewrite: assignment tokens in command position are
+  // staged (span in `out` + converted word); applied only when a real command
+  // word of the SAME simple command lands. Applied right-to-left (spans stay
+  // valid: later appends only grow the string after the earlier span).
+  const pendingEnv: { start: number; end: number; rep: string }[] = [];
+  // envp trigger predicates -- deliberately CASE-SENSITIVE here (bash
+  // keywords are lowercase, so ENV/ECHO uppercase are program names and must
+  // apply like any native command; the cmd-flag face below keeps its own
+  // historical case-insensitive set, untouched). One shared predicate for all
+  // three decision points (staging? keeper apply / apply on word / EOF) --
+  // fd tokens (2>&1's "2", pure digits) and empty assignments (B=) are NOT
+  // real command words: measured native behaviour persists the value of
+  // `A=/c/x 2>&1` unconverted.
+  const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|exec|command|builtin|env|[{}!])$/;
+  // Real-command-word exclusion set -- command words whose value never
+  // crosses the msys->native exec boundary, two closed classes:
+  // 1) bash builtins (enumerable via `enable -a`, plus . [ [[ ]] special
+  //    words); the special builtins eval/source/`.` spawn natively IN their
+  //    dynamic scope WITH conversion (measured `A=/c/x eval 'node …'` ->
+  //    C:/x) so excluding them leaves that side a miss (native-safe).
+  // 2) bash/sh: MSYS programs; msys->msys exec does not convert envp (measured
+  //    `A=/c/x bash -c 'echo $A'` -> /c/x); a native spawn INSIDE converts at
+  //    that inner boundary -- a miss again, safe direction.
+  // exec/command/env deliberately NOT here: they continue position via
+  // RESERVED_WORD and the word after them applies (command node / env node
+  // is a native boundary).
+  // Anti-drift: the battery asserts this set against `enable -a` one by one.
+  const BUILTIN_WORD = /^(?:\.|:|\[|\[\[|\]\]|alias|bg|bind|break|builtin|bash|caller|cd|compgen|compopt|complete|continue|declare|dirs|disown|echo|enable|eval|exit|export|false|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|pwd|read|readarray|readonly|return|set|sh|shift|shopt|source|suspend|test|times|trap|true|type|typeset|ulimit|umask|unalias|unset|wait)$/;
+  const ASSIGN_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+  const envpTrigger = (t: string) =>
+    !ASSIGN_PREFIX.test(t) && !RESERVED_WORD.test(t) && !BUILTIN_WORD.test(t) && !/^\d+$/.test(t);
+
+  // Apply the staged assignment rewrite. Gate re-check: when the caller says
+  // conversion is ON, the native layer does this itself and the rewrite would
+  // be duplicate protection (pure side effect) -- drop the staged spans.
+  const applyPendingEnv = () => {
+    if (!pendingEnv.length) return;
+    if (!convOff) { pendingEnv.length = 0; return; }
+    for (let k = pendingEnv.length - 1; k >= 0; k--) {
+      const r = pendingEnv[k];
+      out = out.slice(0, r.start) + r.rep + out.slice(r.end);
+    }
+    envPathFixed = true;
+    pendingEnv.length = 0;
+  };
   let inBacktick = false; // flat backtick nesting (\` is eaten by the escape branch)
   const btPos: boolean[] = []; // outer command position to restore at each closing backtick
   // open parens, each remembering the OUTER command position at open time:
@@ -470,6 +635,24 @@ function scanBash(command: string): string {
     }
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
+    // prefix-assignment staging / apply (envp): the assignment token (whole
+    // word, unquoted) in command position is staged; a later real command
+    // word (non-assignment incl. empty-value, non-keyword, non-builtin,
+    // non-pure-digit) landing in the SAME simple command means the value will
+    // enter that command's environment -- apply. Empty-value assignments
+    // neither stage (nothing convertible) nor trigger apply (see
+    // envpTrigger). prevTokCmdPos here is still THIS token's position.
+    if (prevTokCmdPos) {
+      const em = ASSIGN_PREFIX.test(curTok)
+        ? /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok)
+        : null;
+      if (em) {
+        const conv = convertEnvPath(em[2]!);
+        if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
+      } else if (envpTrigger(curTok)) {
+        applyPendingEnv();
+      }
+    }
     prevTok = curTok;
     curTok = "";
   };
@@ -484,8 +667,10 @@ function scanBash(command: string): string {
       if (c === "$" && seg[k + 1] === "(") {
         const close = matchParen(seg, k + 2);
         if (close === -1) { s += seg.slice(k); break; }
-        const sub = scanBash(seg.slice(k + 2, close));
-        s += "$(" + sub + ")";
+        const sub = scanBash(seg.slice(k + 2, close), convOff);
+        s += "$(" + sub.command + ")";
+        cmdFlagFixed ||= sub.cmdFlagFixed;
+        envPathFixed ||= sub.envPathFixed;
         k = close + 1;
         continue;
       }
@@ -496,8 +681,10 @@ function scanBash(command: string): string {
           p++;
         }
         if (p >= m2) { s += seg.slice(k); break; }
-        const sub = scanBash(seg.slice(k + 1, p));
-        s += "`" + sub + "`";
+        const sub = scanBash(seg.slice(k + 1, p), convOff);
+        s += "`" + sub.command + "`";
+        cmdFlagFixed ||= sub.cmdFlagFixed;
+        envPathFixed ||= sub.envPathFixed;
         k = p + 1;
         continue;
       }
@@ -605,6 +792,7 @@ function scanBash(command: string): string {
         pendingDelim = m[3] ?? m[4] ?? m[5];
         pendingDash = m[1] === "-";
         inHeader = true;
+        pendingEnv.length = 0; // heredoc redirect = no command word after the assignment (standalone) -> discard
         out += m[0];
         i += m[0].length;
         continue; // same-line redirects still scanned (cmd flag detection needs them)
@@ -615,6 +803,7 @@ function scanBash(command: string): string {
       if (ch === "\n") {
         cmdPosNext = true;
         clearTok(); // a new command line: no token authorizes anything
+        pendingEnv.length = 0; // new command line = assignment without a command word (standalone) -> discard
       }
       out += ch;
       i++;
@@ -644,6 +833,12 @@ function scanBash(command: string): string {
                 : "group";
         parenStack.push({ kind, pos: cmdPosNext });
       }
+      // pipeline / command end : the staged assignment never met a real
+      // command word of its simple command (standalone -> bash-side variable,
+      // POSIX value kept). `(` does NOT drop: the tight form
+      // `VAR=/c/x$(...)` is still collecting its value's dynamic tail, and
+      // `A=x (...)` is a syntax error -- no legal shape to protect.
+      if (ch === "|" || ch === ";") pendingEnv.length = 0;
       clearTok();
       cmdPosNext = true; // separators open a new command position
       out += ch;
@@ -655,6 +850,7 @@ function scanBash(command: string): string {
       if (command[i - 1] !== ">" && command[i - 1] !== "<") {
         cmdPosNext = true; // 2>&1's & is no separator
         clearTok();
+        pendingEnv.length = 0; // background split: the assignment is a standalone
       }
       out += ch;
       i++;
@@ -662,6 +858,12 @@ function scanBash(command: string): string {
     }
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
+      // whether the close RESTORES a command position still owed its command
+      // word (the tight form `VAR=/c/x$(pwd) node` closes the assignment
+      // value here): it keeps the staged assignment so the following word
+      // applies it. Redirection targets are bash's own path syntax (never
+      // argv envp) and `)` ends the command: both discard.
+      let restoreTrue = false;
       if (ch === ")") {
         if (caseRegion === "pattern") {
           // the case-PATTERN terminator: no matching "(" of its own, so it
@@ -686,6 +888,7 @@ function scanBash(command: string): string {
             fr === undefined || fr.kind === "func" || fr.kind === "case"
               ? true
               : fr.pos;
+          restoreTrue = fr !== undefined && (fr.kind === "func" || (fr.kind === "subst" && fr.pos === true));
         }
         clearTok();
       } else {
@@ -695,6 +898,7 @@ function scanBash(command: string): string {
         cmdPosNext = false;
         clearTok();
       }
+      if (!restoreTrue) pendingEnv.length = 0;
       out += ch;
       i++;
       continue;
@@ -736,6 +940,7 @@ function scanBash(command: string): string {
           out += (curTok === "" ? "" : " ") + "/" + m[1];
           i += m[0].length;
           curTok = "/" + m[1];
+          cmdFlagFixed = true;
           continue;
         }
       }
@@ -744,11 +949,21 @@ function scanBash(command: string): string {
       i++;
       continue;
     }
+    // a `#` at the head of a word is a comment: the staged assignment ends
+    // here as a bash-side standalone (dropped BEFORE this `#` commits -- at
+    // word head in command position it would otherwise count as the command
+    // word and wrongly apply). `#` inside a word (a#b) is data, untouched.
+    if (ch === "#" && curTok === "") pendingEnv.length = 0;
     curTok += ch;
     out += ch;
     i++;
   }
-  return out;
+  // EOF close: the last token never sees a separator to commit it -- a real
+  // command word at the tail applies the staged assignments exactly like the
+  // mid-command path (`A=/c/x cmd` ends here); an assignment (incl. empty
+  // value), keyword, builtin or pure-digit tail is a standalone -> discard.
+  if (curTok && cmdPosNext && envpTrigger(curTok)) applyPendingEnv();
+  return { command: out, cmdFlagFixed, envPathFixed };
 }
 
 // ---- OpenCode hook wiring -------------------------------------------------
@@ -780,7 +995,8 @@ const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
 //   numerator    fixes[key] -- one bump per actual rewrite, keyed by fault
 //     point; same-nature variants share one key (/tmp, $TEMP, ${TEMP},
 //     %TEMP% all count as "path.temp"; //c, //q //c and tight cmd//c all
-//     count as "shell.cmdFlag"), different kinds stay separate.
+//     count as "shell.cmdFlag"; A=/c/... and A=/tmp/... prefixes both count
+//     as "shell.envPath"), different kinds stay separate.
 //     OC-only keys: glob.tempPrefix, patch.tempLine, shell.workdir.temp.
 // Storage: ctx.storage (the host's official plugin-scoped durable JSON --
 // it lands in opencode.db's kv table; read it read-only with sqlite, never
@@ -922,11 +1138,14 @@ export default define({
         }
       }
       if (!pathConvDisabled(event.shell)) return;
-      const rewritten = rewriteBashCommand(event.command);
-      if (rewritten !== event.command) {
-        event.command = rewritten;
-        bumpFix("shell.cmdFlag");
-      }
+      // convOff=true by construction here (the probe passed): with conversion
+      // ON the native layer does both rewrites itself. Each rewrite reports
+      // its own flag -- an envPath fix must not be mis-attributed to the
+      // cmd-flag key by a rewritten !== input heuristic.
+      const r = rewriteBashCommand(event.command, true);
+      if (r.command !== event.command) event.command = r.command;
+      if (r.cmdFlagFixed) bumpFix("shell.cmdFlag");
+      if (r.envPathFixed) bumpFix("shell.envPath");
     });
 
     // unload: flush what the debounce still holds. Cleanup is typed
