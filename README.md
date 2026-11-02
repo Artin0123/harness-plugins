@@ -76,15 +76,12 @@ cp -r oc-plugins/chat-trim-context ~/.config/opencode/plugins/
 ```
 
 指令安裝登記到全域 `~/.config/opencode/opencode.json` 的 `plugins`，實體安裝在
-`~/.cache/opencode/npm/git-<repo>-<hash>/<timestamp>/node_modules/`。插件零依賴，
-每個只佔 12 KB（chat-trim-context）／48 KB（env-guard）。以 `#master` 跟隨 master，
-`opencode plugin update env.guard` 更新到最新 commit（釘版本就寫完整 commit hash）。
-每次 add/update 會新增一個 `<timestamp>/` 目錄且不自動清除，舊的要自己刪。
+`~/.cache/opencode/npm/git-<repo>-<hash>/<timestamp>/node_modules/`。
+`opencode plugin update env.guard` 更新，每次 add/update 會新增一個 `<timestamp>/` 目錄且不自動清除，舊的要自己刪。
 
 `opencode plugin list` / `check` / `remove`；`check` 比對是否有新 commit。兩個查詢
-指令問的是執行中的 service（`opencode service status|stop`），不是磁碟——server 沒
-重啟就一直回舊答案；service 剛被拉起時第一跑可能回 `No package plugins found`，再跑
-一次即正常。手動安裝（複製到 `plugins/` 目錄）不經過 npm。
+指令問的是執行中的 service（`opencode service status|stop`），server 沒
+重啟就一直回舊答案；service 剛被拉起時第一跑可能回 `No package plugins found`，再跑一次即正常。手動安裝（複製到 `plugins/` 目錄）不經過 npm。
 
 ---
 
@@ -169,14 +166,18 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法不同：
 | 項目                                                  | pi 版做法                                                                                                                                        |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                          |
-| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫 |
+| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴（外部 wrapper 如 timeout/xargs 維持刻意不修） |
+| 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字） | 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把值轉成 Windows 形式；本機被 `MSYS_NO_PATHCONV` 停用 → 值原樣抵達、被當磁碟相對路徑寫到 `C:\c\...`（靜默錯位）。重現該層規則改寫（盤符→`C:/...`、`/tmp`→錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發，實測這些形原生不走 envp 轉換或方向安全） |
 
 **刻意不修**（原生行為或模型自身錯誤，讓它壞）：`C:\tmp`（原生寫入會成功）、
-MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析層原生正確映射）、裸
-`>nul`/`&>nul`/`<nul`/`2>&nul`/`<&nul`、其他 cmd-ism（`del`、`dir /b`、
-`robocopy //mir`…）、原生 exe 的 posix 路徑參數（`python /tmp/x.py`——大聲失敗，
-agent 可用 `cygpath -w` 自癒）、cmd 的非 ASCII 亂碼（無忠實改寫，亂碼本身就是
-可見、可自矯正的訊號）。完整理由見 spec。
+MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析層原生正確映射）、`nul` 重導向
+（bash 原生行為——重測會建實體 `nul` 檔、`rm nul` 可刪；`<nul`／`2>&nul` 大聲
+失敗）、`/` 前綴原生工具的雙斜線旗標（`taskkill //IM`、`sc //query`…——同一
+故障點但失敗大聲、agent 可自癒）、賦值值的其他形態（根相對路徑、引號值、清單
+值、`env X=...` wrapper 參數、standalone 賦值）、其他 cmd-ism（`del`、
+`dir /b`、`robocopy //mir`…）、原生 exe 的 posix 路徑參數（`python /tmp/x.py`
+——大聲失敗，agent 可用 `cygpath -w` 自癒）、cmd 的非 ASCII 亂碼（無忠實改寫，
+亂碼本身就是可見、可自矯正的訊號）。完整理由見 spec。
 
 通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
 
@@ -184,7 +185,7 @@ agent 可用 `cygpath -w` 自癒）、cmd 的非 ASCII 亂碼（無忠實改寫�
 
 統計清單內工具的呼叫次數（分母 `toolCalls`）與各修復的觸發次數（分子
 `fixes`）：`path.temp`（各種 temp 寫法合計）、`shell.cmdFlag`（`//c` 多旗標
-合計）。分類學與 OC 版共用，可直接對照。
+合計）、`shell.envPath`（前綴賦值路徑值合計）。分類學與 OC 版共用，可直接對照。
 
 儲存：`~/.pi/agent/env-guard-stats.json`（pi 官方 agent 目錄，吃
 `PI_CODING_AGENT_DIR` 覆蓋），**直接開檔即看**：
@@ -194,7 +195,7 @@ agent 可用 `cygpath -w` 自癒）、cmd 的非 ASCII 亂碼（無忠實改寫�
   "schema": 1,
   "since": "2025-01-01T00:00:00.000Z",
   "toolCalls": { "read": 123, "bash": 45 },
-  "fixes": { "path.temp": 7, "shell.cmdFlag": 9 }
+  "fixes": { "path.temp": 7, "shell.cmdFlag": 9, "shell.envPath": 2 }
 }
 ```
 

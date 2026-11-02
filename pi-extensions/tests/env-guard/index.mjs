@@ -134,6 +134,101 @@ flagCase('backtick nested fixed', 'echo v: `cmd //c ver`', 'echo v: `cmd /c ver`
 flagCase('//c fixed, quoted payload kept', 'cmd //c "dir > nul"', 'cmd /c "dir > nul"');
 flagCase('env-assignment prefix keeps position', 'x=1 cmd //c ver', 'x=1 cmd /c ver');
 
+// --- rewriteBashCommand: prefix-assignment POSIX paths (probe-gated) ---
+// 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把 VAR=/c/foo
+// 轉成 C:/foo、VAR=/tmp/x 轉成掛載錨點（正斜線風格，與 cygpath 的反斜線輸出
+// 不同——實測如此）；本機轉換被 MSYS_NO_PATHCONV 關閉時值原樣抵達 → Node
+// 把前導 / 當磁碟相對路徑解析成 C:\c\foo（靜默錯位，exit 0）。只修「前綴賦值
+// ＋後接指令字」；standalone 賦值（bash 端語意需要 POSIX 值）、引號值、清單值、
+// 根相對路徑、wrapper 參數一律不動（見檔頭刻意不修清單）。
+const Tf = String(mod.realTempDir() ?? T).replace(/\\/g, '/');
+const envCase = (label, input, expectedWhenOn) => {
+  const r = bc(input);
+  if (gateOn) check(`P: ${label}`, r.command === expectedWhenOn && r.envPathFixed, JSON.stringify(r));
+  else check(`P: ${label} [gate off: untouched]`, r.command === input && !r.envPathFixed, JSON.stringify(r));
+};
+const envMiss = (c) => {
+  const r = bc(c);
+  check(`P: untouched ${JSON.stringify(c)}`, r.command === c && !r.envPathFixed, JSON.stringify(r));
+};
+envCase('drive letter', 'XDG_CACHE_HOME=/c/foo node -e x', 'XDG_CACHE_HOME=C:/foo node -e x');
+envCase('other drive', 'CACHE=/d/data git status', 'CACHE=D:/data git status');
+envCase('uppercase input drive', 'V=/C/bar cmd', 'V=C:/bar cmd');
+envCase('bare drive', 'X=/c node -e y', 'X=C:/ node -e y');
+envCase('chained assignments', 'A=/c/x B=/d/y node x', 'A=C:/x B=D:/y node x');
+envCase('/tmp value', 'TMPDIR=/tmp node x', 'TMPDIR=' + Tf + ' node x');
+envCase('/tmp/sub value', 'TMPDIR=/tmp/sub node x', 'TMPDIR=' + Tf + '/sub node x');
+envCase('after !', '! A=/c/x cmd', '! A=C:/x cmd');
+envCase('after if', 'if A=/c/x cmd; then echo y; fi', 'if A=C:/x cmd; then echo y; fi');
+envCase('in case body', 'case x in a) A=/c/x cmd;; esac', 'case x in a) A=C:/x cmd;; esac');
+envCase('inside $( )', 'echo $(A=/c/x node -e y)', 'echo $(A=C:/x node -e y)');
+envCase('inside double-quoted $( )', 'echo "$(A=/c/x node -e y)"', 'echo "$(A=C:/x node -e y)"');
+envCase('spaced substitution as command word', 'A=/c/x $(pwd) cmd', 'A=C:/x $(pwd) cmd');
+// 緊貼形 VAR=/c/x$(…)：組合律——前綴改寫＋逐字後綴＝對串接後完整值的原生轉換
+envCase('tight substitution composes', 'A=/c/x$(pwd) cmd', 'A=C:/x$(pwd) cmd');
+envCase('redirect after command word', 'A=/c/x node > log', 'A=C:/x node > log');
+// 重導向交錯形＝漏修（原生會轉換，但重導向後掃描器已當參數區；fd 前緣
+// 2 不再觸發套用——與 A=/c/x > log node 同類，方向安全）
+envMiss('A=/c/x 2>&1 cmd');
+envMiss('A=/c/x > log node');
+// fd 前緣 standalone 形（實測原生持久化 [/c/x]）：純數字詞不觸發套用
+envMiss('A=/c/x 2>&1');
+envMiss('A=/c/x 2>/dev/null');
+// 空值賦值（B=）統一 predicate：既不暫存也不觸發；尾隨空白的 B= 同樣收尾
+envMiss('A=/c/x B= ');
+// bash 內建：不 spawn → envp 轉換層不存在（實測 A=/c/x eval 'echo $A'
+// 原生 [/c/x]；read/cd/source 同）→ 不套用＝與原生一致
+envMiss('A=/c/x eval "echo $A"');
+envMiss('A=/c/x read line');
+envMiss('A=/c/x [[ -d /c/x ]]');
+// 引號指令字不被掃描器當 token：單獨形＝漏修（原生會轉換 C:/x——實測
+// A=/c/x "node" -e … 原生 C:/x），方向安全；帶參數時由後續詞觸發而正確
+envMiss('A=/c/x "node"');
+// env 本身是 MSYS 程式：msys→msys 邊界不轉 envp（實測 A=/c/x env 印
+// A=/c/x）→ 不動＝原生行為（非漏修）
+envMiss('A=/c/x env');
+// bash/sh：msys 程式、msys→msys 邊界不轉 envp（實測 A=/c/x bash -c
+// 'echo $A' 原生 [/c/x]；內層 spawn native 時原生在內層邊界補轉）→ 不套用
+// ＝direct-read 一致、respawn 漏修（安全方向）
+envMiss('A=/c/x bash -c "echo $A"');
+envMiss('A=/c/x sh -c "echo $A"');
+// `:` 與 compopt：內建（防漂移對照由 enable -a 測試覆蓋）
+envMiss('A=/c/x :');
+envMiss('A=/c/x compopt');
+// 函式名殘餘（混合邊界，見檔頭）：無法靜態排除→維持套用，釘實際行為
+envCase('function name residual (mixed boundary)', 'A=/c/x f', 'A=C:/x f');
+// 緊貼組合單獨形：無後接指令字＝standalone（動態輸出進 shell 變數、不轉換）
+envMiss('A=/c/x$(pwd)');
+envCase('both fixes together', 'A=/c/x cmd //c ver', 'A=C:/x cmd /c ver');
+// 空值賦值 B= 保持指令位置續位（bash 語意：空值也進 envp），cmd 觸發套用
+envCase('empty assignment keeps position', 'A=/c/x B= cmd', 'A=C:/x B= cmd');
+// 引號指令字帶參數：由後續詞（-e）觸發，結果正確（原生 C:/x）
+envCase('quoted command word with args', 'A=/c/x "node" -e x', 'A=C:/x "node" -e x');
+// command 內建續位（會轉發外部指令）：由 node 觸發套用
+envCase('command builtin forwards to external', 'A=/c/x command node x', 'A=C:/x command node x');
+envMiss('A=/c/x');
+envMiss('A=/c/x; cat $A');
+envMiss('A=/c/x\ncat $A');
+envMiss('A="/c/foo" node x');
+envMiss('export X=/c/foo; node x');
+envMiss('echo A=/c/foo');
+envMiss('A=/usr/bin node x');
+envMiss('A=/tmpfoo/x node x');
+envMiss('A=/c/a:/c/b node x');
+envMiss('A=/c/x <<EOF\nEOF\ncmd');
+// 註解：`A=/c/x # c` 在 bash 是 standalone 賦值＋註解（值不進 envp、原生不轉換
+// ）——詞首 # 要把暫存賦值丟掉，否則註解裡的詞被當指令字觸發誤修
+envMiss('A=/c/x # comment');
+envMiss('A=/c/x # cmd');
+// && 左側是賦值敘述（shell 變數，不進 envp——實測 process.env.A undefined）
+envMiss('A=/c/x && node -e y');
+envMiss('A=/c/x&&node -e y');
+// wrapper 選項之後的詞在參數位置（選項結構＝開放集合）→ 刻意漏修
+envMiss('env -u V XDG=/c/foo node x');
+// A=x (…) 實測是 syntax error＝死文字，套用與否都無效果；群組內的詞是內建
+// （echo）不再觸發套用——不動同樣安全。釘實際行為防止意外漂移。
+envMiss('A=/c/x (echo hi)');
+
 // --- rewriteBashCommand: POSIX reserved words keep cmd at command position ---
 // `if cmd //c ver; then …` is native-correct git-bash syntax (measured: the
 // conversion layer turns //c into /c and `ver` runs) and is broken here only
@@ -289,18 +384,32 @@ const misses = [
   'echo if cmd //c ver',
   'echo "$(pwd)" cmd //c ver',
   'timeout 5 cmd //c ver',
-  'env cmd //c ver',
+  'xargs cmd //c ver',
   '/c/Windows/System32/cmd.exe //c ver',
   '"cmd" //c ver',
   '\\cmd //c ver',
   'cmd //?',
   'cmd ///c ver',
   'printf %s cmd //c',
+  // / 前綴原生工具：與 cmd //c 同一個故障點但失敗大聲（實測 taskkill //IM
+  // exit 1 報『無效參數』），列為刻意漏修（見檔頭）——釘住不升級成誤修
+  'taskkill //IM media-downloader.exe //F',
+  'taskkill //F //IM x.exe',
+  'sc //query wuauserv',
 ];
 for (const c of misses) {
   const r = bc(c);
-  check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+  check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed && !r.envPathFixed, JSON.stringify(r));
 }
+
+// --- taskkill 事件原形（CS0016 檔案鎖定那條）：整條對 env-guard 是 no-op ---
+// cmd.exe /c 是本機（轉換關閉）的正確單斜線形；taskkill 非 cmd、無前綴賦值
+// → 兩種改寫都不觸發。病理（//IM 原樣抵達 → exit 1）是刻意漏修：失敗大聲、
+// agent 看到即自癒（實錄：拿掉遮罩後下一步就改 /IM）；事件裡的靜默是模型
+// 自己的 >/dev/null 2>&1，屬模型自身錯誤不介入。
+const incident = 'cmd.exe /c "csc-build.cmd /nopause media-downloader.cs" 2>&1 | tail -2 && rm -f media-downloader.ini && ./media-downloader.exe & sleep 4; taskkill //IM media-downloader.exe //F >/dev/null 2>&1; sleep 1; sed -n \'1,14p\' media-downloader.ini';
+const incidentR = bc(incident);
+check('P: taskkill incident command is a no-op', incidentR.command === incident && !incidentR.cmdFlagFixed && !incidentR.envPathFixed, JSON.stringify(incidentR));
 
 // A substitution that yields a word, followed by the command: here `cmd` really
 // is at command position (`x=`y` cmd …` executes cmd), so this one is fixed.
@@ -311,6 +420,10 @@ const heredoc = bc("cat <<'EOF'\ncmd //c ver\nEOF");
 check('P: heredoc body untouched', heredoc.command.includes('cmd //c ver'), JSON.stringify(heredoc));
 const nul = bc('a 2>nul & b &>nul');
 check('P: nul forms untouched (deliberate)', nul.command === 'a 2>nul & b &>nul' && !nul.cmdFlagFixed, JSON.stringify(nul));
+// 重測（轉換開／關皆驗）：本機 bash 對 `> nul` 家族會建實體 nul 檔（非舊註解的
+// 「丟棄裝置」）；不修判準不變——bash 原生行為、模型 cmd-ism 自身錯誤
+const nul2 = bc('a > nul 2>/dev/null');
+check('P: > nul (builds a real file on this bash) untouched', nul2.command === 'a > nul 2>/dev/null' && !nul2.cmdFlagFixed && !nul2.envPathFixed, JSON.stringify(nul2));
 const paramExp = bc('echo "${x//c/d}"');
 check('P: ${x//c/d} untouched', paramExp.command === 'echo "${x//c/d}"', JSON.stringify(paramExp));
 
@@ -427,15 +540,32 @@ toolCall({ toolName: 'find', input: {} }, uiCtx);       // denominator even with
 toolCall({ toolName: 'webfetch', input: {} }, uiCtx);   // outside the guard list: not counted
 toolCall({ toolName: 'bash', input: { command: 'cmd //c ver' } }, uiCtx);
 toolCall({ toolName: 'bash', input: { command: 'cmd /c echo 中文' } }, uiCtx); // 非 ASCII：不偵測不改寫，命令原樣通過
+toolCall({ toolName: 'bash', input: { command: 'XDG_CACHE_HOME=/c/foo node -e x' } }, uiCtx);
 shutdown({}, uiCtx); // flush what the debounce still holds
 
+// 防漂移：掃描器的指令字排除集必須涵蓋實際 bash 的全部內建（enable -a
+// 列舉）。黑箱斷言——每個內建作為 A=/c/x 後的指令字都不應觸發改寫（含
+// RESERVED 轉發的 command/exec，單獨形本來就不套用）。bash 不可用時跳過。
+if (msysBash) {
+  const en = spawnSync(msysBash, ['--norc', '-c', 'enable -a'], {encoding: 'utf8'});
+  if (en.status === 0) {
+    const words = en.stdout.split('\n').map((l) => l.replace(/^enable\s+[-a]+\s+/, '').trim()).filter(Boolean);
+    for (const w of words) {
+      const r = mod.rewriteBashCommand(`A=/c/x ${w}`);
+      check(`P: builtin ${JSON.stringify(w)} excluded from trigger`, r.command === `A=/c/x ${w}` && !r.envPathFixed, JSON.stringify(r));
+    }
+    check('P: enable -a parsed non-trivially', words.length > 50, String(words.length));
+  }
+}
+
 const saved = JSON.parse(readFileSync(statsPath, 'utf8'));
-check('S: denominators merged with prior (read 9, find 1, bash 2)',
-  saved.toolCalls.read === 9 && saved.toolCalls.find === 1 && saved.toolCalls.bash === 2,
+check('S: denominators merged with prior (read 9, find 1, bash 3)',
+  saved.toolCalls.read === 9 && saved.toolCalls.find === 1 && saved.toolCalls.bash === 3,
   JSON.stringify(saved.toolCalls));
 check('S: unguarded tool not counted', saved.toolCalls.webfetch === undefined, JSON.stringify(saved.toolCalls));
 check('S: path.temp merged on top', saved.fixes['path.temp'] === 4, JSON.stringify(saved.fixes));
 check('S: cmd flag counted only when the gate is on', saved.fixes['shell.cmdFlag'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
+check('S: env path counted only when the gate is on', saved.fixes['shell.envPath'] === (gateOn ? 1 : undefined), JSON.stringify(saved.fixes));
 check('S: non-ASCII command untouched (no detection, no count)', saved.fixes['shell.cmdNonAscii'] === undefined, JSON.stringify(saved.fixes));
 check('S: since preserved across runs', saved.since === '2025-01-01T00:00:00.000Z', JSON.stringify(saved.since));
 check('S: no tmp leftovers after flush (per-PID tmp is renamed away)', readdirSync(agentDir).filter((f) => f.endsWith('.tmp')).length === 0, JSON.stringify(readdirSync(agentDir)));

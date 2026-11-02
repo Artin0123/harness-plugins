@@ -17,20 +17,47 @@
 //     0／空字串／false 也一樣停用轉換），//c 原樣抵達 cmd → 進互動模式
 //     （印橫幅、指令沒跑、exit 0）。bashrc 對擴充不可見，故以子 bash 探測
 //     （見下方 pathConvDisabled），確認轉換關閉才啟用改寫——探測失敗一律不改寫。
-//     適用 cmd 與 cmd.exe、指令位置（含 if/while/{/!/time 等 POSIX 語法關鍵字
-//     之後）的全部 //字母旗標（含多旗標 cmd //q //c）。
+//     適用 cmd 與 cmd.exe、指令位置（含 if/while/{/!/time 等 POSIX 語法關鍵字、
+//     env/exec/command/builtin 等後接指令字的內建之後）的全部 //字母旗標
+//     （含多旗標 cmd //q //c）。
+//   - bash 前綴賦值的 POSIX 路徑值（VAR=/c/…、VAR=/tmp/… 後接指令字）：實測
+//     原生 git-bash 在 spawn 原生程式時對 envp 做「值語法」轉換（name-agnostic：
+//     變數名不參與判斷，FOO 與 XDG_CACHE_HOME 一視同仁；/c/foo→C:/foo、
+//     /tmp→實際掛載點，輸出正斜線），本機 MSYS_NO_PATHCONV 一樣停用這層 →
+//     值原樣抵達 node，path.join 不做盤符映射、前導 / 被當成磁碟相對路徑解析
+//     → 寫到 C:\c\foo（靜默錯位，exit 0）。修法＝逐條重現該層的不變式規則
+//     （不猜哪個變數是路徑——轉換層自己就不看名字）：只修「前綴賦值＋後接
+//     指令字」的靜態未引號整值（實測 A=1 (…)、A=1 foo() {…}、A=1 if… 全是
+//     syntax error，賦值前綴只存在於 simple command——standalone 賦值是 shell
+//     變數，bash 端語意本來就需要 POSIX 值，改它才是誤修）。盤符形 /c、/c/…
+//     →C:/…（不分大小寫、輸出大寫）；/tmp、/tmp/…→cygpath 錨點（正斜線風格
+//     與原生 envp 輸出一致；問不到錨點就不修）。緊貼的動態尾部（VAR=/c/x$(…)）
+//     以組合律處理：轉換是「前綴改寫、後綴逐字保留」，前綴改寫＋動態後綴＝
+//     對串接後完整值的原生轉換。
 //
 // 【刻意不修】原生行為或模型自身錯誤，一概讓它壞：
-//   - wrapper 指令後的 cmd（timeout 5 cmd //c …、env cmd //c …、xargs …）：
-//     原生（轉換開啟）可跑、本機被同一層弄壞，但要在指令位置判定裡跳過
-//     wrapper 的參數，就得知道每個 wrapper 的參數結構——開放集合＋猜測，
-//     違反「只留不變的部分」，故列為刻意漏修（漏修＝原生失敗，方向安全）。
+//   - 外部 wrapper 指令後的 cmd（timeout 5 cmd //c …、xargs …、nice …）：
+//     原生（轉換開啟）可跑、本機被同一層弄壞（實測 timeout 2 cmd //c ver
+//     原生跑出 ver、本機只印 banner），但要在指令位置判定裡跳過 wrapper 的
+//     參數，就得知道每個 wrapper 的參數結構——開放集合＋猜測，違反「只留
+//     不變的部分」，故列為刻意漏修（漏修＝原生失敗，方向安全）。env/exec/
+//     command/builtin 不在此列：env 是 POSIX 標準程式、其餘是 bash 內建，
+//     「後接第一個非選項詞＝被執行的指令」是閉集合語法（已納入 RESERVED_WORD
+//     ；實測 env/exec/command cmd //c ver 原生跑 ver、本機 banner——同一
+//     故障，與 oc 版 SHELL_KEYWORDS 對齊）。
 //   - 原生程式的 POSIX 路徑參數（`git -F /tmp/x`、`git hash-object /tmp/x`、
 //     `python /tmp/x.py`…）：預設 git-bash 靠 argv 轉換才成立，本機轉換關閉就
 //     變成 `could not open '/tmp/…'`（實測；MSYS 程式如 cat/ls 不受影響）。
 //     不修的理由：判斷「哪個參數是路徑」需要各程式自己的參數語義（開放集合
 //     ＋猜測），把所有 /… 參數硬改成 Windows 路徑又會改壞字串／regex
 //     （`echo /tmp`、`grep /tmp`、`sed 's|/tmp|X|'`）；且失敗是大聲的，agent 可自癒。
+//   - 前綴賦值值的其他形態：根相對路徑（VAR=/usr、/foo…——原生映射到 MSYS
+//     安裝根，非不變式，fstab/nsswitch 可自訂）；引號開頭的值（VAR="/c/foo"
+//     ——引號切開 token，掃描器見不到整值）；清單值（VAR=/c/a:/c/b——原生
+//     清單轉換是另一套規則，輸出 C:\a;C:\b）；含 \ 的值（cmd-ism 分隔符）；
+//     wrapper 的賦值參數（env X=/c/…、export X=/c/…——argv 位置，同 wrapper
+//     cmd 的開放集合）；重導向交錯形（A=/c/x > log node——重導向後掃描器
+//     已當參數區，列為漏修）：一律照原樣。
 //   - 絕對路徑 cmd（C:\…\cmd.exe //c）、引號形式（"cmd" //c）、跳脫（\cmd //c）：
 //     同樣是原生可跑、本機壞，但模型實務不會這樣寫，加了只是多一個作用點。
 //   - 原生就壞的雙斜線形（cmd //?、cmd ///c、cmd //server/share）：實測轉換
@@ -45,14 +72,22 @@
 //     別的位置（`> /tmp/eg.log` 真的建檔），所以目標原樣不動。
 //   - C:\tmp：write 工具寫 C:\tmp 原生會成功（合法 Windows 路徑）——原生不壞就不修，
 //     模型真寫 C:\tmp 就讓它寫。
-//   - nul 重導向（> nul、2>nul…）：實測 bash（與 pi spawn 同一顆）把裸 nul 映射到
-//     丟棄裝置——多數形態根本不建檔；只有在同 process 先開過 /dev/null 的
-//     命令形態（如 `x > nul 2>/dev/null`）才會因 MSYS 裝置映射失效建出實體檔。
-//     這是 bash 原生行為（無 pi 介入也一樣），且是模型寫 cmd-ism 的自身錯誤，
-//     不符合介入判準；殘留檔 `rm nul` 即可刪。write 工具 path="nul" 同理
-//     （Node host 端原生就會建真檔，非 pi 加工）。
+//   - nul 重導向（> nul、2>nul、&>nul…）：重測（轉換開／關皆驗）本機 bash 在
+//     cwd 建出實體 nul 檔（Windows dir 可見、內容為重導向輸出）——舊註解「裸
+//     nul 映射到丟棄裝置、多數形態不建檔」與現況不符，已按重測修正。不修的
+//     判準不變：bash 原生行為（原生 git-bash 同樣建檔、無 pi 介入、無環境層
+//     故障點——bash 的丟棄裝置是 /dev/null，寫 >nul 是模型 cmd-ism 的自身錯誤
+//     ）；殘留檔 `rm nul` 即可刪。write 工具 path="nul" 同理（Node host 端
+//     原生就會建真檔——實測 dir 可見，非 pi 加工）。
 //   - < nul：bash 直接報 ENOENT，錯誤訊息自己會說話
 //   - 2>&nul、<&nul：ambiguous redirect，大聲失敗且不造檔
+//   - / 前綴原生工具的雙斜線旗標（taskkill //IM、sc //query、robocopy //mir、
+//     findstr //n…）：與 cmd //c 同一個故障點（原生靠 // 形成功、本機轉換關閉
+//     原樣抵達而失敗——實測 taskkill exit 1 大聲報『無效參數 //IM』；反向在
+//     原生環境把 /IM 轉成 C:/…/Git/IM 也失敗），但失敗大聲、agent 可自癒，
+//     靜態修復又需列舉「哪些程式吃 / 旗標」（開放集合＋猜測）→ 刻意漏修。
+//     cmd 是唯一例外：失敗靜默（互動模式、exit 0）且是 OS shell，納入判準
+//     見掃描器註解。
 //   - 其他 cmd-ism（del、dir /b、robocopy //mir…）：不是所有 shell 語法都能無風險改寫
 //
 // 位置：~/.pi/agent/extensions/env-guard/index.ts（全域生效，jiti 直接跑 TS；
@@ -64,8 +99,10 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// 不直接信 os.tmpdir()：若 pi 是從 git-bash 啟動，TEMP 可能是 "/tmp" 這種
-// MSYS 映射值，Node 直接拿去用會再踩同樣的坑。但也不要預設 AppData 佈局：
+// 不直接信 os.tmpdir()：TEMP 可能是 "/tmp" 這種 MSYS 映射值，而 Node 對它
+// 會驗證失敗後回退（實測 TEMP=TMP=/tmp 時回退到使用者 temp）——回退值不
+// 保證等於 bash 的 /tmp 錨點（自訂 fstab 會錯位），所以錨點還是要問 bash
+// 本身。但也不要預設 AppData 佈局：
 // bash 的 /tmp 靠 /etc/fstab 掛載（Git for Windows 預設 usertemp，但自訂 fstab
 // 可指向任何地方）。正確解：問「pi 實際會 spawn 的 bash」本身 `cygpath -w /tmp`
 // ——那才是 bash 的 `> /tmp/x` 與檔案工具看同一個目錄的錨點；探不到就用
@@ -135,9 +172,8 @@ export function realTempDir(): string | null {
 //   模型可自行修正；誤修則是沉默破壞正確語法——寧可漏修，不可誤修）
 // MSYS 的判定是「變數存在即停用」（實測 //c 在 0／空字串／false 下都原樣抵達
 // 原生程式），所以探測只問存在性，不比對值。
-// 前提：探測對象現在是 pi 自己的設定值（settings.shellPath，由 factory 注入；
-// 沒設才退回 findBash() 的掃描）。設定值是 MSYS bash 才探測、否則整體 inert，
-// 所以不再存在「探測的 bash ≠ 實際 spawn 的 bash」這種漂移。
+// 前提：探測對象＝實際 spawn 的 bash（settings.shellPath，由 factory 注入；
+// 沒設才退回 findBash() 的掃描）——兩者同源，沒有「探測 ≠ spawn」的漂移。
 let noPathConvCache: boolean | null = null;
 
 // ---- bash 自動偵測（掃描 + 驗證身份，不寫死任何安裝路徑）----
@@ -366,9 +402,31 @@ export function rewritePath(p: string): string {
   m = /^%(?:temp|tmp)%([\\/].*)?$/i.exec(p);
   if (m) return norm(m[1] ?? "");
   // C:\tmp：刻意不修——原生寫入會成功（合法 Windows 路徑），原生不壞就不修。
-  // 裸 nul / NUL：刻意不修。實測 bash 把裸 nul 映射到丟棄裝置（多數形態不建檔），
-  // 會建檔的形態是 MSYS 原生行為（見檔頭），非工具層問題
+  // 裸 nul / NUL：刻意不修。重測（轉換開／關皆驗）本機 bash 在 cwd 建實體
+  // nul 檔（見檔頭）——bash 原生行為、非工具層問題，不修
   return p;
+}
+
+// 前綴賦值路徑值轉換（bash 掃描器用）：重現原生 git-bash envp 轉換層對
+// 「值是 POSIX 絕對路徑」的不變式規則（name-agnostic——轉換層只看值語法，
+// 不猜哪個變數是路徑；實測 FOO/RANDOMNAME/XDG_CACHE_HOME 一視同仁）。
+// 範圍刻意只有兩個可驗證錨點：
+//   盤符形 /c、/c/… → C:/…（實測原生輸出大寫盤符＋正斜線，輸入不分大小寫）
+//   /tmp、/tmp/…   → cygpath 錨點（實測原生 envp 轉換輸出正斜線風格）
+// 不修：根相對路徑（/usr…——原生映射到 MSYS 安裝根，非不變式）、含 : 的清單值
+// （原生清單轉換是另一套規則，輸出 C:\a;C:\b）、含 \ 的值（cmd-ism）。
+// 回傳 null ＝ 不修（掃描器照原樣保留）。
+function convertEnvPath(v: string): string | null {
+  if (/[:\\]/.test(v)) return null; // 清單分隔符／cmd-ism：另一套規則，不碰
+  let m = /^\/([a-zA-Z])(\/.*)?$/.exec(v);
+  if (m) return m[1]!.toUpperCase() + ":" + (m[2] ?? "/");
+  m = /^\/tmp(\/.*)?$/i.exec(v);
+  if (m) {
+    const anchor = realTempDir();
+    if (!anchor) return null; // 問不到錨點就不修（不猜佈局）
+    return anchor.replace(/\\/g, "/") + (m[1] ?? "");
+  }
+  return null;
 }
 
 // bash 指令改寫（語法感知掃描器，單次掃描處理兩件事）：
@@ -378,19 +436,32 @@ export function rewritePath(p: string): string {
 //      範圍界定（為何只修 cmd、不預防性擴及 git/npx/python/pwsh）：那些工具吃
 //      -/-- 參數，msys 轉換層不碰 - 開頭的參數，MSYS_NO_PATHCONV 開關對它們
 //      沒有可觀察影響——不是選擇性不修，是它們沒有這個故障模式。雙斜線慣用
-//      語法只存在於以 / 為 switch 前綴的程式，Windows 上即 cmd.exe（OS shell，
-//      bash 到不了的 OS 設施都得經它，e2e 實測自然觸發）。判準是故障點所在層：
+//      語法存在於所有以 / 為 switch 前綴的原生程式：除了 cmd.exe，還有 taskkill、
+//      sc、net、reg、robocopy、findstr 這類可直接從 bash 呼叫的 Windows 內建
+//      工具——實測 taskkill //IM x //F 在原生 git-bash 成功、本機（轉換關閉）
+//      原樣抵達而 exit 1 大聲報錯，與 //c 同一個故障點。它們維持刻意漏修：
+//      失敗是大聲的（stderr＋exit 1，agent 看到即自癒——事件實錄裡的「靜默」
+//      是模型自己加 >/dev/null 2>&1 遮掉的，屬模型自身錯誤、不介入），且靜態
+//      修復必須列舉「哪些程式吃 / 旗標」＝開放集合＋猜測。cmd 單獨納入的依據：
+//      失敗是靜默的（互動模式、exit 0、橫幅偽裝成輸出），又是 OS shell（bash
+//      到不了的 OS 設施都得經它，e2e 實測自然觸發）。判準是故障點所在層：
 //      此故障在「本機轉換層被 MSYS_NO_PATHCONV 關閉（存在即停用）」，模型語法（git-bash
-//      官方慣用法）與 cmd.exe 本身都無錯。將來若有別的工具出現「自然使用＋
+//      官方慣用法）與程式本身都無錯。將來若有別的工具出現「自然使用＋
 //      故障可歸因於本機環境層＋靜默失敗」三條全中的實例，再按同一標準納入。
+//   2. 前綴賦值的 POSIX 路徑值 → Windows 值：VAR=/c/foo node … 在原生 git-bash
+//      會經 envp 轉換成 C:/foo，本機轉換被 MSYS_NO_PATHCONV 關閉 → 值原樣抵達
+//      node、被當磁碟相對路徑解析成 C:\c\foo（靜默錯位）。只在「指令位置的
+//      賦值前綴＋後接指令字」改寫（規則與不修形態見 convertEnvPath 與檔頭）。
 // 語法感知規則：
 //   - 單引號/雙引號內的字面「> nul」是資料，不動（cmd //c "dir > nul" 引號內交給 cmd）
 //   - heredoc 本體是資料，不動；結束標記行整行原樣跳過（同列殘字非標記，bash 會視為本體）
 //   - 反斜線跳脫的字元不構成運算子
 //   - 反引號與 $( ) 內是指令位置（會真的執行）；FOO=bar 前綴不結束指令位置
-//   - POSIX 語法關鍵字（if/then/elif/else/fi/while/until/do/done/time、{、}、!）
-//     在指令位置時不結束指令位置，所以 `if cmd //c ver; then …` 的 cmd 仍算
-//     指令位置；wrapper 指令（timeout/env/xargs…）刻意不列（見檔頭「刻意不修」）
+//   - POSIX 語法關鍵字（if/then/elif/else/fi/while/until/do/done/time、{、}、！）
+//     與 env/exec/command/builtin（bash 內建/POSIX 標準、後接指令字的閉集合）
+//     在指令位置時不結束指令位置，所以 `if cmd //c ver; then …`、`env cmd //c
+//     ver` 的 cmd 仍算指令位置；外部 wrapper（timeout/env 選項後/nice/xargs…
+//     ）刻意不列（見檔頭「刻意不修」）
 //   - 重導向/`<`/`)` 之後不延續 cmd 旗標區：目標是 bash 自己解析的路徑，不是 argv
 //   - heredoc 終止符按 bash 規則整行等值比對（`<<-` 先去掉前導 tab），不用 trim()
 //   - heredoc 定界符是 bash 的 word：`<<'END OF FILE'`（引號內任意內容）、
@@ -403,9 +474,34 @@ export function rewritePath(p: string): string {
 //     ——由「`(` 前一字元」與 commit 後的指令位置天然分流；`foo( … )` 函式
 //     定義維持 true；群組 `( … ) word` 原生就是語法錯誤 → false
 //   - 2>&1 的 & 不是分隔符（前一字元是 > ）
+//   - 前綴賦值在指令位置時暫存（記下它在 out 的跨度與改寫結果），「真指令
+//     字」落地才套用——此時值確定會經 exec 邊界進該 simple command 的
+//     envp。真指令字＝非賦值（含空值 B=）、非語法關鍵字、非 BUILTIN_WORD
+//     （bash 內建與 bash/sh：值不經 msys→native 邊界——實測 A=/c/x
+//     eval 'echo $A' 與 A=/c/x bash -c 'echo $A' 原生皆 [/c/x]；這些詞的
+//     動態範圍内 spawn native 時原生會轉，排除＝那側漏修，方向安全）、
+//     非純數字詞（fd 前綴；實測 A=/c/x 2>&1 原生持久化 [/c/x]）。
+//     收尾＝standalone 賦值（shell 變數，bash 端語意
+//     需要 POSIX 值）→ 丟棄：分隔符／重導向（含 fd 前綴 2>…）／heredoc／
+//     EOF／詞首 `#` 註解。`(` 不丟：緊貼形 VAR=/c/x$(…) 靠組合律（前綴改
+//     寫＋逐字後綴＝對串接後完整值的原生轉換；前提＝動態尾部以 / 開頭，
+//     否則原生把整值當根相對路徑、組合律不成立——實測 A=/c$(echo foo)
+//     原生 → <msys-root>/cfoo）；實測 A=x (…)、A=x foo() {…} 是 syntax
+//     error，不存在需要保守的合法形。多筆由右至左套用，記錄時的跨度不受
+//     後續附加影響。
+//     殘餘邊界（如實）：函式名是開放集合、無法靜態排除，且是混合邊界
+//     ——body 内 spawn native 時原生會轉（實測 f(){ node …; }; A=/c/x f
+//     → C:/x，與改寫一致）、body 直接讀值時原生不轉（實測 f(){ echo
+//     [$A]; } → [/c/x]，改寫發散）；維持套用偏向 spawn 情形（多數形），
+//     讀值情形為罕見且靜默的誤修；其他 msys 程式（git/cat…）同為開放
+//     集合、同樣雙向。引號指令字不被掃描器當 token（A=/c/x "node" 單獨形＝漏修，原生會轉換；帶參數時由後續詞
+//     觸發而正確）；重導向交錯形（A=/c/x 2>&1 cmd、A=/c/x > log node）＝
+//     漏修（原生會轉換）；靜態前綴止於盤符的緊貼形（VAR=/c$(…) ：暫存值
+//     /c$ 不符合轉換規則、不記錄）＝漏修——漏修方向安全。
 export interface BashScanResult {
   command: string;
   cmdFlagFixed: boolean;  // cmd //c|//k 被改寫為 /c|/k
+  envPathFixed: boolean;  // 前綴賦值的 POSIX 路徑值被改寫（VAR=/c/… → VAR=C:/…）
 }
 
 export function rewriteBashCommand(command: string): BashScanResult {
@@ -413,6 +509,7 @@ export function rewriteBashCommand(command: string): BashScanResult {
   return {
     command: r.command,
     cmdFlagFixed: r.cmdFlagFixed,
+    envPathFixed: r.envPathFixed,
   };
 }
 
@@ -423,8 +520,32 @@ function scanBash(command: string): BashScanResult {
   // 避免把 `$((1<<2))` 這種算術位移誤當 heredoc。
   const heredoc = /<<(-?)[ \t]*(?:(["'])([^\r\n]+?)\2|\\?([A-Za-z_][A-Za-z0-9_.-]*))/y; // sticky 已錨定 lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
-  // POSIX 語法關鍵字：固定集合（bash 語法），不是「猜哪些程式會轉發指令」
-  const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|[{}!])$/;
+  // 指令位置不結束的固定集合（bash 語法/內建層，閉集合）——不是「猜哪些程式
+  // 會轉發指令」：if/while/{/!/time 是語法關鍵字；exec/command/builtin 是 bash
+  // 內建、env 是 POSIX 標準程式，四者後接的第一個非選項詞就是被執行的指令
+  //（實測 env/exec/command cmd //c ver 原生跑 ver、本機進互動模式——與裸
+  // cmd //c 同一故障；與 oc 版 SHELL_KEYWORDS 對齊）。界線仍在 shell 語法層
+  // ：timeout/nice/xargs 這類外部 wrapper 的參數結構才是開放集合（見檔頭刻意不修）
+  //。刻意大小寫敏感：大寫 ENV 是路徑上的程式名、IF/TIME 不是 bash 關鍵字。
+  const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|exec|command|builtin|env|[{}!])$/;
+
+  // 指令字排除集（觸發套用的反集合）——值「不經 msys→native exec 邊界」
+  // 的閉集合，兩類：
+  // 1) bash 內建（本機 enable -a 可列舉，＋ . [ 與 [[ ]] 特殊語法詞）：內建
+  //    本身不 spawn；但 eval/source 這類特殊內建的動態範圍内 spawn 原生程
+  //    式時原生會轉（實測 A=/c/x eval 'node …' 原生 C:/x）——字串會做什麼
+  //    無法靜態判定；排除＝純內建情形與原生一致（實測 A=/c/x eval
+  //    'echo $A' 原生 [/c/x]）、動態範圍 spawn 情形＝漏修（安全方向）。
+  // 2) bash/sh：msys 程式，msys→msys 邊界不轉 envp（實測 A=/c/x bash -c
+  //    'echo $A' 原生 [/c/x]）；內層再 spawn native 時原生在內層邊界補轉
+  //    （實測 C:/x）、此處漏修——同上安全方向。
+  // exec/command/env 刻意不列：RESERVED_WORD 續位、由後面的真指令字觸發
+  // （command node / env node 的 node 是 native、值經邊界）。函式名與其他
+  // msys 程式（git/cat…）是開放集合、無法靜態排除 → 殘餘混合邊界，如實
+  // 記錄（見檔頭語法感知規則）。純數字詞（fd 前緣，2>&1 的 2）也不觸發
+  // （實測 A=/c/x 2>&1 原生持久化 [/c/x]）。刻意大小寫敏感（與 RESERVED_WORD 同）
+  // 。防漂移：測試電池把本集合與 enable -a 逐一對照。
+  const BUILTIN_WORD = /^(?:\.|:|\[|\[\[|\]\]|alias|bg|bind|break|builtin|bash|caller|cd|compgen|compopt|complete|continue|declare|dirs|disown|echo|enable|eval|exit|export|false|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|pwd|read|readarray|readonly|return|set|sh|shift|shopt|source|suspend|test|times|trap|true|type|typeset|ulimit|umask|unalias|unset|wait)$/;
   let out = "";
   let i = 0;
   const n = command.length;
@@ -432,6 +553,11 @@ function scanBash(command: string): BashScanResult {
   let pendingStripTabs = false; // <<- ：終止符行先去掉前導 tab 再比（bash 只去 tab，不去空白）
   let inHeader = false;
   let cmdFlagFixed = false;
+  let envPathFixed = false;
+  // 前綴賦值暫存：賦值 token 在指令位置時記下它在 out 的跨度與改寫後整詞，
+  // 等後續「指令字」落地（＝值確定會進該 simple command 的 envp）才套用。
+  // 多筆由右至左套用（記錄時的跨度不受後續右側附加影響）。
+  let pendingEnv: { start: number; end: number; rep: string }[] = [];
   // token 追蹤：判斷 cmd 是否在「指令位置」（可執行處），避免改到字面資料
   let curTok = "";
   let prevTok = "";
@@ -471,6 +597,22 @@ function scanBash(command: string): BashScanResult {
     cmdFlagZone = false;
   };
 
+  // 套用暫存的前綴賦值改寫。gate：轉換層沒被 MSYS_NO_PATHCONV 關閉＝原生
+  // 會自己轉，不改（重複防護），此時直接丟掉暫存、不套用。
+  const applyPendingEnv = () => {
+    if (!pendingEnv.length) return;
+    if (!pathConvDisabled()) {
+      pendingEnv = [];
+      return;
+    }
+    for (let k = pendingEnv.length - 1; k >= 0; k--) {
+      const r = pendingEnv[k]!;
+      out = out.slice(0, r.start) + r.rep + out.slice(r.end);
+    }
+    envPathFixed = true;
+    pendingEnv = [];
+  };
+
   const commitTok = () => {
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
@@ -487,6 +629,23 @@ function scanBash(command: string): BashScanResult {
     // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok)) cmdFlagZone = true;
+    // 前綴賦值路徑改寫的暫存／套用：賦值 token（整詞未引號、值可轉換）在
+    // 指令位置 → 暫存；非賦值、非語法關鍵字的 token 在指令位置落地 ＝
+    // simple command 的指令字 → 此時暫存賦值確定會進它的 envp，套用。
+    // prevTokCmdPos 此時仍是本 token 的位置（commitTok 開頭賦的值）。
+    if (prevTokCmdPos) {
+      // 賦值判定與 keeper/EOF 一致（含空值 B=）：空值賦值既不暫存（無可轉換
+      // 值）也不觸發套用——套用必須是「真指令字」（見 BUILTIN_WORD 註解）
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok)) {
+        const em = /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok);
+        if (em) {
+          const conv = convertEnvPath(em[2]!);
+          if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
+        }
+      } else if (!RESERVED_WORD.test(curTok) && !BUILTIN_WORD.test(curTok) && !/^\d+$/.test(curTok)) {
+        applyPendingEnv();
+      }
+    }
     prevTok = curTok;
     curTok = "";
   };
@@ -508,6 +667,7 @@ function scanBash(command: string): BashScanResult {
         const sub = scanBash(seg.slice(k + 2, close));
         s += "$(" + sub.command + ")";
         cmdFlagFixed ||= sub.cmdFlagFixed;
+        envPathFixed ||= sub.envPathFixed;
         k = close + 1;
         continue;
       }
@@ -524,6 +684,7 @@ function scanBash(command: string): BashScanResult {
         const sub = scanBash(seg.slice(k + 1, p));
         s += "`" + sub.command + "`";
         cmdFlagFixed ||= sub.cmdFlagFixed;
+        envPathFixed ||= sub.envPathFixed;
         k = p + 1;
         continue;
       }
@@ -635,6 +796,7 @@ function scanBash(command: string): BashScanResult {
         inHeader = true;
         out += m[0];
         i += m[0].length;
+        pendingEnv = []; // heredoc 重導向＝賦值沒接指令字（A=x <<EOF 是 standalone）→ 丟棄
         continue; // 標記行同列的重導向照常掃描（cmd 旗標偵測仍需要）
       }
     }
@@ -643,6 +805,7 @@ function scanBash(command: string): BashScanResult {
       if (ch === "\n") {
         cmdPosNext = true; // 新的一行：上一行的 cmd 不能授權本行的改寫
         clearTok();
+        pendingEnv = []; // 新指令列＝賦值沒接指令字（standalone）→ 丟棄
       }
       out += ch;
       i++;
@@ -652,6 +815,10 @@ function scanBash(command: string): BashScanResult {
       commitTok();
       // 只有 `;;` 會把 body 拉回樣式區；單一 `;` 只是 body 內的指令分隔
       if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") caseRegion = "pattern";
+      // 管線／指令結束＝前綴賦值沒接上指令字（standalone）→ 丟棄。`(` 不丟：
+      // 緊貼的 VAR=/c/x$(…) 是賦值值的動態組合（見函式頭註解）；A=x (…) 是
+      // syntax error，沒有需要保守的合法形。
+      if (ch === "|" || ch === ";") pendingEnv = [];
       if (ch === "(") {
         // cmdPosNext 此時是 commit 後的值：`count=$(` 會被 assignment 前綴保
         // 留在 true，`$(` 則已被 commit 成一個普通 word → false（天然分流）
@@ -671,6 +838,7 @@ function scanBash(command: string): BashScanResult {
       if (command[i - 1] !== ">" && command[i - 1] !== "<") {
         clearTok();
         cmdPosNext = true; // 2>&1 的 & 不是分隔符
+        pendingEnv = []; // 背景分離＝賦值沒接指令字（standalone）→ 丟棄
       }
       out += ch;
       i++;
@@ -678,6 +846,7 @@ function scanBash(command: string): BashScanResult {
     }
     if (ch === ")" || ch === ">" || ch === "<") {
       commitTok();
+      let restoreTrue = false;
       if (ch === ")") {
         if (caseRegion === "pattern") {
           // 樣式終止：不 pop（防止偷走外層 $( 的堆疊項），重開命令位置並進 body
@@ -687,10 +856,16 @@ function scanBash(command: string): BashScanResult {
           // 還原這個括號對應的位置；stack 空就維持現況
           const restore = parenRestore.pop();
           if (restore !== undefined) cmdPosNext = restore;
+          restoreTrue = restore === true;
         }
       }
       // 重導向目標由 bash 自己開檔（不經被關掉的 argv 轉換層），`)` 也結束該指令：
-      // 兩者都清掉指令上下文，否則下一個詞會被當旗標改寫成資料/路徑
+      // 兩者都清掉指令上下文，否則下一個詞會被當旗標改寫成資料/路徑。
+      // 同時丟棄暫存賦值（A=x > log node 這種交錯形列為漏修：重導向後掃描器
+      // 已當參數區，見上「重導向之後不延續」）。例外：`$(` 關閉且還原到指令
+      // 位置＝緊貼形 A=/c/x$(…) 的值組合還沒收尾——賦值仍在等後面的真指令字
+      //（內建的 pwd/echo 等已不再觸發套用），這個 `)` 不丟，讓暫存流到指令字。
+      if (!restoreTrue) pendingEnv = [];
       clearTok();
       out += ch;
       i++;
@@ -739,11 +914,26 @@ function scanBash(command: string): BashScanResult {
       i++;
       continue;
     }
+    // bash 註解（# 在詞首——bash 只在詞首認註解）：註解讓前綴賦值收尾成
+    // standalone（`A=/c/x # c` 是 shell 變數賦值、值不進任何 envp，原生也
+    // 不轉換）→ 丟棄暫存；丟棄要在 # 這個詞自己 commit 之前（詞首 # 在指令
+    // 位置會被當指令字觸發套用）。詞中的 #（a#b）不是註解，照常掃描；
+    // 註解內容照一般掃描——資料位置不會誤觸改寫， # 後面的指令字若真被
+    // 授權也只落在永不執行的死文字上。
+    if (ch === "#" && curTok === "") {
+      pendingEnv = [];
+    }
     curTok += ch;
     out += ch;
     i++;
   }
-  return { command: out, cmdFlagFixed };
+  // EOF：檔尾 token 沒有分隔符觸發 commit——真指令字落在檔尾時前綴賦值一樣
+  // 要套用（A=/c/x cmd 的 cmd 就是這種）。賦值（含空值）、語法關鍵字、
+  // 內建、純數字詞＝收尾 standalone → 丟棄；參數位置照舊不套用。
+  if (curTok && cmdPosNext && !RESERVED_WORD.test(curTok) && !BUILTIN_WORD.test(curTok) && !/^\d+$/.test(curTok) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(curTok)) {
+    applyPendingEnv();
+  }
+  return { command: out, cmdFlagFixed, envPathFixed };
 }
 
 // ===== 使用統計 =====
@@ -754,7 +944,11 @@ function scanBash(command: string): BashScanResult {
 //        統計範圍＝外掛實際作用的範圍）
 //   分子  fixes[key]——真的改寫才 +1，以故障點為 key；同性質的
 //        variant 合併（/tmp、$TEMP、${TEMP}、%TEMP% 都是 "path.temp"；
-//        //c、多旗標都是 "shell.cmdFlag"），不同類型分開。
+//        //c、多旗標都是 "shell.cmdFlag"；前綴賦值的盤符與 /tmp 形都是
+//        "shell.envPath"），不同類型分開。三個鍵對應三個不同故障層：host
+//        工具路徑解析層、msys argv 旗標轉換層、msys envp 賦值值轉換層
+//        （後兩者根因同為 MSYS_NO_PATHCONV，但失敗模式與修法不同，合併會
+//        看不出哪層在觸發）。
 // 儲存：pi 不提供 per-extension 儲存 API（docs/extensions.md 的 State 段：
 // session 外的資料＝external storage，由擴充自選），所以放 pi 自己的
 // agent 目錄——getAgentDir() 是 pi 官方匯出的路徑（吃 PI_CODING_AGENT_DIR
@@ -929,6 +1123,14 @@ export default function (pi: ExtensionAPI) {
           notifyUI(
             ctx,
             "env-guard: cmd //c flag rewritten to /c (MSYS_NO_PATHCONV is set, so msys path conversion is off and //c would start an interactive cmd)",
+            "info",
+          );
+        }
+        if (r.envPathFixed) {
+          bumpFix("shell.envPath");
+          notifyUI(
+            ctx,
+            "env-guard: env assignment path rewritten (MSYS_NO_PATHCONV is set, so msys env conversion is off and POSIX values would reach the program verbatim, e.g. /c/foo resolving to C:\\c\\foo)",
             "info",
           );
         }
