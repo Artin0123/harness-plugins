@@ -429,6 +429,30 @@ const hdSpacesSq = "cat <<'END OF FILE'\ncmd //c ver\nEND OF FILE";
 check('P: quoted delimiter with spaces recognised', bc(hdSpacesSq).command === hdSpacesSq, JSON.stringify(bc(hdSpacesSq).command));
 const hdSpacesDq = 'cat <<"END OF FILE"\ncmd //c ver\nEND OF FILE';
 check('P: double-quoted delimiter recognised', bc(hdSpacesDq).command === hdSpacesDq, JSON.stringify(bc(hdSpacesDq).command));
+// 數字開頭的未引號定界符是合法 bash heredoc（實測 `<<2EOF` / `<<-2ND` /
+// `<< 2EOF` / `<<\2X` / 巢狀）——此前第一字限字母，本體被當指令掃描、
+// `cmd //c` 被改成 `cmd /c`（live 實測：pi bash 工具拿到的本體真的變了）。
+// 現在與 oc 同形（`\d*[A-Za-z_…]`）：本體保真。
+for (const [label, text] of [
+  ['digit-head delimiter <<2EOF', 'cat <<2EOF\ncmd //c ver\n2EOF'],
+  ['digit-head with dash <<-2ND', 'cat <<-2ND\n\tcmd //c ver\n\t2ND'],
+  ['space before digit-head << 2EOF', 'cat << 2EOF\ncmd //c ver\n2EOF'],
+  ['escaped digit-head <<\\2X', String.raw`cat <<\2X` + '\ncmd //c ver\n2X'],
+  ['nested digit-head heredocs', 'cat <<2X\ncat <<2Y\ncmd //c ver\n2Y\n2X'],
+]) {
+  check(`P: ${label} keeps the body literal`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
+// 已知邊界（誤修、有機頻率 ~0）——這幾條 pin 的是「現況」不是「正確」：第一字
+// 不是數字/字母/底線的定界符實測也合法（`<<*X`、`<<.E`），純數字 `<<3` 同；
+// 辨識不到→本體被當指令掃描。放寬第一字會把 `$((x<<$y))` 誤判成 heredoc，
+// 兩個方向的猜測都只有副作用，所以留著並釘住，哪天動了會在這裡看到。
+check('P: BOUNDARY <<*X body is currently scanned', bc('cat <<*X\ncmd //c ver\n*X').command === 'cat <<*X\ncmd /c ver\n*X', JSON.stringify(bc('cat <<*X\ncmd //c ver\n*X').command));
+check('P: BOUNDARY <<3 body is currently scanned', bc('cat <<3\ncmd //c ver\n3').command === 'cat <<3\ncmd /c ver\n3', JSON.stringify(bc('cat <<3\ncmd //c ver\n3').command));
+// 反方向的邊界（漏修、安全方向）：`$((1<<N))` 的識別字運算元被當 heredoc 開頭、
+// 等不到定界符 → 換行後整段不再改寫（實測：後面的 `cmd //c` 保持原樣、live
+// 是靜默 banner）。同形不可分（`<<3` 也是合法 heredoc），記臺帳不補貼。
+const shiftIdent = 'echo $((1<<SHIFT))\ncmd //c ver';
+check('P: BOUNDARY arithmetic <<NAME leaves the next line unrewritten', bc(shiftIdent).command === shiftIdent, JSON.stringify(bc(shiftIdent).command));
 
 // --- rewriteBashCommand: token state must not leak out of substitutions ---
 // Measured in bash: in `echo `y` cmd …` the substitution IS the command word, so
@@ -550,6 +574,10 @@ const misses = [
   'cmd//k',
   '"cmd"//c ver',
   'x=1 cmd//c ver',
+  // 未引號詞尾的成對反斜線：bash 縮成一層再讓它跳脫分隔符，程式名是 `cmd\`
+  // （實測 rc 127、兩種轉換狀態同）——不是指令字。此前 isCmdTok 去反斜線後
+  // 命中而改寫 `//c`＝零效應改寫（文字有變、行為一樣）；現在與 oc 同守門
+  'cmd\\\\ //c ver',
   // 反斜線換行續接：跳脫對被併進 token、指令字身分失效（實測：轉換開＝
   // 續接後 //c 轉成 /c 真跑；本機＝banner 靜默 exit 0）→ 漏修臺
   'cmd \\\n//c ver',
