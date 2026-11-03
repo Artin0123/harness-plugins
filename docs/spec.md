@@ -522,7 +522,13 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   本體原樣。即修法已同源驗證，但 pi host 的 live 端到端（pi 的 tool_call hook
   → spawn 管道）未做 → 依「每 host 重新量過才留」pi 版未動，記臺帳待補：下次
   pi session 用同一例子（`cat <<2EOF` 餵 bash 工具、看本體是否保真）過端到端
-  再移植＋釘樁；**純數字定界符 `<<3`
+  再移植＋釘樁。移植範圍＝**只動 heredoc 正則那一行**（與 oc 同形，原文照抄
+  `oc-plugins/env-guard/index.ts` 的 `heredoc` 常數及其註解）：pi 的
+  `cmdFlag` 已有 `!== "/"` 閘，不要一併動它；正則**上方**的註解同時寫死
+  「起始字仍限字母/底線」，移植時要一併改（oc 版的寫法可照抄）；電池補三條
+  pin（`<<2EOF`／`<<-2ND`／`<<EOF2` 本體保真，形狀照
+  `oc-plugins/tests/env-guard/index.mjs` 的同區塊）並保留 `$((1<<2))` 算術
+  pin；**純數字定界符 `<<3`
   刻意不認**：與算術左移 `$((x<<2))` 靜態同形無法分辨（`<<3` 實測也是合法
   heredoc），算術救不了那一側、heredoc 救不了這一側，有機頻率兩側皆 ~0，
   記為邊界（電池釘 `<<2EOF` 認得、`$((1<<2))` 算術兩條）。
