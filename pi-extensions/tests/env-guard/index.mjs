@@ -750,18 +750,16 @@ const noCap = await import(pathToFileURL(join(noCapScratch, 'index.ts')).href);
 check('P: host without getShellConfig -> gate off', noCap.pathConvDisabled() === false, JSON.stringify(noCap.pathConvDisabled()));
 check('P: host without getShellConfig -> cmd untouched', noCap.rewriteBashCommand('cmd //c ver').command === 'cmd //c ver', JSON.stringify(noCap.rewriteBashCommand('cmd //c ver').command));
 check('P: host without getShellConfig -> anchor falls back to the tmpdir fact', noCap.realTempDir() === mod.realTempDir() || noCap.realTempDir() === null, JSON.stringify(noCap.realTempDir()));
-// 默默 inert 看不出原因——第一次 tool_call 要通知一次（且只一次）
+// 宿主缺 getShellConfig 時完全 inert：不改寫、不拋。UI 提示已移除（那是給人
+// 看的、對 agent 沒有作用），所以不再有「第一次呼叫通知一次」的行為——這幾條
+// 釘住的是「拿掉提示之後行為不變」。
 const noCapHooks = [];
 noCap.default({on: (ev, fn) => noCapHooks.push([ev, fn]), getSettings: () => ({})});
 const noCapToolCall = noCapHooks.find(([e]) => e === 'tool_call')?.[1];
-const notes = [];
-const noteCtx = {hasUI: true, ui: {notify: (m, l) => notes.push([m, l])}};
 const noCapInput = {command: 'cmd //c ver'};
-noCapToolCall({toolName: 'bash', input: noCapInput}, noteCtx);
-check('P: host gap announced on the first tool call', notes.length === 1 && /getShellConfig/.test(notes[0][0]), JSON.stringify(notes));
+noCapToolCall({toolName: 'bash', input: noCapInput}); // 不傳 ctx 也不能拋
 check('P: host gap leaves the command untouched', noCapInput.command === 'cmd //c ver', JSON.stringify(noCapInput.command));
-noCapToolCall({toolName: 'bash', input: {command: 'cmd //c ver'}}, noteCtx);
-check('P: host gap announced only once', notes.length === 1, JSON.stringify(notes));
+check('P: host gap handler does not throw without a ctx', (() => { try { noCapToolCall({toolName: 'bash', input: {command: 'cmd //c ver'}}, {}); return true; } catch { return false; } })());
 rmSync(noCapScratch, {recursive: true, force: true});
 
 // --- E2E: parity with the native conversion layer (envp family) ---
@@ -833,7 +831,7 @@ mod.default({ getSettings: () => ({}), on: (ev, fn) => registered.push([ev, fn])
 const toolCall = registered.find(([e]) => e === 'tool_call')?.[1];
 const shutdown = registered.find(([e]) => e === 'session_shutdown')?.[1];
 check('S: session_shutdown flush registered', typeof shutdown === 'function', JSON.stringify(registered.map(([e]) => e)));
-const uiCtx = { hasUI: false, ui: { notify: () => {} } };
+const uiCtx = {}; // 通知已移除：ctx 不再被讀，傳空物件就好
 toolCall({ toolName: 'read', input: { path: '/tmp/x' } }, uiCtx);
 toolCall({ toolName: 'read', input: { path: '$TEMP/y' } }, uiCtx); // 同一個 temp 修復、不同故障點
 toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx);

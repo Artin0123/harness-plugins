@@ -67,8 +67,8 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   `settings.shellPath` 指到不存在的檔（getShellConfig 對它會 throw）→ 整體
   inert。**宿主版本耦合**：`getShellConfig` 自 pi **0.48.0** 起才 export
   （CHANGELOG #766），舊宿主上 import 是 `undefined`——擴充以
-  `typeof getShellConfig === "function"` 檢查，不成立就整體停用，並在第一次
-  工具呼叫時 `notify` 一次（默默 inert 看不出原因）。
+  `typeof getShellConfig === "function"` 檢查，不成立就整體停用（完全不改寫；
+  早期版本會在第一次工具呼叫時 `notify` 一次，2026-11-03 移除）。
 - `cmd //c` / `//k`：bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動
   模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗
   不改寫。**實測**：pi 的 bash 經 `BASH_ENV` 一樣載入 bashrc、病理重現——banner 與
@@ -407,8 +407,9 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   ，記臺帳待補（詳見〈掃描器要點〉heredoc 段）；oc 電池 +3 釘。
 - **統計與改寫同源**：oc 的 temp 分類只有一份 `TEMP_FAMILIES`／`splitTempPath`，
   `rewritePathFix` 一次回傳值＋機制；`glob`／`patch`／`workdir` 都用同一份結果。
-  `bumpFix` 只在值真的變了的分支呼叫；`bumpTool` 是分母，不是修復。oc 沒有 UI
-  通知，因此不存在「只提示、不改寫」的分支。
+  `bumpFix` 只在值真的變了的分支呼叫；`bumpTool` 是分母，不是修復。兩個 host
+  都不再有 UI 通知（pi 早期版本會 `ctx.ui.notify` 提示，2026-11-03 依「提示是給
+  人看的、對 agent 沒有作用」移除），因此不存在「只提示、不改寫」的分支。
 順帶把「計數與改寫可能脫鉤」的來源清掉（這正是「只寫提示／統計、對改寫沒影響」
 那類 bug 的溫床）：
 
@@ -423,10 +424,9 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   `classifyTempFix(...) ?? "path.tempVar"` 那個 fallback 原本會把「未分類的
   改寫」悄悄記成 tempVar（今天到不了、以後可能誤導），改成 `?? "path.other"`
   ——到得了就看得見。
-- 只有 `hostGap` 的通知是「純資訊」——它是宿主能力缺失時的一次性警告，不是
-  修復，程式與文件都照這樣標示。
-
-通知前綴 `env-guard:`；改寫時用 `ctx.ui.notify` 告知，不擋工具執行。
+- 通知一律移除（2026-11-03）：`path`／`cmdFlag`／`envPath` 的改寫提示與
+  `hostGap` 的一次性警告都只給人看、對 agent 沒有作用。統計與改寫不受影響，也
+  沒有「只提示、不改寫」的分支；統計檔是唯一的外部觀測點。
 
 ## oc 版：安裝形態與體積（v2.2.5 實測）
 
@@ -538,8 +538,9 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   本體內的 `cmd //c` 遭改寫（＝資料改寫）。**兩個 host 現在都是這條正則**：pi
   於 2026-11-03 移植，依據是 live 端到端證據（安裝中的 0.6.3 用 bash 工具跑
   `cat <<2EOF…`，本體輸出真的是 `cmd /c ver`，`<<'EOF'` 對照組保真）＋拋棄式
-  副本改同一行後的對照（本體保真、`$((1<<2))` 算術與 `<<<` 行為不變、pi 電池
-  362 綠）；待辦只剩「patch 上到安裝副本後重啟做一輪 live 複驗」。
+  副本改同一行後的對照（本體保真、`$((1<<2))` 算術與 `<<<` 行為不變、電池
+  全綠）；patch 上到安裝副本後已 live 複驗（0.6.5：`cat <<2EOF` 本體保真、
+  `<<3` 仍掃、`cmd\\` 不觸發改寫）。
   **兩個靜態邊界（兩 host 同）：**
   - 第一字非數字/字母/底線的定界符（實測合法：`* . : = $ [ ] / @ + % ^ , ~ ! ? { }`）
     與純數字 `<<3` 不認——本體會被當指令掃描（＝資料改寫，是誤修不是漏修）。
@@ -848,4 +849,5 @@ persisted 往返與 read-modify-write、畸形資料、壞 storage 韌性。
 spawn）。這才真正驗證「改寫規則 ≡ MSYS 的轉換規則」（`/tmp` 錨點也因此被釘住：
 改寫後的值必須等於 MSYS 自己轉出的值）。cmd //c 家族不在此列（互動模式會掛，
 而且那是旗標不是 envp）。另外兩個刻意另開的模組副本：沒有 `getShellConfig`
-的舊宿主（驗證整體 inert ＋通知一次）、worker 場景（無錨點／探測開關）。
+的舊宿主（驗證整體 inert、handler 不拋、不傳 ctx 也行）、worker 場景（無錨點／
+探測開關）。

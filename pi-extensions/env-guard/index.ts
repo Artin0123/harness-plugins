@@ -76,12 +76,6 @@ let tempAnchor: string | null | undefined; // undefined＝尚未探測；null＝
 // 改寫停用、錨點退 os.tmpdir()——與 pi 真的 spawn 該 shell 的原生行為一致。
 let configuredShell: (() => string | undefined) | null = null;
 let probeShellCache: string | null | undefined;
-// 宿主能力缺失的紀錄（只在 tool_call 的第一個呼叫通知一次）：pi 的
-// getShellConfig 自 0.48.0 起才 export（CHANGELOG #766）。舊宿主上 import 會是
-// undefined → 下面丟錯被吞、整體 inert——依「閘門失敗一律停用」正確，但
-// 默默停用看不出原因，所以記下來在第一次工具呼叫時告知。
-let hostGap: string | null = null;
-let hostGapNotified = false;
 
 export function setConfiguredShell(fn: () => string | undefined): void {
   configuredShell = fn;
@@ -92,7 +86,6 @@ function probeShell(): string | null {
   probeShellCache = null;
   if (typeof getShellConfig !== "function") {
     // 舊 pi（< 0.48.0）沒這個 export：探測對象不可得＝不改寫（寧可漏修）
-    hostGap = "this pi version does not export getShellConfig (needs >= 0.48.0); shell probe disabled, so no rewriting";
     return probeShellCache;
   }
   try {
@@ -1047,18 +1040,9 @@ function bumpFix(key: string): void {
   flushStats(); // 分子低頻：立即落盤
 }
 
-const notifyUI = (ctx: { hasUI: boolean; ui: { notify: (msg: string, level?: string) => void } }, msg: string, level: string) => {
-  if (!ctx.hasUI) return;
-  try {
-    ctx.ui.notify(msg, level);
-  } catch {
-    try {
-      ctx.ui.notify(msg, "info");
-    } catch {
-      /* 通知失敗不影響工具執行 */
-    }
-  }
-};
+// 刻意不呼叫 ctx.ui.notify：那些提示是給人看的、對 agent 沒有作用（使用者指示
+// 移除；統計與改寫照舊）。宿主能力缺失的情形仍然整體 inert（probeShell 回 null
+// → 不改寫），只是不再往外丢訊息。
 
 export default function (pi: ExtensionAPI) {
   // 故障點全部是 Windows 的（host 端路徑解析、MSYS 轉換層）：非 Windows 整個擴充
@@ -1078,20 +1062,8 @@ export default function (pi: ExtensionAPI) {
   // session 結束：把分母 debounce 還沒寫出的部分補冲
   pi.on("session_shutdown", () => flushStats());
 
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", (event) => {
     const name = event.toolName;
-
-    // 宿主能力缺失（見 hostGap）：默默 inert 看不出原因 → 第一次呼叫告知一次。
-    // 先跑一次探測（単次快取）讓第一次呼叫就能判斷，而不是拖到第二次
-    if (!hostGapNotified) {
-      pathConvDisabled();
-      if (hostGap) {
-        hostGapNotified = true;
-        notifyUI(ctx, `env-guard: disabled — ${hostGap}`, "warning");
-      } else {
-        hostGapNotified = true; // 能力正常：不必再檢查
-      }
-    }
 
     // write / edit / read / grep / find / ls：改寫 path 參數
     //（grep/find/ls 同樣是 host 端解析（resolveToCwd），/tmp/$TEMP 也會出事，
@@ -1102,16 +1074,10 @@ export default function (pi: ExtensionAPI) {
       if (typeof input?.path === "string") {
         const fix = rewritePathFix(input.path);
         if (fix.value !== input.path) {
-          const from = input.path;
           input.path = fix.value;
           // kind 與值同源（rewritePathFix 只在 splitTempPath 命中時改值）——萬一
           // 以後新增了不屬於 temp 族的改寫，會落在 path.other，不會混進別人的鍵
           bumpFix(fix.kind ?? "path.other");
-          notifyUI(
-            ctx,
-            `env-guard: path rewritten ${from} -> ${fix.value}`,
-            "info",
-          );
         }
       }
       return;
@@ -1127,22 +1093,8 @@ export default function (pi: ExtensionAPI) {
         if (r.command !== input.command) {
           input.command = r.command;
         }
-        if (r.cmdFlagFixed) {
-          bumpFix("shell.cmdFlag");
-          notifyUI(
-            ctx,
-            "env-guard: cmd //c flag rewritten to /c (MSYS_NO_PATHCONV is set, so msys path conversion is off and //c would start an interactive cmd)",
-            "info",
-          );
-        }
-        if (r.envPathFixed) {
-          bumpFix("shell.envPath");
-          notifyUI(
-            ctx,
-            "env-guard: env assignment path rewritten (MSYS_NO_PATHCONV is set, so msys env conversion is off and POSIX values would reach the program verbatim, e.g. /c/foo resolving to C:\\c\\foo)",
-            "info",
-          );
-        }
+        if (r.cmdFlagFixed) bumpFix("shell.cmdFlag");
+        if (r.envPathFixed) bumpFix("shell.envPath");
       }
     }
   });
