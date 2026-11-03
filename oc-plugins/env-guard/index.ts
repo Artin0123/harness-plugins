@@ -67,9 +67,21 @@
 //     //c ver` (bare `time` is a covered keyword, but `-p` ends the
 //     position -- measured, same silent failure; organic frequency ~0);
 //     `function NAME { … }` bodies (the name slot is not tracked; `f() { … }`
-//     is tracked and works);
+//     is tracked and works); ANSI-C command words (`$'cmd' //c` -- the scanner
+//     copies $'...' as data and does not decode it into a command name);
+//     `coproc cmd //c` (not a covered command-position keyword); a redirect
+//     written BEFORE the command word (`> log cmd //c`, `> log A=/c/x node`
+//     -- the target ends the position; tracking "this simple command already
+//     has a command word" was judged not worth the state for ~0 frequency);
+//     `+=` assignment values (`A+=/c/x node`: native converts the FINAL
+//     per-variable value, so a per-token rewrite diverges when another
+//     assignment to the same name precedes it);
 //     POSIX path arguments of native programs; envp residual value shapes
 //     (see the scanner section and spec.md "envp 殘餘形").
+//   HEREDOC words whose delimiter needs quote-removal/ANSI-C decoding
+//     (escaped quoted forms, concatenated words like <<E"OF"): the scanner
+//     cannot reproduce the terminator line, so it returns the WHOLE command
+//     unchanged -- an inert miss, never a body rewrite.
 //   cmd's GBK mojibake is its own case: the host's UTF-8 decode differs
 //     from what a native terminal prints (strictly return != native =
 //     漏修), but the faithful fix lives in the host's decode layer -- out
@@ -271,6 +283,18 @@ function probeNoPathConv(bash: string): boolean {
   }
 }
 
+// A run of backslashes in the command string is folded once by the host's
+// spawn channel (`\\` -> `\`) BEFORE bash parses it. `escapesNext` is whether
+// the folded run has odd length -- i.e. whether bash sees the following
+// character as escaped. Callers copy the ORIGINAL run verbatim and, when true,
+// also copy/skip the escaped character so it is not mistaken for an opener,
+// closer, or separator.
+function backslashRun(s: string, i: number): { end: number; escapesNext: boolean } {
+  let j = i;
+  while (s[j] === "\\") j++;
+  return { end: j, escapesNext: (Math.ceil((j - i) / 2) & 1) === 1 };
+}
+
 // In s, index of the ")" matching the "$(" in front of `from`; -1 if absent.
 // Understands bash nesting: quotes reopen context, but $( ) and backticks
 // still execute inside double quotes; single quotes are fully literal.
@@ -279,7 +303,11 @@ function matchParen(s: string, from: number): number {
   let i = from;
   while (i < s.length) {
     const c = s[i];
-    if (c === "\\") { i += 2; continue; }
+    if (c === "\\") {
+      const run = backslashRun(s, i);
+      i = run.end + (run.escapesNext ? 1 : 0);
+      continue;
+    }
     if (c === "'") {
       let p = i + 1;
       while (p < s.length && s[p] !== "'") p++;
@@ -289,7 +317,11 @@ function matchParen(s: string, from: number): number {
     if (c === '"') {
       let p = i + 1;
       while (p < s.length && s[p] !== '"') {
-        if (s[p] === "\\") { p += 2; continue; }
+        if (s[p] === "\\") {
+          const run = backslashRun(s, p);
+          p = run.end + (run.escapesNext ? 1 : 0);
+          continue;
+        }
         if (s[p] === "$" && s[p + 1] === "(") {
           const cl = matchParen(s, p + 2);
           if (cl === -1) return -1;
@@ -299,7 +331,11 @@ function matchParen(s: string, from: number): number {
         if (s[p] === "`") {
           let q = p + 1;
           while (q < s.length && s[q] !== "`") {
-            if (s[q] === "\\") q++;
+            if (s[q] === "\\") {
+              const run = backslashRun(s, q);
+              q = run.end + (run.escapesNext ? 1 : 0);
+              continue;
+            }
             q++;
           }
           p = q + 1;
@@ -477,24 +513,88 @@ function convertEnvPath(v: string): string | null {
   return null;
 }
 
+// A heredoc opener's delimiter word, read with bash's quote-removal rules.
+// Returns the header length + delimiter + <<- marker, or:
+//   null   = not a heredoc spelling we track (arithmetic shift, here-string,
+//            or an ambiguous unquoted word: pure digits / leading punctuation)
+//   "bail" = a legal heredoc word whose delimiter cannot be decoded statically
+//            (quoted form containing backslash escapes, quoted/unquoted word
+//            concatenation). The caller then leaves the WHOLE command
+//            unchanged: rewriting inside a body is silent data corruption,
+//            a missed fix is the safe direction (寧可漏修，不可誤修).
+// Delimiters are bash WORDS, not just identifiers: quoted content may contain
+// spaces; `$'...'`/`$"..."` are legal too; an unquoted word may carry digits
+// after a letter/_/non-ASCII head (`<<2EOF`, `<<EOF.v2`), while a pure-digit or
+// ASCII-punctuation head stays untracked (it is statically indistinguishable
+// from `$((x<<2))` -- docs/spec.md records the boundary).
+type HeredocHead = { len: number; delim: string; dash: boolean };
+function readHeredocHead(s: string, from: number): HeredocHead | "bail" | null {
+  let i = from + 2;
+  const dash = s[i] === "-";
+  if (dash) i++;
+  while (s[i] === " " || s[i] === "\t") i++;
+  // Leading backslash run before the word: the transport fold + lexer make
+  // 1-2 backslashes a quote marker (`<<\EOF` / `<<\\EOF` -> delimiter EOF), a
+  // longer run leaves a literal backslash in the word. Anything past two is
+  // not reproducible here -> bail (never scan a body).
+  const lead = backslashRun(s, i);
+  const marker = lead.end > i;
+  if (marker) {
+    if (lead.end - i > 2) return "bail";
+    i = lead.end;
+  }
+  const c = s[i];
+  if (marker && (c === "'" || c === '"' || c === "$")) return "bail"; // <<\'x' etc.
+  const ansi = c === "$" && (s[i + 1] === "'" || s[i + 1] === '"');
+  const quote = ansi ? s[i + 1] : c;
+  if (quote === "'" || quote === '"') {
+    const start = ansi ? i + 2 : i + 1;
+    let j = start;
+    let escaped = false;
+    while (j < s.length && s[j] !== quote) {
+      if (s[j] === "\n") return "bail";
+      // Backslash escapes the closing quote in double quotes and in ANSI-C
+      // quotes; in a plain single-quoted word it is an ordinary character.
+      if ((quote === '"' || ansi) && s[j] === "\\") {
+        const run = backslashRun(s, j);
+        escaped = true;
+        j = run.end + (run.escapesNext ? 1 : 0);
+        continue;
+      }
+      j++;
+    }
+    if (j >= s.length) return "bail";
+    if (escaped) return "bail"; // quote removal changes the delimiter: do not guess
+    // A quoted word can continue with more chars (`<<"A"B`, `<<'A'/x`,
+    // `<<'A'#x`): the delimiter is the concatenation, not the quoted part.
+    // Only a real separator ends a heredoc word.
+    if (!/[\s;&|<>()]/.test(s[j + 1] ?? " ")) return "bail";
+    // The spawn channel folds each `\\` pair BEFORE bash sees the line, and a
+    // plain single-quoted word is otherwise literal. Fold the content so the
+    // body's terminator comparison uses the same bytes bash receives.
+    const content = s.slice(start, j);
+    const delim = quote === "'" && !ansi ? content.replace(/\\\\/g, "\\") : content;
+    return { len: j + 1 - from, delim, dash };
+  }
+  const m = /^(\d*[A-Za-z_\u0080-\uFFFF][^\s"'><;&|()\\`]*)/.exec(s.slice(i));
+  if (!m) return null;
+  const end = i + m[1].length;
+  // A following quote/backslash continues the same word after quote removal
+  // (`<<E"OF"`, `<<E\OF`): the literal prefix is not the delimiter.
+  if (s[end] === "\\" || s[end] === '"' || s[end] === "'") return "bail";
+  return { len: end - from, delim: m[1], dash };
+}
+
 function scanBash(command: string, convOff = false): BashScanResult {
-  // group 1: the <<- dash; group 2: the backslash of <<\EOF (literal body);
-  // the delimiter is a bash WORD, quoted (any content, quotes stripped --
-  // the terminator line compares bare, like bash) or unquoted and free of
-  // shell metacharacters carrying a LETTER or _ in the word (a digit HEAD
-  // is legal: `<<2EOF` is a legal bash heredoc -- before this the body was
-  // tokenized and the body's `cmd //c` became data corruption; `EOF2` was
-  // already legal), while a PURE-digit delimiter (`<<2`) stays
-  // unrecognized: statically indistinguishable from the arithmetic shift
-  // `$((x<<2))` (measured legal heredoc too) -- organic frequency ~0,
-  // recorded in docs/spec.md as a boundary
-  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\d*[A-Za-z_][^\s"'><;&|()\\`]*))/y; // sticky, anchored at lastIndex
+  // heredoc bodies are data: one queue entry per opener on the current header
+  // line, consumed in bash's order (multiple heredocs on one line are legal:
+  // `cat <<A <<B` -- a single-slot tracker ended the first body at a line
+  // equal to B and rewrote the second body's `cmd //c`, measured corruption).
+  const heredocs: { delim: string; dash: boolean }[] = [];
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.\-/])/iy; // cmd flags are alphabetic and never cross a "/": /v:on keeps its colon tail, and a "/" after the flag word means no flag spelling at all (UNC `//server/share`, `//c/d/e` -- a "/" in the terminator class keeps them unrewritten; a following "//" pair is blocked by the non-empty curTok, measured)
   let out = "";
   let i = 0;
   const n = command.length;
-  let pendingDelim: string | null = null;
-  let pendingDash = false; // <<- (strips leading TABS from terminator lines)
   let inHeader = false;
   // token tracking: only rewrite flags of a cmd in COMMAND position, never
   // literal data (`echo cmd //c` stays verbatim)
@@ -592,14 +692,16 @@ function scanBash(command: string, convOff = false): BashScanResult {
   let caseRegion: "none" | "pattern" | "body" = "none";
   let casePending = false; // saw "case", waiting for the case's "in"
 
-  // A cmd token is recognised by basename. Unquoted words go through the
-  // host's `-c` operand fold plus bash's escape rules: a paired `\\` in the
-  // command string collapses to one backslash before bash, and the unquoted
-  // lexer removes the remaining escape pair -- the net effect is that ALL
-  // backslashes disappear (`\cmd`/`c\md` -> cmd = real; `C:\Windows\…` and
-  // `C:\\Windows\\…` -> C:Windows… = not a program, native 127). Removing them
-  // for the comparison models that pipeline (pi's rule; measured on this
-  // host). A QUOTED word is different: backslashes are literal, and MSYS
+  // A cmd token is recognised by basename. Unquoted words pass through TWO
+  // layers on this host (both measured live 2026-11-04): the spawn channel
+  // folds each `\\` pair to one backslash, then bash's unquoted lexer removes
+  // one more escape level. So event.command `C:\Windows\…` (1) and
+  // `C:\\Windows\\…` (2) both end up as C:Windows… (127, untouched), while 3/4
+  // backslashes end up as C:\Windows\… (a REAL program that runs cmd) and are
+  // rewritten. `\cmd`/`c\md` (1) and `c\\md` (2) run cmd; 3+ backslashes leave
+  // a literal \ in the word (127). pi's transport folds the same way but its
+  // isCmdTok removes every backslash, which is why this model is oc-specific.
+  // A QUOTED word is different: backslashes are literal, and MSYS
   // resolves them as separators when the path exists -- `"C:\Windows\…\cmd.exe"`
   // and `"/c/Windows\System32\cmd.exe"` both run cmd (measured), so keep the
   // raw quoted word (a quoted `"c\md"` basename is `md`, not cmd).
@@ -607,9 +709,9 @@ function scanBash(command: string, convOff = false): BashScanResult {
     // a trailing escape pair in an unquoted word (`cmd\\ <space>`) folds into a
     // lone backslash that escapes the delimiter; bash then sees `cmd <space>`
     // (or `cmd <stuff>` as one word) -- not the program (measured 127). Refuse
-    // rather than rely on the all-backslash-removal approximation.
+    // rather than rely on the unescape approximation.
     if (!quoted && /\\$/.test(t)) return false;
-    const word = quoted ? t : t.replace(/\\/g, "");
+    const word = quoted ? t : t.replace(/\\\\/g, "\\").replace(/\\([\s\S])/g, "$1");
     const base = word.split(/[\\/]/).pop()!.toLowerCase();
     return base === "cmd" || base === "cmd.exe";
   };
@@ -687,6 +789,13 @@ function scanBash(command: string, convOff = false): BashScanResult {
       casePending = false;
     }
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
+    // `builtin cmd` is not a program: `builtin` looks the next word up in the
+    // builtin table, cmd is not a builtin, so bash fails before spawning
+    // anything -- rewriting its `//c` changes only dead text (measured; the
+    // word after builtin can still execute through builtin exec/command/eval/
+    // source, and those reach this line with prevTok = that builtin, not
+    // "builtin"). Same rule as the other zero-effect rewrites.
+    if (prevTok === "builtin" && isCmdTok(curTok, quotedTok)) prevTokCmdPos = false;
     if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) cmdFlagZone = true;
     // prefix-assignment staging / apply (envp): the assignment token (whole
     // word, unquoted) in command position is staged; a later real command
@@ -742,8 +851,10 @@ function scanBash(command: string, convOff = false): BashScanResult {
     while (k < m2) {
       const c = seg[k];
       if (c === "\\") {
-        s += seg.slice(k, k + 2);
-        k += 2;
+        const run = backslashRun(seg, k);
+        const end = Math.min(run.end + (run.escapesNext ? 1 : 0), m2);
+        s += seg.slice(k, end);
+        k = end;
         continue;
       }
       if (c === "$" && seg[k + 1] === "(") {
@@ -759,7 +870,11 @@ function scanBash(command: string, convOff = false): BashScanResult {
       if (c === "`") {
         let p = k + 1;
         while (p < m2 && seg[p] !== "`") {
-          if (seg[p] === "\\") p++;
+          if (seg[p] === "\\") {
+            const run = backslashRun(seg, p);
+            p = run.end + (run.escapesNext ? 1 : 0);
+            continue;
+          }
           p++;
         }
         if (p >= m2) { s += seg.slice(k); break; }
@@ -777,27 +892,31 @@ function scanBash(command: string, convOff = false): BashScanResult {
   };
 
   while (i < n) {
-    // heredoc bodies are data: copy verbatim; the delimiter line ends the
-    // body. (Unquoted bodies still undergo $( )/backtick expansion in bash;
-    // those inner commands are deliberately NOT rewritten -- a loud miss
-    // beats scanning inside body data.)
-    if (pendingDelim !== null && !inHeader) {
+    // heredoc bodies are data: copy verbatim; each delimiter line ends its
+    // body (in opener order). (Unquoted bodies still undergo $( )/backtick
+    // expansion in bash; those inner commands are deliberately NOT rewritten
+    // -- a loud miss beats scanning inside body data.)
+    if (heredocs.length && !inHeader) {
       let lineEnd = command.indexOf("\n", i);
       if (lineEnd === -1) lineEnd = n;
       // bash matches the terminator line EXACTLY (<<- strips leading tabs
       // only, nothing else) -- a trim() here would end the body early and
       // rewrite its lines ("EOF " / "  EOF" are BODY) -- except that ONE
       // trailing \r is ignored: measured, both a full-CRLF text and a clean
-      // delimiter followed by an "EOF\r" line terminate the body here.
-      const raw = command.slice(i, lineEnd).replace(/\r$/, "");
-      if ((pendingDash ? raw.replace(/^\t+/, "") : raw) === pendingDelim) {
+      // delimiter followed by an "EOF\r" line terminate the body here. The
+      // transport fold (`\\` -> `\`) applies to the body bytes too, so fold
+      // both sides before comparing a delimiter that contains backslashes.
+      const raw = command.slice(i, lineEnd).replace(/\r$/, "").replace(/\\\\/g, "\\");
+      const head = heredocs[0]!;
+      if ((head.dash ? raw.replace(/^\t+/, "") : raw) === head.delim) {
         out += command.slice(i, Math.min(lineEnd + 1, n));
         i = lineEnd + 1;
-        pendingDelim = null;
-        pendingDash = false;
-        curTok = "";
-        clearTok();
-        cmdPosNext = true; // a fresh command line follows
+        heredocs.shift();
+        if (!heredocs.length) {
+          curTok = "";
+          clearTok();
+          cmdPosNext = true; // all bodies consumed: a fresh command line follows
+        }
         continue;
       }
       out += command.slice(i, Math.min(lineEnd + 1, n));
@@ -805,7 +924,7 @@ function scanBash(command: string, convOff = false): BashScanResult {
       continue;
     }
     const ch = command[i];
-    if (ch === "\n" && pendingDelim !== null && inHeader) {
+    if (ch === "\n" && heredocs.length && inHeader) {
       out += "\n";
       i++;
       inHeader = false;
@@ -814,14 +933,25 @@ function scanBash(command: string, convOff = false): BashScanResult {
       continue;
     }
     if (ch === "\\") {
-      const seg = command.slice(i, i + 2);
+      const run = backslashRun(command, i);
+      const end = Math.min(run.end + (run.escapesNext ? 1 : 0), n);
+      const seg = command.slice(i, end);
       out += seg;
       curTok += seg; // escaped chars belong to the token (\> is no operator)
-      if (command[i + 1] === "$") escapedDollar.add(i + 1); // \$: the $ is literal (see escapedDollar)
-      i += 2;
+      if (run.escapesNext && command[run.end] === "$") escapedDollar.add(run.end); // \$: the $ is literal (see escapedDollar)
+      i = end;
       continue;
     }
     if (ch === "'") {
+      // ANSI-C quoting ($'...'): the content is literal (no command
+      // substitution) and a backslash escapes the next character -- including
+      // \' -- so the plain single-quote scan would end at the escaped quote and
+      // treat the rest of the string as shell syntax (measured: `echo $'x\' ;
+      // cmd //c ver'` rewrote the echoed data). Copy the whole segment
+      // verbatim; feed the token only when it has no escapes, since only then
+      // the quote-removed content is known statically.
+      const ansiC =
+        command[i - 1] === "$" && !escapedDollar.has(i - 1) && command[i - 2] !== "$";
       // A quote does not change word identity (bash removes quotes before
       // parsing the command word). A standalone quoted word in command
       // position is fed to the token; without it the NEXT word was taken as
@@ -833,6 +963,23 @@ function scanBash(command: string, convOff = false): BashScanResult {
       const feedTok = curTok === "" && cmdPosNext;
       commitTok();
       funcAwaitBody = false; // a quoted word is not a function body
+      if (ansiC) {
+        let end = i + 1;
+        while (end < n && command[end] !== "'") {
+          if (command[end] === "\\") {
+            const run = backslashRun(command, end);
+            end = run.end + (run.escapesNext ? 1 : 0);
+            continue;
+          }
+          end++;
+        }
+        if (end >= n) { out += command.slice(i); break; }
+        out += command.slice(i, end + 1);
+        const content = command.slice(i + 1, end);
+        if (feedTok && !content.includes("\\")) { curTok += content; tokQuoted = true; }
+        i = end + 1;
+        continue;
+      }
       const end = command.indexOf("'", i + 1);
       if (end === -1) {
         const seg = command.slice(i);
@@ -856,7 +1003,11 @@ function scanBash(command: string, convOff = false): BashScanResult {
       // closing quote hunt: $() and backticks reopen quote context
       let j = i + 1;
       while (j < n && command[j] !== '"') {
-        if (command[j] === "\\") { j += 2; continue; }
+        if (command[j] === "\\") {
+          const run = backslashRun(command, j);
+          j = run.end + (run.escapesNext ? 1 : 0);
+          continue;
+        }
         if (command[j] === "$" && command[j + 1] === "(") {
           const close = matchParen(command, j + 2);
           if (close === -1) { j = n; break; }
@@ -866,7 +1017,11 @@ function scanBash(command: string, convOff = false): BashScanResult {
         if (command[j] === "`") {
           let p = j + 1;
           while (p < n && command[p] !== "`") {
-            if (command[p] === "\\") p++;
+            if (command[p] === "\\") {
+              const run = backslashRun(command, p);
+              p = run.end + (run.escapesNext ? 1 : 0);
+              continue;
+            }
             p++;
           }
           j = p + 1;
@@ -886,18 +1041,33 @@ function scanBash(command: string, convOff = false): BashScanResult {
       i = j + 1;
       continue;
     }
+    // Here-string `<<<`: one redirection token. Processing its second/third
+    // "<" separately made `<<< "$(cmd //c ver)"` look like a heredoc opener
+    // (`<< "$(…)"`), so the real command substitution inside the quoted word
+    // was never scanned (measured: native executes it, the flag stayed //c).
+    if (ch === "<" && command[i + 1] === "<" && command[i + 2] === "<") {
+      commitTok();
+      funcAwaitBody = false;
+      cmdPosNext = false;
+      clearTok();
+      pendingEnv.length = 0; // a redirect ends the staged prefix here (a command word after it is the documented redirect-prefix miss)
+      out += "<<<";
+      i += 3;
+      continue;
+    }
     if (ch === "<" && command[i + 1] === "<") {
       commitTok();
       funcAwaitBody = false; // a heredoc is not a function body
-      heredoc.lastIndex = i;
-      const m = heredoc.exec(command);
-      if (m) {
-        pendingDelim = m[3] ?? m[4] ?? m[5];
-        pendingDash = m[1] === "-";
+      const head = readHeredocHead(command, i);
+      // An undecodable delimiter means the body boundary is unknown; keeping
+      // the original command is the only way to stay out of the body's data.
+      if (head === "bail") return { command, cmdFlagFixed: false, envPathFixed: false };
+      if (head) {
+        heredocs.push({ delim: head.delim, dash: head.dash });
         inHeader = true;
-        pendingEnv.length = 0; // heredoc redirect = no command word after the assignment (standalone) -> discard
-        out += m[0];
-        i += m[0].length;
+        pendingEnv.length = 0; // a heredoc redirect ends the staged prefix here; `A=x <<EOF cmd` is the documented redirect-prefix miss (inert, safe)
+        out += command.slice(i, i + head.len);
+        i += head.len;
         continue; // same-line redirects still scanned (cmd flag detection needs them)
       }
     }
@@ -915,8 +1085,12 @@ function scanBash(command: string, convOff = false): BashScanResult {
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
       funcAwaitBody = false; // a separator or the paren-as-body settles the slot
-      if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") {
-        caseRegion = "pattern"; // ";;" ends the body: the next pattern follows
+      // ";;" and ";&" both end the body (bash case terminators); ";;&" is
+      // covered by its leading ";;". Without ";&" the next pattern ")" was
+      // treated as an ordinary paren close and the following body's cmd flag
+      // stayed unrewritten (a miss).
+      if (ch === ";" && caseRegion === "body" && (command[i + 1] === ";" || command[i + 1] === "&")) {
+        caseRegion = "pattern"; // ";;" / ";&" end the body: the next pattern follows
       }
       if (ch === "(") {
         // classify the paren and remember the OUTER command position at open

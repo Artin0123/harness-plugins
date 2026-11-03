@@ -288,8 +288,14 @@ spec〈只能靠「寫對」的形〉）：
 - 原生工具的旗標：**gate ON（`MSYS_NO_PATHCONV` 有設）時寫單斜線**
   `taskkill /IM x`；`//IM` 是給「轉換開啟」環境的寫法（實測本機 `//IM` 無效、
   `/IM` 可用）。
-- `cmd` 的程式名直接寫 `cmd`（或全正斜線的 `/c/.../cmd.exe`）；未引號的
-  `C:\Windows\…\cmd.exe` 原生 127（`-c` 傳輸＋lexer 吃掉反斜線）。
+- `cmd` 的程式名直接寫 `cmd`（或全正斜線的 `/c/.../cmd.exe`）。Windows 路徑：
+  transport 先折一層、bash lexer 再去一層，所以 1–2 個反斜線的未引號
+  `C:\Windows\…` / `C:\\Windows\…` 都變成 `C:Windows…`（127，不修）；**3 個以上**（3/4 已實測）
+  才是真實路徑、插件會改寫旗標。pi 的 transport 折疊相同，但判準仍全刪（3/4 漏修）。
+  跨 host 一致就加引號（`"C:\Windows\…\cmd.exe"` 兩邊都認）或寫 POSIX 路徑。
+- 引號／ANSI-C 裡的反斜線也按同一折疊計：event 2 個 `\\` 到 bash 只剩一個
+  （`"\$(…)"` 是字面），**3 個以上**（3/4 已實測）才是「字面反斜線＋真替換」。oc 已按 folded
+  奇偶掃描；pi 仍用 event 成對（記錄為臺帳）。
 - 給原生 exe 的路徑用 Windows 形式（`python C:/x.py`）或先 `cygpath -w`。
 - 不要把 `cmd //c` 放進外部 wrapper（`timeout`/`xargs`/`nice`）、`time -p`、
   引號 payload（`bash -c '…'`）或反斜線續接；寫在指令位置。
@@ -297,8 +303,13 @@ spec〈只能靠「寫對」的形〉）：
 - 子殼或 `fi`／`done`／`esac`／`}` 之後要接指令，請加 `;`／`&&`／換行
   （直接接指令字是 bash 語法錯誤）；函式本體用 `f() { …; }` 形式（
   `function f { …; }` 內的 `cmd //c` 目前漏修）。
-- cmd 輸出的 GBK 亂碼、以及指令字串裡成對反斜線被 `-c` 折一層——治療點在宿主
-  （解碼層／transport），插件只能記錄；要保位元組請用 write 工具落檔或 `\134`。
+- cmd 輸出的 GBK 亂碼——治療點在宿主解碼層。指令字串裡成對反斜線被 transport
+  折一層是兩 host 共有的通道行為（oc live 2026-11-04 量到 2→1、4→2），bash lexer
+  再一層；oc 的程式名判準現在完整模擬這兩層，pi 仍全刪（3/4 個反斜線的真實路徑
+  漏修）。要保位元組請用 write 工具落檔或 `\134`。
+- heredoc 定界符：字母／中文開頭、`<<$'EOF'`／`<<$"EOF"`、一行多個 heredoc 都認；
+  含轉義的引號定界符（`<<$'E\tF'`、`<<"E\"F"`）整條指令原樣放行（inert，安全）。
+  `<<3`、`<<*X` 這種第一字是 ASCII 標點/數字的寫法仍是邊界（本體會被當指令掃描）。
 - host 自帶的 shell 預檢（「Portable shell scanner」）對 `cat <<*X` 一類 heredoc
   直接回 error——外掛 ON/OFF 都到不了插件（WSL bash 原生接受，回傳≠原生）；
   定界符用字母開頭可避免。

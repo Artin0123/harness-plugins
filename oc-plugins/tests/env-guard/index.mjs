@@ -102,6 +102,12 @@ const tight = bc('cmd//c ver');
 check('P: tight cmd//c form untouched (bash sees a program name; native 127)', tight === 'cmd//c ver', JSON.stringify(tight));
 const tightInSeq = bc('FOO=1 cmd//c ver');
 check('P: tight form after env prefix untouched', tightInSeq === 'FOO=1 cmd//c ver', JSON.stringify(tightInSeq));
+// `builtin cmd` looks cmd up in the builtin table (it is not a builtin) and
+// fails before spawning anything: rewriting its flag is a zero-effect rewrite
+check('P: builtin cmd is not a program (zero-effect rewrite removed)', bc('builtin cmd //c ver') === 'builtin cmd //c ver', JSON.stringify(bc('builtin cmd //c ver')));
+// ... while builtin can still execute a command through exec/command/eval/source
+check('P: builtin exec still reaches cmd', bc('builtin exec cmd //c ver') === 'builtin exec cmd /c ver', JSON.stringify(bc('builtin exec cmd //c ver')));
+check('P: builtin command still reaches cmd', bc('builtin command cmd //c ver') === 'builtin command cmd /c ver', JSON.stringify(bc('builtin command cmd //c ver')));
 const tightQuoted = bc('"cmd"//c ver');
 check('P: quoted tight form untouched', tightQuoted === '"cmd"//c ver', JSON.stringify(tightQuoted));
 // a "/" after the flag word means no flag spelling at all: the UNC form and
@@ -412,14 +418,26 @@ const gpVar = split('${TEMP}/*.txt');
 check('S: glob var prefix reports tempVar', !!gpVar && gpVar.mechanism === 'tempVar', JSON.stringify(gpVar));
 
 // --- command position: shells keywords, groups, case patterns, path forms ---
+// Event.command passes through two measured layers: the spawn channel folds
+// each `\\` pair once, then bash's unquoted lexer removes one escape level.
+// 1-2 backslashes therefore lex to C:Windows… (127, untouched); 3+ become the
+// REAL C:\Windows\… path and run cmd, so the flag is rewritten.
 const fullPath = bc('C:\\Windows\\System32\\cmd.exe //c ver');
-check('P: unquoted backslash Windows path untouched (bash eats the backslashes: native 127)', fullPath === 'C:\\Windows\\System32\\cmd.exe //c ver', JSON.stringify(fullPath));
+check('P: 1-backslash Windows path untouched (lexes to C:Windows…: native 127)', fullPath === 'C:\\Windows\\System32\\cmd.exe //c ver', JSON.stringify(fullPath));
 const fullPathEscaped = bc('C:\\\\Windows\\\\System32\\\\cmd.exe //c ver');
-check('P: double-backslash Windows path untouched (host -c fold + lexer leaves C:Windows…)', fullPathEscaped === 'C:\\\\Windows\\\\System32\\\\cmd.exe //c ver', JSON.stringify(fullPathEscaped));
+check('P: 2-backslash Windows path untouched (still lexes to C:Windows…: native 127)', fullPathEscaped === 'C:\\\\Windows\\\\System32\\\\cmd.exe //c ver', JSON.stringify(fullPathEscaped));
+const fullPath3 = bc('C:\\\\\\Windows\\\\\\System32\\\\\\cmd.exe //c ver');
+check('P: 3-backslash Windows path fixed (real program on this host)', fullPath3 === 'C:\\\\\\Windows\\\\\\System32\\\\\\cmd.exe /c ver', JSON.stringify(fullPath3));
+const fullPath4 = bc('C:\\\\\\\\Windows\\\\\\\\System32\\\\\\\\cmd.exe //c ver');
+check('P: 4-backslash Windows path fixed (real program on this host)', fullPath4 === 'C:\\\\\\\\Windows\\\\\\\\System32\\\\\\\\cmd.exe /c ver', JSON.stringify(fullPath4));
 const fullPathPosix = bc('/c/Windows/System32/cmd.exe //c ver');
 check('P: POSIX full-path cmd.exe fixed', fullPathPosix === '/c/Windows/System32/cmd.exe /c ver', JSON.stringify(fullPathPosix));
 const fullPathMixed = bc('/c/Windows\\System32\\cmd.exe //c ver');
-check('P: unquoted mixed-separator path is not a program (untouched)', fullPathMixed === '/c/Windows\\System32\\cmd.exe //c ver', JSON.stringify(fullPathMixed));
+check('P: 1-backslash mixed path is not a program (untouched)', fullPathMixed === '/c/Windows\\System32\\cmd.exe //c ver', JSON.stringify(fullPathMixed));
+const fullPathMixed2 = bc('/c/Windows\\\\System32\\\\cmd.exe //c ver');
+check('P: 2-backslash mixed path is not a program (untouched)', fullPathMixed2 === '/c/Windows\\\\System32\\\\cmd.exe //c ver', JSON.stringify(fullPathMixed2));
+const fullPathMixed3 = bc('/c/Windows\\\\\\System32\\\\\\cmd.exe //c ver');
+check('P: 3-backslash mixed path fixed (MSYS resolves it)', fullPathMixed3 === '/c/Windows\\\\\\System32\\\\\\cmd.exe /c ver', JSON.stringify(fullPathMixed3));
 const quotedWinPath = bc('"C:\\Windows\\System32\\cmd.exe" //c ver');
 check('P: quoted Windows path fixed (quoted backslashes are literal separators)', quotedWinPath === '"C:\\Windows\\System32\\cmd.exe" /c ver', JSON.stringify(quotedWinPath));
 const quotedMixedPath = bc('"/c/Windows\\System32\\cmd.exe" //c ver');
@@ -432,6 +450,10 @@ const escapedName = bc('\\cmd //c ver');
 check('P: escaped cmd name fixed (bash runs cmd)', escapedName === '\\cmd /c ver', JSON.stringify(escapedName));
 const midEscapedName = bc('c\\md //c ver');
 check('P: mid-word escaped cmd name fixed', midEscapedName === 'c\\md /c ver', JSON.stringify(midEscapedName));
+const midDoubleEscaped = bc('c\\\\md //c ver');
+check('P: 2-backslash c\\md still runs cmd (fixed)', midDoubleEscaped === 'c\\\\md /c ver', JSON.stringify(midDoubleEscaped));
+const mid4Escaped = bc('c\\\\\\\\md //c ver');
+check('P: 4-backslash c\\md leaves a literal \\ (native 127, untouched)', mid4Escaped === 'c\\\\\\\\md //c ver', JSON.stringify(mid4Escaped));
 const thenKw = bc('if true; then cmd //c ver; fi');
 check('P: cmd after then', thenKw === 'if true; then cmd /c ver; fi', JSON.stringify(thenKw));
 const doKw = bc('for f in a b; do cmd //c ver; done');
@@ -473,15 +495,19 @@ check('E: backslash-newline after an assignment still composes',
   bc('A=/c/x \\\n node x') === 'A=C:/x \\\n node x', JSON.stringify(bc('A=/c/x \\\n node x')));
 
 // --- escaped \$ ( : literal data, not a substitution opener ---
-// bash: "\$(x)" inside double quotes prints $(x) literally (the $ is
-// escaped), while "\\$(x)" runs a REAL substitution after a literal
-// backslash (measured both). Before the pair-aware scanDq the scanner
-// rewrote inside the literal "\$( )" -- silently corrupting echo's data
-// (the rewritten run prints $(cmd /c ver), native prints $(cmd //c ver)).
+// bash sees the command AFTER the transport folds each \\ pair. Inside double
+// quotes, event 1 and event 2 backslashes both become \$ (literal $); event
+// 3/4 become \\$ (literal backslash + real substitution). The old scanner
+// consumed event pairs directly and rewrote event 2's literal data.
 check('B: dq "\\$(" stays literal (data, not substitution)',
   bc('echo "\\$(cmd //c ver)"') === 'echo "\\$(cmd //c ver)"', JSON.stringify(bc('echo "\\$(cmd //c ver)"')));
-check('B: dq "\\\\$(" is a real substitution, still fixed',
-  bc('echo "\\\\$(cmd //c ver)"') === 'echo "\\\\$(cmd /c ver)"', JSON.stringify(bc('echo "\\\\$(cmd //c ver)"')));
+// The spawn transport folds each \\ pair before bash parses it: event 2
+// backslashes reach bash as 1 (\$ literal); event 3 reaches bash as 2
+// (\\$ = literal backslash + real substitution).
+check('B: dq event-2 backslashes stay literal after the transport fold',
+  bc('echo "\\\\$(cmd //c ver)"') === 'echo "\\\\$(cmd //c ver)"', JSON.stringify(bc('echo "\\\\$(cmd //c ver)"')));
+check('B: dq event-3 backslashes are a real substitution, still fixed',
+  bc('echo "\\\\\\$(cmd //c ver)"') === 'echo "\\\\\\$(cmd /c ver)"', JSON.stringify(bc('echo "\\\\\\$(cmd //c ver)"')));
 // bare \$( is a native SYNTAX ERROR (loud, exit 2, measured) in both the
 // original and the rewritten form, so the interior rewrite changes nothing
 // observable -- pinned to keep the shape classified as native-equivalent
@@ -508,6 +534,14 @@ check('B: flag fixed, redirect target kept', redirAfterFlag === 'cmd /c < //in',
 // terminator line must match EXACTLY (<<- strips leading tabs only), so
 // "EOF " / "  EOF" / "EOF\r" terminator look-alikes are BODY
 check('B: <<\\EOF body untouched', bc('cat <<\\EOF\ncmd //c ver\nEOF') === 'cat <<\\EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<\\EOF\ncmd //c ver\nEOF')));
+// leading backslash run: 1-2 event backslashes fold/lex to the quote marker
+// (delimiter EOF); 3+ leave a literal backslash and are left inert.
+check('B: <<\\\\EOF (2 event backslashes) keeps the body literal',
+  bc('cat <<\\\\EOF\ncmd //c ver\nEOF') === 'cat <<\\\\EOF\ncmd //c ver\nEOF',
+  JSON.stringify(bc('cat <<\\\\EOF\ncmd //c ver\nEOF')));
+check('B: <<\\\\\\EOF (3 event backslashes) leaves the command inert',
+  bc('cat <<\\\\\\EOF; cmd //c ver\nbody\nEOF') === 'cat <<\\\\\\EOF; cmd //c ver\nbody\nEOF',
+  JSON.stringify(bc('cat <<\\\\\\EOF; cmd //c ver\nbody\nEOF')));
 check('B: trailing-space terminator is body', bc('cat <<EOF\nbody\nEOF \ncmd //c ver') === 'cat <<EOF\nbody\nEOF \ncmd //c ver', JSON.stringify(bc('cat <<EOF\nbody\nEOF \ncmd //c ver')));
 check('B: leading-space terminator is body', bc('cat <<EOF\na\n  EOF\ncmd //c ver\nEOF') === 'cat <<EOF\na\n  EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<EOF\na\n  EOF\ncmd //c ver\nEOF')));
 // bash ignores ONE trailing \r on the terminator line (measured: a clean
@@ -529,6 +563,82 @@ check('B: <<- space-indented line is body', bc('cat <<-EOF\n  EOF\ncmd //c ver\n
 check('B: digit-head delimiter <<2EOF keeps the body literal', bc('cat <<2EOF\ncmd //c ver\n2EOF') === 'cat <<2EOF\ncmd //c ver\n2EOF', JSON.stringify(bc('cat <<2EOF\ncmd //c ver\n2EOF')));
 check('B: digit head with dash <<-2ND keeps the body literal', bc('cat <<-2ND\n\tcmd //c ver\n\t2ND') === 'cat <<-2ND\n\tcmd //c ver\n\t2ND', JSON.stringify(bc('cat <<-2ND\n\tcmd //c ver\n\t2ND')));
 check('B: letter head digit tail <<EOF2 keeps the body literal', bc('cat <<EOF2\ncmd //c ver\nEOF2') === 'cat <<EOF2\ncmd //c ver\nEOF2', JSON.stringify(bc('cat <<EOF2\ncmd //c ver\nEOF2')));
+
+// --- non-ASCII heredoc delimiters are bash words too ---------------------
+// Measured on this host (git-bash -c) and WSL: `<<中文`, `<<·`, `<<2中文`,
+// `<<😀` are legal heredocs and the body is data. The ASCII-only first-char
+// class used to scan the body and rewrite its `cmd //c` (silent data
+// corruption; live oc reproduced it). Non-ASCII cannot open the arithmetic
+// shift `$((x<<y))` (identifiers are ASCII), so widening is safe.
+for (const [label, s] of [
+  ['CJK <<中文', 'cat <<中文\ncmd //c ver\n中文'],
+  ['CJK <<中文EOF', 'cat <<中文EOF\ncmd //c ver\n中文EOF'],
+  ['CJK punct <<·', 'cat <<·\ncmd //c ver\n·'],
+  ['digit head <<2中文', 'cat <<2中文\ncmd //c ver\n2中文'],
+  ['emoji <<😀', 'cat <<😀\ncmd //c ver\n😀'],
+  ['escaped <<\\中文', 'cat <<\\中文\ncmd //c ver\n中文'],
+]) {
+  const out = bc(s);
+  check(`B: non-ASCII heredoc body data (${label})`, out === s, JSON.stringify(out));
+}
+check('B: non-ASCII heredoc then real command still fixed',
+  bc('cat <<中文\nbody\n中文\ncmd //c ver') === 'cat <<中文\nbody\n中文\ncmd /c ver',
+  JSON.stringify(bc('cat <<中文\nbody\n中文\ncmd //c ver')));
+
+// --- multiple heredocs on one header line are read in opener order -------
+// A single-slot tracker ended the first body at a line equal to the SECOND
+// delimiter and then rewrote the second body (measured corruption: native
+// printed `cmd //c ver`, the rewrite printed `cmd /c ver`).
+{
+  const s = 'cat <<A <<B\nB\nA\ncmd //c ver\nB';
+  check('B: multiple heredocs keep every body literal', bc(s) === s, JSON.stringify(bc(s)));
+  const s2 = 'cat <<A <<B\none\nA\ntwo\nB\ncmd //c ver';
+  check('B: multiple heredocs then real command still fixed',
+    bc(s2) === 'cat <<A <<B\none\nA\ntwo\nB\ncmd /c ver', JSON.stringify(bc(s2)));
+  const s3 = 'cat <<-A <<B\n\tB\n\tA\ncmd //c ver\nB';
+  check('B: multiple heredocs honour per-opener <<-', bc(s3) === s3, JSON.stringify(bc(s3)));
+}
+
+// --- ANSI-C / locale-quoted heredoc delimiters ---------------------------
+// `<<$'EOF'` and `<<$"EOF"` are legal (quote removal yields EOF). They used
+// to be unrecognised, so the body was scanned and its `cmd //c` rewritten.
+check("B: ANSI-C quoted heredoc delimiter body data",
+  bc("cat <<$'EOF'\ncmd //c ver\nEOF") === "cat <<$'EOF'\ncmd //c ver\nEOF",
+  JSON.stringify(bc("cat <<$'EOF'\ncmd //c ver\nEOF")));
+check('B: locale quoted heredoc delimiter body data',
+  bc('cat <<$"EOF"\ncmd //c ver\nEOF') === 'cat <<$"EOF"\ncmd //c ver\nEOF',
+  JSON.stringify(bc('cat <<$"EOF"\ncmd //c ver\nEOF')));
+// A quoted delimiter containing escapes cannot be decoded here (quote removal
+// / ANSI-C decoding change the terminator line), so the WHOLE command stays
+// untouched -- the safe direction, an inert miss instead of body corruption.
+for (const [label, s] of [
+  ["ANSI-C escaped delimiter", "cat <<$'E\\tF'\ncmd //c ver\nE\tF"],
+  ["double-quoted escaped delimiter", 'cat <<"E\\"F"\ncmd //c ver\nE"F'],
+  ["unquoted escaped word", 'cat <<E\\OF; cmd //c ver\nbody\nEOF'],
+  ["quoted word concatenation", 'cat <<"A"B; cmd //c ver\nbody\nAB'],
+]) {
+  check(`B: undecodable heredoc word leaves the command inert (${label})`, bc(s) === s, JSON.stringify(bc(s)));
+}
+
+// --- ANSI-C quoting ($'...') is literal data, with backslash escapes -----
+// The plain single-quote scan ended at the \' inside $'...'; the rest of the
+// string was then parsed as shell syntax (measured: the echoed text's
+// `cmd //c` was rewritten). The whole $'...' word is now copied verbatim.
+check("B: ANSI-C quote with \\' keeps its data",
+  bc("echo $'x\\' ; cmd //c ver'") === "echo $'x\\' ; cmd //c ver'",
+  JSON.stringify(bc("echo $'x\\' ; cmd //c ver'")));
+check("B: ANSI-C quote closes at the real quote, later command fixed",
+  bc("echo $'a\\'b' ; cmd //c ver") === "echo $'a\\'b' ; cmd /c ver",
+  JSON.stringify(bc("echo $'a\\'b' ; cmd //c ver")));
+
+// --- case terminators: ;& (fallthrough) also returns to the pattern list --
+check('B: case fallthrough ;& then next body is fixed',
+  bc('case x in a) cmd //c ver ;& b) cmd //k dir ;; esac') === 'case x in a) cmd /c ver ;& b) cmd /k dir ;; esac',
+  JSON.stringify(bc('case x in a) cmd //c ver ;& b) cmd //k dir ;; esac')));
+check('B: case fallthrough ;;& then next body is fixed',
+  bc('case x in a) cmd //c ver ;;& b) cmd //k dir ;; esac') === 'case x in a) cmd /c ver ;;& b) cmd /k dir ;; esac',
+  JSON.stringify(bc('case x in a) cmd //c ver ;;& b) cmd //k dir ;; esac')));
+
 
 // a closed $( ) / `...` / group ends the command position: the next word is
 // an ARGUMENT of the outer command, never rewritten
@@ -649,12 +759,25 @@ check('B: <<EOF.v2 body untouched', bc('cat <<EOF.v2\ncmd //c ver\nEOF.v2') === 
 // a quoted delimiter with a space still terminates on the bare line
 const spDelim = bc("cat <<'A B'\ncmd //c ver\nA B\ncmd //c ver");
 check('B: quoted space delimiter terminates on the bare line', spDelim === "cat <<'A B'\ncmd //c ver\nA B\ncmd /c ver", JSON.stringify(spDelim));
+// the transport folds `\\` pairs before bash sees the header/body, so a plain
+// single-quoted delimiter containing backslashes must be compared folded
+check("B: single-quoted delimiter with folded backslash keeps the body",
+  bc("cat <<'E\\\\F'\ncmd //c ver\nE\\\\F") === "cat <<'E\\\\F'\ncmd //c ver\nE\\\\F",
+  JSON.stringify(bc("cat <<'E\\\\F'\ncmd //c ver\nE\\\\F")));
 // arithmetic left shift must not open a heredoc (letter-first gate)
 check('B: $((1<<2)); cmd still fixed', bc('x=$((1<<2)); cmd //c ver') === 'x=$((1<<2)); cmd /c ver', JSON.stringify(bc('x=$((1<<2)); cmd //c ver')));
 check('B: $((a<<b)); cmd still fixed', bc('x=$((a<<b)); cmd //c ver') === 'x=$((a<<b)); cmd /c ver', JSON.stringify(bc('x=$((a<<b)); cmd //c ver')));
 // a same-line separator after the heredoc word is still scanned
 const sameLine = bc('cat <<EOF; cmd //c ver\nbody\nEOF');
 check('B: <<EOF; same-line cmd still fixed', sameLine === 'cat <<EOF; cmd /c ver\nbody\nEOF', JSON.stringify(sameLine));
+// here-string is ONE redirection token; its second "<" must not pair with the
+// third to look like a heredoc `<< "…"` (that hid a real $( ) inside)
+check('B: here-string quoted substitution is scanned',
+  bc('cat <<< "$(cmd //c ver)"') === 'cat <<< "$(cmd /c ver)"', JSON.stringify(bc('cat <<< "$(cmd //c ver)"')));
+check('B: here-string unquoted substitution is scanned',
+  bc('cat <<< $(cmd //c ver)') === 'cat <<< $(cmd /c ver)', JSON.stringify(bc('cat <<< $(cmd //c ver)')));
+check('B: here-string data word untouched',
+  bc('cat <<< "cmd //c ver"') === 'cat <<< "cmd //c ver"', JSON.stringify(bc('cat <<< "cmd //c ver"')));
 
 // --- bash detection sanity (this machine must find its own MSYS bash) ---
 const bash = mod.findBash();
