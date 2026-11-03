@@ -480,11 +480,16 @@ function convertEnvPath(v: string): string | null {
 function scanBash(command: string, convOff = false): BashScanResult {
   // group 1: the <<- dash; group 2: the backslash of <<\EOF (literal body);
   // the delimiter is a bash WORD, quoted (any content, quotes stripped --
-  // the terminator line compares bare, like bash) or unquoted starting with
-  // a letter and free of shell metacharacters; the letter gate keeps
-  // $((1<<2)) arithmetic out of the heredoc path
-  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([A-Za-z_][^\s"'><;&|()\\`]*))/y; // sticky, anchored at lastIndex
-  const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd flags are alphabetic; /v:on keeps its colon tail
+  // the terminator line compares bare, like bash) or unquoted and free of
+  // shell metacharacters carrying a LETTER or _ in the word (a digit HEAD
+  // is legal: `<<2EOF` is a legal bash heredoc -- before this the body was
+  // tokenized and the body's `cmd //c` became data corruption; `EOF2` was
+  // already legal), while a PURE-digit delimiter (`<<2`) stays
+  // unrecognized: statically indistinguishable from the arithmetic shift
+  // `$((x<<2))` (measured legal heredoc too) -- organic frequency ~0,
+  // recorded in docs/spec.md as a boundary
+  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\d*[A-Za-z_][^\s"'><;&|()\\`]*))/y; // sticky, anchored at lastIndex
+  const cmdFlag = /\/\/([A-Za-z]+)(?![\w.\-/])/iy; // cmd flags are alphabetic and never cross a "/": /v:on keeps its colon tail, and a "/" after the flag word means no flag spelling at all (UNC `//server/share`, `//c/d/e` -- a "/" in the terminator class keeps them unrewritten; a following "//" pair is blocked by the non-empty curTok, measured)
   let out = "";
   let i = 0;
   const n = command.length;

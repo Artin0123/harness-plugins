@@ -104,6 +104,14 @@ const tightInSeq = bc('FOO=1 cmd//c ver');
 check('P: tight form after env prefix untouched', tightInSeq === 'FOO=1 cmd//c ver', JSON.stringify(tightInSeq));
 const tightQuoted = bc('"cmd"//c ver');
 check('P: quoted tight form untouched', tightQuoted === '"cmd"//c ver', JSON.stringify(tightQuoted));
+// a "/" after the flag word means no flag spelling at all: the UNC form and
+// a slash inside the flag word stay unrewritten (measured four-way banner /
+// banner; the rewrite used to flip //c/d/e to a "path not found" error,
+// diverging from native -- fixed by putting "/" in the terminator class).
+// A following "//" pair is blocked by the non-empty curTok (///c stays).
+check('P: scanner keepsUNC //server/share', bc('cmd //server/share ver') === 'cmd //server/share ver', JSON.stringify(bc('cmd //server/share ver')));
+check('P: scanner keeps slash inside flag word //c/d/e', bc('cmd //c/d/e ver') === 'cmd //c/d/e ver', JSON.stringify(bc('cmd //c/d/e ver')));
+check('P: scanner keeps ///c (curTok guard)', bc('cmd ///c ver') === 'cmd ///c ver', JSON.stringify(bc('cmd ///c ver')));
 
 // --- rewriteBashCommand: position awareness ---
 check('P: data position untouched', bc('echo cmd //c ver') === 'echo cmd //c ver', JSON.stringify(bc('echo cmd //c ver')));
@@ -495,6 +503,15 @@ check('B: full-CRLF heredoc ends body', crlfFull === 'cat <<EOF\r\nbody\r\nEOF\r
 const dashOk = bc('cat <<-EOF\n\tx\n\tEOF\ncmd //c ver');
 check('B: <<- tab terminator recognized, next line is a command', dashOk === 'cat <<-EOF\n\tx\n\tEOF\ncmd /c ver', JSON.stringify(dashOk));
 check('B: <<- space-indented line is body', bc('cat <<-EOF\n  EOF\ncmd //c ver\nEOF') === 'cat <<-EOF\n  EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<-EOF\n  EOF\ncmd //c ver\nEOF')));
+// a digit-head delimiter with a letter/_ in the word is a legal bash heredoc
+// (measured `<<2EOF` / `<<-2ND`); before the word gate allowed digit heads,
+// the body was tokenized and the body's `cmd //c` was rewritten = data
+// corruption. A PURE-digit delimiter (`<<2`) stays unrecognized: statically
+// indistinguishable from `$((x<<2))` (also a legal heredoc, measured);
+// organic frequency ~0 -- recorded in docs/spec.md as a boundary.
+check('B: digit-head delimiter <<2EOF keeps the body literal', bc('cat <<2EOF\ncmd //c ver\n2EOF') === 'cat <<2EOF\ncmd //c ver\n2EOF', JSON.stringify(bc('cat <<2EOF\ncmd //c ver\n2EOF')));
+check('B: digit head with dash <<-2ND keeps the body literal', bc('cat <<-2ND\n\tcmd //c ver\n\t2ND') === 'cat <<-2ND\n\tcmd //c ver\n\t2ND', JSON.stringify(bc('cat <<-2ND\n\tcmd //c ver\n\t2ND')));
+check('B: letter head digit tail <<EOF2 keeps the body literal', bc('cat <<EOF2\ncmd //c ver\nEOF2') === 'cat <<EOF2\ncmd //c ver\nEOF2', JSON.stringify(bc('cat <<EOF2\ncmd //c ver\nEOF2')));
 
 // a closed $( ) / `...` / group ends the command position: the next word is
 // an ARGUMENT of the outer command, never rewritten

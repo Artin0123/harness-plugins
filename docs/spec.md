@@ -126,6 +126,14 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 - **UNC 形**（`cmd //server/share`）——`//alpha/beta` 是 UNC 路徑，MSYS 不轉它、cmd 當無效
   switch：四種組合（原生／本機 × 原形／改寫成 `/server/share`）實測**全是互動
   banner**，改寫零效應 → 掃描器跳過 UNC 形（`//alpha` 後面緊接 `/`），電池釘樁。
+  **2026-11-03 修正**：此「跳過」先前只是文件聲明，掃描器旗標正則的終止字類
+  `(?![\w.-])` 少了 `/`，實測會把 `cmd //server/share ver` 改寫成 `/server/share`
+  （零效應改寫），且同根因的 `cmd //c/d/e ver` 改寫後行為翻轉（本地＝banner、
+  改寫＝`系統找不到指定的路徑`；native 兩態皆 banner）。終止字類補 `/` 後兩形
+  都保持原樣（`///c` 由 curTok 非空閘擋住，實測不改）；電池另補掃描器面釘樁
+  （原本只有 path 工具面那條）。pi 版無此問題：pi 在 `cmdFlag.exec` 後有明確的
+  `command[i + m[0].length] !== "/"` 閘＋電池釘樁——oc 是移植時掉了這層，這次
+  以終止字類補 `/` 的正則一道蓋掉（兩 host 掃描器同源，判準相同）。
 - 原生就壞的 cmd 雙斜線形（`cmd //?`、`cmd ///c`）——
   實測轉換開啟時一樣進互動模式：模型自己寫錯，不修。
 - **緊貼形 `cmd//c`／`cmd//k`／`"cmd"//c`**——bash 把 `cmd//c` 當**程式名**
@@ -208,7 +216,7 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 | `/c/Users/x`（檔案工具 `path`） | pi／oc host 原生映射成 `C:\Users\x` | 照寫即可（不要再期待插件改） |
 | `>nul`／`2>nul`／`<nul`／`2>&nul` | bash 原生：建實體 `nul` 檔／ENOENT／ambiguous redirect | 要丟棄輸出寫 `/dev/null` |
 | 重導向目標的 `//x`（`cmd //c x > //out`） | 目標由 bash 自己開檔，`//out: Is a directory` | 目標寫正常路徑 |
-| `cmd //?`、`cmd ///c ver`、`cmd //server/share` | 模型錯字。`///c` 兩態**輸出不同**：轉換開啟＝互動 banner、本機＝意外跑到 `ver`；都不改（修它＝替模型改錯字） | 執行就寫 `cmd //c <cmd>`（gate ON 時插件改寫成 `/c`） |
+| `cmd //?`、`cmd ///c ver`、`cmd //server/share`、`cmd //c/d/e ver` | 模型錯字。`///c` 兩態**輸出不同**：轉換開啟＝互動 banner、本機＝意外跑到 `ver`；都不改（修它＝替模型改錯字）。`//server/share` 四態全 banner；`//c/d/e` 同族（2026-11-03 起掃描器確實跳過，見〈零效應改寫稽核〉） | 執行就寫 `cmd //c <cmd>`（gate ON 時插件改寫成 `/c`） |
 | 緊貼形 `cmd//c`、`cmd//k`、`"cmd"//c`、`x=1 cmd//c` | 原生 127：bash 把 `cmd//c` 當**程式名** | 程式名與旗標之間要有空格 |
 | `exec X=/c/x …`／`command X=/c/x …`／`builtin X=/c/x …` | 原生 127／127／1：bash 把 `X=/c/x` 當指令名跑 | 前綴賦值要直接接真指令字 |
 | 引號偽賦值 `A=/c/x "B=/c/y" node` | 原生 127（`B=/c/y: No such file or directory`）：賦值判定在 quote removal 之前 | 同上；引號詞不是賦值前綴 |
@@ -364,6 +372,19 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   這個誤修（未動，形狀記於〈只能靠寫對的形〉）。
 - `case $x in esac) …` 的死文字——oc 的 stray `)` 不再開指令位置 → 不改寫；
   pi 仍保留（見上表）。
+- **UNC 與旗標內斜線形（2026-11-03 抓到並已修）**：`cmd //server/share ver`
+  與 `cmd //c/d/e ver` 曾被旗標正則改寫（終止字類 `(?![\w.-])` 少 `/`）。
+  前者四態全 banner＝零效應改寫（spec 此前聲明「掃描器跳過＋電池釘樁」，實查
+  電池只有 path 工具面的 pin，聲明失真）；後者本地行為翻轉（原形＝banner、
+  改寫＝`系統找不到指定的路徑`，native 兩態皆 banner＝改寫≠原生）。終止字類
+  補 `/` 之後兩形都不改寫，`///c` 由 curTok 非空閘擋住；電池補掃描器面三條 pin
+  （UNC、`//c/d/e`、`///c`）。
+- **`<<2EOF` 資料改寫（2026-11-03 抓到並已修，oc）**：數字開頭未引號定界符是合法
+  bash heredoc（`<<3` 純數字實測也合法），此前不認得 → 本體被當指令掃描，
+  實測觸發（本 session 頂層呼叫的本體 `cmd //c ver` 被改成 `cmd /c ver`）。
+  定界符正則改為 `\d*[A-Za-z_…]`（純數字仍不認，與算術靜態同形，記邊界）。
+  **pi 同源掃描器同病灶，未動**——修法已同源驗證、但 pi 的 live 端到端未做
+  ，記臺帳待補（詳見〈掃描器要點〉heredoc 段）；oc 電池 +3 釘。
 - **統計與改寫同源**：oc 的 temp 分類只有一份 `TEMP_FAMILIES`／`splitTempPath`，
   `rewritePathFix` 一次回傳值＋機制；`glob`／`patch`／`workdir` 都用同一份結果。
   `bumpFix` 只在值真的變了的分支呼叫；`bumpTool` 是分母，不是修復。oc 沒有 UI
@@ -427,12 +448,34 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   `false`：沒有閘證據的直接呼叫整體 inert（不確定絕不開啟副作用；hook 探測通過
   後才傳 `true`）。任何閘門失敗 → 整體不動（不動時留在漏修臺＝環境層故障未
   修；誤修是靜默破壞正確語法，比漏修嚴重）。
+- **閘門機制的精確版**（2026-11-03 停用外掛後重測）：`MSYS_NO_PATHCONV` 決定的
+  不是「argv 一層、envp 另一層」的差異——它是**按次 spawn 查環境**：只要被
+  spawn 的子行程環境裡帶著它（任意值，空字串也算），msys 對那次 spawn 的
+  argv **與** envp 轉換就整層關閉；變數在哪一層被設上（父行程匯出、bashrc 的
+  runtime export）不影響判定，bash 的啟動時刻也不特別（bashrc export 後
+  再 spawn，子環境帶 NPC，一樣關）。也因此在 gate ON 的閘門語意成立：
+  探測看到的 NPC 就是「該次 spawn 環境帶 NPC」，與轉換層實際關閉同義。
+- **測量紀律（外掛污染事故）**：hook 只改寫 opencode 交給 shell 的**頂層**
+  命令字串——載著改寫的對話環境裡「直接跑」指令不是原生對照：賦值會被外掛
+  自己改掉（事故：頂層 `A=/c/x node` 印出 `C:/x` 被誤判為原生轉換，實為
+  外掛改寫；由此得出「envp 改寫是 no-op」的錯誤結論，工作樹已整份錯誤移除
+  後撤回）。測原生行為必須讓命令走 hook 碰不到的層——子層 spawn
+  （`bash -c '…'` 的 payload、或從裸 node spawnSync bash），或停用外掛
+  （`opencode.json` 移除 plugin 條目，hot-reload 立即生效）並用顯著例子
+  （`A=/q/x node`：停用前印 `Q:/x`＝外掛改寫、停用後印 `/q/x`＝原生）確認
+  後再量。電池的 e2e parity 判準（原生側 spawn env 刪 `MSYS_NO_PATHCONV`／
+  `BASH_ENV`，與改寫側比對）本身有效——被污染的是一次性的對話實測、不是
+  這條判準。
 
 已知無害邊界（如實記錄、不修）：
 
 - glob 前綴拆分把 rest 的反斜線一律轉正斜線——rest 含 `\*`／`\[` 這類 glob
   轉義時語意會變（有機頻率為零；若要防僅對含這類序列的 rest 保留反斜線，
   依臺帳紀律選擇記錄不修）。
+- glob 整體 bare temp 模式（`pattern:"/tmp"`／`"${TEMP}"` 且無 `path` 欄）：
+  `splitTempPrefix` 要求 rest 非空（`^[\\/].+`）→ 原樣放行，host 端照字面
+  匹配＝靜默 0 結果。保守閘是刻意的（把 pattern 搬進 `path` 會重整呼叫形）
+  ；有機頻率極低，記為邊界（2026-11-03 稽核）。
 - `PATCH_PATH_LINE` 的 `[^\r\n]+?` 會抓到路徑行的行尾空白（實測：`*** Add File:
   /tmp/ws.txt ` 的路徑值帶尾隨空白）——host 解析會 trim、兩端收斂（審查時對照
   過），無需修。
@@ -469,6 +512,20 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   合法（`<<EOF/x` 的終止行就是字面 `EOF/x`）。兩者都必須認得：字元類窄了或
   引號分支要求至少一字元，本體就會被當指令掃描（＝改到資料，實測踩過
   `cat <<""` 把 heredoc 本體裡的 `cmd //c` 改了）。
+  **數字開頭定界符（2026-11-03 補）**：`<<2EOF`／`<<-2ND` 是合法 bash
+  heredoc（實測），定界符正則改為「詞內必須含字母/底線」（`\d*[A-Za-z_…]`）
+  ——此前數字開頭不認得，本體被當指令掃描、本體內的 `cmd //c` 遭改寫
+  （＝資料改寫；本 session 頂層呼叫實測觸發過這個誤修）；**pi 同源掃描器
+  同病灶（臺帳，2026-11-03）**：pi 自己的掃描器修前/修後對照實測（改前原始碼
+  ＝`git show HEAD`、hook 閘門實開、同一台機器）——修前 `cat <<2EOF\ncmd //c
+  ver\n2EOF` 的本體被改寫成 `cmd /c ver`、修後（套用本行正則的拋棄式副本）
+  本體原樣。即修法已同源驗證，但 pi host 的 live 端到端（pi 的 tool_call hook
+  → spawn 管道）未做 → 依「每 host 重新量過才留」pi 版未動，記臺帳待補：下次
+  pi session 用同一例子（`cat <<2EOF` 餵 bash 工具、看本體是否保真）過端到端
+  再移植＋釘樁；**純數字定界符 `<<3`
+  刻意不認**：與算術左移 `$((x<<2))` 靜態同形無法分辨（`<<3` 實測也是合法
+  heredoc），算術救不了那一側、heredoc 救不了這一側，有機頻率兩側皆 ~0，
+  記為邊界（電池釘 `<<2EOF` 認得、`$((1<<2))` 算術兩條）。
 - 跳脫字元屬於當前詞（`\>` 不構成運算子）；`2>&1` 的 `&` 不是分隔符。
 - POSIX 語法關鍵字（if/then/do/{/！…）、`FOO=bar` 前綴與 env/exec/command/
   builtin（後接指令字的閉集合）不結束指令位置；`#` 在詞首是註解——bash 忽略
