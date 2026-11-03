@@ -489,6 +489,95 @@ for (const [label, text] of [
 const shiftIdent = 'echo $((1<<SHIFT))\ncmd //c ver';
 check('P: BOUNDARY arithmetic <<NAME leaves the next line unrewritten', bc(shiftIdent).command === shiftIdent, JSON.stringify(bc(shiftIdent).command));
 
+// --- heredoc 佇列：一行多個 heredoc（實測 `cat <<A <<B`）---
+// 單槽會被後面的定界符覆蓋：第一個本體內出現 B 行時就提前結束，之後的行被
+// 當指令掃描——印刷出來的本體因此從 `cmd //c ver` 變成 `cmd /c ver`（資料
+// 改寫）。本體依開啟順序逐個吃完才是 bash 的語意。
+const hdMultiEarly = 'cat <<A <<B\nB\nA\ncmd //c ver\nB';
+check('P: multi-heredoc keeps the printed body literal', bc(hdMultiEarly).command === hdMultiEarly, JSON.stringify(bc(hdMultiEarly).command));
+const hdMultiQueued = 'cat <<A <<B\nB\nA\ncmd //c ver\nB\ncmd //c ver\nA\nB';
+flagCase('multi-heredoc: the command after all bodies is rewritten', hdMultiQueued,
+  'cat <<A <<B\nB\nA\ncmd //c ver\nB\ncmd /c ver\nA\nB');
+const hdMultiThree = 'cat <<A <<B <<C\nx\nA\ny\nB\nz\nC\ncmd //c ver';
+flagCase('three heredocs on one line', hdMultiThree, 'cat <<A <<B <<C\nx\nA\ny\nB\nz\nC\ncmd /c ver');
+
+// --- ANSI-C／locale 引號定界符（`<<$'EOF'`、`<<$"EOF"`）---
+// 實測都是合法 heredoc（定界符 word 不做展開，但 `$'…'` 裡的跳脫會先解開）。
+// 認不得就會把本體當指令掃描 ＝ `cmd //c` 被改成 `cmd /c`（資料改寫）。
+for (const [label, text] of [
+  ["$'EOF'", "cat <<$'EOF'\ncmd //c ver\nEOF"],
+  ['$"EOF"', 'cat <<$"EOF"\ncmd //c ver\nEOF'],
+]) {
+  check(`P: ${label} delimiter keeps the body literal`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
+// 帶跳脫的 ANSI-C 定界符（`$'E\tF'`）靜態算不準（`\t` 是真 tab）→ 整條指令
+// 原樣放行（inert，安全方向：寧可漏修），連後面的真指令都一起放掉。
+const hdAnsicEsc = String.raw`echo hi; cat <<$'E\tF'` + '\ncmd //c ver\nE\tF';
+check('P: INERT escaped ANSI-C delimiter leaves everything untouched', bc(hdAnsicEsc).command === hdAnsicEsc, JSON.stringify(bc(hdAnsicEsc).command));
+// 帶反斜線的非 ANSI-C 引號定界符（`<<'E\\F'`，event 兩個）比對要過 transport
+// fold：bash 看到的定界符是 `E\F`，終止行也是 → 本體是資料。
+const hdQuotedBs = "cat <<'E\\\\F'\ncmd //c ver\nE\\\\F";
+check('P: quoted delimiter with backslashes keeps the body literal', bc(hdQuotedBs).command === hdQuotedBs, JSON.stringify(bc(hdQuotedBs).command));
+
+// --- ANSI-C 字串 `$'…'` 裡的 \' ---
+// 實測 `echo $'a\'b'` 印 `a'b`：`\'` 不結束字串。認錯就會把字串後半當命令，
+// `echo $'x\' ; cmd //c ver'` 的資料被改成 `cmd /c ver`（資料改寫）。
+const ansicData = String.raw`echo $'x\' ; cmd //c ver'`;
+check('P: data inside ANSI-C string is untouched', bc(ansicData).command === ansicData, JSON.stringify(bc(ansicData).command));
+flagCase("ANSI-C string then a real command (rewritten)", String.raw`echo $'a\'b'; cmd //c ver`, String.raw`echo $'a\'b'; cmd /c ver`);
+flagCase('ANSI-C string with \n escape', String.raw`echo $'a\nb'; cmd //c ver`, String.raw`echo $'a\nb'; cmd /c ver`);
+
+// --- 反斜線 run 的奇偶：判定照 bash 看到的那份（transport 先縮一層）---
+// bash 實測：`"\$(x)"`（run 1）與 `"\\$(x)"`（run 2）都印**字面** `$(x)`；
+// `"\\\$(x)"`（run 3）＝字面反斜線＋**真**替換。舊碼在 event 字串上成對消費：
+// run 2 被當真替換改寫（資料靜默被改）、run 3 反而漏修。
+for (const [label, text] of [
+  ['run 1', String.raw`echo "\$(cmd //c ver)"`],
+  ['run 2', String.raw`echo "\\$(cmd //c ver)"`],
+  ['run 2 in fn body', String.raw`f() { echo "\\$(cmd //c ver)"; }; f`],
+]) {
+  check(`P: dq literal $() untouched (${label})`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
+flagCase('dq run 3 = literal backslash + real substitution', String.raw`echo "\\\$(cmd //c ver)"`, String.raw`echo "\\\$(cmd /c ver)"`);
+flagCase('dq run 4 = real substitution', String.raw`echo "\\\\$(cmd //c ver)"`, String.raw`echo "\\\\$(cmd /c ver)"`);
+// 收尾引號也看奇偶：run 2（fold 後 1）→ 引號被跳脫、字串沒收；run 4（fold 後 2）
+// → 引號真的收尾，後面的 `cmd //c` 是真指令。
+flagCase('dq closed after run 4, next command rewritten', String.raw`echo "a\\\\" ; cmd //c ver`, String.raw`echo "a\\\\" ; cmd /c ver`);
+
+// --- 未引號 Windows 路徑：反斜線 run 3 以上才是真的 cmd ---
+// bash 實測（每個分隔符的 run 長度，bash 看到的字串）：1 → `C:Windows…`（127）、
+// 2 → 真的跑 cmd、3/4 → 真的跑 cmd。event 要先過 transport fold（3→2、4→2），
+// 所以 event run ≥3 是真的 cmd（先前「全刪反斜線」比對把它當 `C:Windows…` 漏修）。
+for (const [label, text] of [
+  ['event run 1', String.raw`C:\Windows\System32\cmd.exe //c ver`],
+  ['event run 2', String.raw`C:\\Windows\\System32\\cmd.exe //c ver`],
+]) {
+  check(`P: unquoted windows path ${label} untouched (native 127)`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
+flagCase('unquoted windows path event run 3 is real cmd', String.raw`C:\\\Windows\\\System32\\\cmd.exe //c ver`, String.raw`C:\\\Windows\\\System32\\\cmd.exe /c ver`);
+flagCase('unquoted windows path event run 4 is real cmd', String.raw`C:\\\\Windows\\\\System32\\\\cmd.exe //c ver`, String.raw`C:\\\\Windows\\\\System32\\\\cmd.exe /c ver`);
+// 尾反斜線仍不命中（程式名不是 cmd）：event run 2/3/4 都是 127
+for (const text of [String.raw`cmd\\ //c ver`, String.raw`cmd\\\ //c ver`, String.raw`cmd\\\\ //c ver`]) {
+  check(`P: trailing backslashes untouched ${text}`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
+check('P: c\\\\\\md (event run 3) is 127, untouched', bc(String.raw`c\\\md //c ver`).command === String.raw`c\\\md //c ver`, JSON.stringify(bc(String.raw`c\\\md //c ver`)));
+flagCase('c\\\\md (event run 2) is still cmd', String.raw`c\\md //c ver`, String.raw`c\\md /c ver`);
+
+// --- here-string `<<<` 不是 heredoc ---
+// 舊碼讓第二個 `<` 跟第三個 `<` 配成 `<< "…"`：引號內容被當定界符，整條指令的
+// `$(…)` 被當本體吞掉（真替換漏修：本機 banner、原生 version），後面的行也一起埋。
+flagCase('here-string with quoted substitution', 'cat <<< "$(cmd //c ver)"', 'cat <<< "$(cmd /c ver)"');
+flagCase('here-string does not swallow the next line', 'cat <<< hi\ncmd //c ver', 'cat <<< hi\ncmd /c ver');
+check('P: here-string data is untouched', bc("cat <<< 'a$(cmd //c ver)'").command === "cat <<< 'a$(cmd //c ver)'", JSON.stringify(bc("cat <<< 'a$(cmd //c ver)'")));
+check('P: here-string plus real heredoc keeps the body literal', bc('cat <<< x <<EOF\ncmd //c ver\nEOF').command === 'cat <<< x <<EOF\ncmd //c ver\nEOF', JSON.stringify(bc('cat <<< x <<EOF\ncmd //c ver\nEOF')));
+
+// --- builtin cmd //c 是零效應（`builtin` 只查內建表，cmd 不是內建）---
+// 實測 exit 1、`builtin: cmd: not a shell builtin`、兩種轉換狀態同訊息：
+// 改寫旗標只改死文字。`builtin exec／command cmd //c` 仍照常（cmd 真的跑）。
+check('P: builtin cmd //c untouched (zero-effect rewrite removed)', bc('builtin cmd //c ver').command === 'builtin cmd //c ver', JSON.stringify(bc('builtin cmd //c ver')));
+flagCase('builtin exec cmd //c still rewritten', 'builtin exec cmd //c ver', 'builtin exec cmd /c ver');
+flagCase('builtin command cmd //c still rewritten', 'builtin command cmd //c ver', 'builtin command cmd /c ver');
+
 // --- rewriteBashCommand: token state must not leak out of substitutions ---
 // Measured in bash: in `echo `y` cmd …` the substitution IS the command word, so
 // `cmd` is only an argument; same for `FOO=bar `y` cmd …` and for `echo hi`y` …`.
@@ -686,13 +775,22 @@ for (const c of misses) {
 }
 
 // --- 跳脫的 \$ ( ：字面資料、不是替換開頭 ---
-// bash 實測：雙引號內 "\$(x)" 印字面 $(x)（$ 被跳脫）；"\\$(x)" 才是字面
-// 反斜線＋真替換（印 "\<pwd>"）。成對消費跳脫序之前的掃描器把 "\$( )" 內
-// 當替換掃描改寫＝靜默誤修 echo 的資料。dq 形兩種 gate 狀態都不動；
-// 裸 \$ ( 原生本來就是語法錯誤（大聲、exit 2），改寫前後同形。
-check('P: dq "\\$(" 字面資料不動',
-  bc('echo "\\$(cmd //c ver)"').command === 'echo "\\$(cmd //c ver)"', JSON.stringify(bc('echo "\\$(cmd //c ver)"')));
-flagCase('dq "\\\\$(" 是真替換，照修', 'echo "\\\\$(cmd //c ver)"', 'echo "\\\\$(cmd /c ver)"');
+// bash 實測（腳本檔傳輸＝bash 原樣看到的字串）：雙引號內 "\$(x)" 與
+// "\\$(x)"（run 2）都印字面 `$(x)`——transport 先把每組 \\ 縮成 \（見
+// index.ts foldTransport），所以 run 2 到 bash 只剩 1；run 3（"\\\$(x)"）
+// 縮成 2＝字面反斜線＋**真**替換。舊掃描器在 event 字串上成對消費跳脫序：
+// run 2 被當真替換改寫＝靜默誤修 echo 的資料、run 3 反而漏修。
+// 裸 \$ ( 原生本來就是語法錯誤（大聲、exit 2），改寫只影響 stderr 回印行。
+for (const c of [
+  'echo "\\$(cmd //c ver)"',
+  'echo "\\\\$(cmd //c ver)"',
+  'f() { echo "\\\\$(cmd //c ver)"; }; f',
+]) {
+  const r = bc(c);
+  check(`P: dq 字面 $() 不動 ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+flagCase('dq run 3＝字面反斜線＋真替換，照修', 'echo "\\\\\\$(cmd //c ver)"', 'echo "\\\\\\$(cmd /c ver)"');
+flagCase('dq run 4＝真替換，照修', 'echo "\\\\\\\\$(cmd //c ver)"', 'echo "\\\\\\\\$(cmd /c ver)"');
 flagCase('裸 \\$( 內部照掃（原生同為語法錯誤）', 'echo \\$(cmd //c ver)', 'echo \\$(cmd /c ver)');
 
 // --- taskkill 事件原形（CS0016 檔案鎖定那條）：整條對 env-guard 是 no-op ---

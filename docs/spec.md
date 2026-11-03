@@ -350,8 +350,11 @@ temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境�
   不改任何指令語意。插件端**看不到原始位元組**（hook 拿到的是折疊前的字串，spawn
   時 transport 再折一層），「把反斜線加倍」會同時破壞合法的 `\n`、`\ `、`\|`＝誤修
   風險遠大於漏修 ⇒ 留臺帳、不補貼。**oc 與 pi 的折疊相同**（live 2026-11-04：2→1、
-  4→2）——差別在 `isCmdTok` 的模型：oc 現在模擬「transport fold＋lexer 一層」
-  （3/4 個反斜線的真實路徑會命中），pi 仍用全去反斜線（3/4 漏修，未動 pi）。
+  4→2）。**掃描器端要模擬它**（2026-11-04 第二輪，兩 host 同）：`isCmdTok` 用
+  「transport fold＋lexer 一層」（`lexWord`）、跳脫／引號收尾用 `foldedRun` 奇偶
+  ——不模擬就會把 run 2 的 `"\\$(…)"`（bash 看到的是字面）當真替換改寫＝資料
+  改寫，而 run 3 的真替換反而漏修；未引號 Windows 路徑 3/4 個反斜線（真的跑 cmd）
+  也會漏修。**折疊本身的位元組損失仍然不可修**（插件看不到原始位元組）。
   實務：要保位元組的 payload（heredoc 內的
   `\\`、正則、Windows 路徑字面）用 write 工具落檔或 `\134` 寫法。
 
@@ -433,6 +436,57 @@ MSYS 自己轉），比 exit＋stdout。結果與處置：
   "eg-*.txt")` 找得到；但拆前綴會把 fd 從 full-path 切成 basename 遞迴
   （1→3 筆，多出子目錄）＝改語意 → **不修**，形狀入〈只能靠寫對的形〉。
 
+**2026-11-04 第二輪（pi；oc 端交叉驗證回報逐條複驗）**：oc 端 agent 那輪的
+6 類修正＋2 條附帶逐條拿到 pi 重測（同一套三態 harness：`fold()` 模擬 transport、
+local＝轉換關、native＝`env -u MSYS_NO_PATHCONV -u BASH_ENV`、rewritten＝新模組
+餵出的字串；`fold` 模型先用 live 探針驗（run 2→1、3→2、4→2、6→3；lone `\` 不動；
+單引號內也折）。local／native／rewritten 一律比 exit＋stdout＋stderr。結果：
+
+- **成立且已修（真誤修／資料被改）**：
+  - **一行多個 heredoc**：pi 是單槽（後面的定界符覆蓋前面的），不是 oc 的
+    「第一個本體提前結束」；要第一個本體內出現**第二個**定界符行才爆。實測
+    `cat <<A <<B` + `B`／`A`／`cmd //c ver`／`B`：bash 印的本體是
+    `cmd //c ver`（local≡native），pi 改成 `cmd /c ver`。改法＝佇列
+    （`pendingHeredocs`，本體依開啟順序逐個吃完）。
+  - **ANSI-C／locale 引號定界符**：`<<$'EOF'`、`<<$"EOF"` 實測合法，pi 不認得
+    → 本體被改寫。現在認得；內容帶反斜線的（`<<$'E\tF'`，`\t` 是真 tab）靜態
+    算不準 → **整條指令 inert**（原樣放行，安全方向）。
+  - **ANSI-C 字串 `$'…'` 裡的 `\'`**：`echo $'x\' ; cmd //c ver'` 的資料被改成
+    `cmd /c ver`（local≡native 都印 `x' ; cmd //c ver`）——pi 在第一個 `'` 提前
+    收尾。同一個修法把 `echo $'a\'b'; cmd //c ver`（字串後真的接指令，先前漏修）
+    變成修復。
+  - **反斜線奇偶（transport fold）**：`echo "\\$(cmd //c ver)"`（event run 2）
+    local／native 都印字面 `$(cmd //c ver)`，pi 把內部的 `//c` 改掉＝資料改寫；
+    `echo "\\\$(cmd //c ver)"`（run 3）反而是真替換、pi 漏修。現在主迴圈／
+    `scanDq`／`matchParen`／雙引號收尾／ANSI-C 收尾全部按 `foldedRun` 奇偶判定
+    （run 1–2 字面、3–4 真替換；收尾引號同理，`echo "a\\\\" ; cmd //c ver` 現在
+    會改寫）。
+  - **未引號 Windows 路徑**：event run 1–2 → bash 看到 `C:Windows…`（127，不動）；
+    run 3–4 → 真的跑 cmd（local banner、native ver），舊「全刪反斜線」模型兩者
+    同字 → **漏修**。現在 `isCmdTok` 用 `lexWord`（fold＋lexer）：3/4 命中並改寫，
+    並回頭把 `c\\\md`（event run 3、原生 127）從「被改寫」變成不動。
+  - **here-string `<<<`**：舊碼讓第二個 `<` 跟第三個 `<` 配成 `<< "…"`——引號內容
+    被當定界符，`cat <<< "$(cmd //c ver)"` 的真替換被當本體吞掉（local banner、
+    native ver），後面的行也一起埋。現在 `<<<` 不進 heredoc 分支（前後都不是 `<`）。
+  - **`builtin cmd //c` 零效應**：`builtin` 只查內建表、cmd 不是內建 → 實測 exit 1、
+    `builtin: cmd: not a shell builtin`、兩態同訊息，改寫只落在死文字。已不改寫；
+    `builtin exec／command cmd //c` 仍照常（位置由 exec/command 提供）。
+- **不成立（pi 沒有這個缺陷；oc 段落的 pi 對照句已改）**：
+  - **`case` 的 `;&` fallthrough**：`;&` 之後的樣式**永遠不會被比對**（bash 直接
+    跳去下一個 body），所以即使 pi 把那段樣式當 body 掃也沒有可観測差異。實測
+    可匹配的形（`case "cmd //c ver" in a) true;& cmd\ //c\ ver) echo HIT;; esac`）
+    三態都是 `HIT`、pi 不改寫；`;;`／`;;&` 同樣不動。→ 不為它加狀態。
+  - **非 ASCII 定界符不是 pi 的缺口**：pi 自 2026-11-04 第一輪就有（含 astral
+    `<<😀`——UTF-16 surrogate 落在 `\u0080-\uFFFF` 內），兩邊現在都有。
+- **仍是邊界（兩 host 一致、記臺帳）**：`<<3`／`<<*X`／`<<.E`／`<<$S` 本體仍被掃
+  （pin 現況）；`$'cmd' //c`（ANSI-C 指令字）、`coproc cmd //c` 仍不修；
+  `echo \$(cmd //c ver)`（裸 `\$(` 是原生語法錯誤）改寫只影響 stderr 回印行；
+  `A+=/c/x` 不在 envp 形狀內。
+- **回歸**：既有 45 條 cmd/envp＋16 條 heredoc 全重跑，另加 ~40 條新語料
+  （`<<A <<B <<C`、heredoc 嵌 `if`、`<<<` 與 heredoc 同行、CRLF、`<<'E\\F'`
+  折疊比對、`time cmd //c`、閉合引號 parity）——除臺帳那幾條外全部
+  rewritten≡native；pi 電池 418 條（gate ON／OFF 各跑一次）。
+
 **零效應改寫稽核（oc，逐條實跑）**：同一份判準套到 oc 的掃描器與路徑面，找到並
 修掉下列「文字有變、行為一樣」或「改到資料」的形：
 
@@ -444,18 +498,22 @@ MSYS 自己轉），比 exit＋stdout。結果與處置：
   `\cmd`／`c\md`（1）與 `c\\md`（2）命中，`c\\\md`／`c\\\\md`（3/4）留字面 `\`
   （原生 127）→ 不動。引號詞不經 lexer 跳脫，反斜線是字面分隔符：
   `"C:\Windows\…\cmd.exe"`、`"/c/Windows\…"` 實測會跑 cmd，照樣命中（`"c\md"`
-  的 basename 是 `md`，不命中）——各形都有釘樁。**pi 不動**：transport 折疊相同，
-  但 pi 的全刪規則對 3/4 仍是漏修（記在臺帳，未在本輪修改 pi）。
+  的 basename 是 `md`，不命中）——各形都有釘樁。**pi 同輪套用同一個模型**
+  （`lexWord`＝fold＋lexer：3/4 命中、1/2 不動、`c\\\md`（event 3）回到不動；
+  見上節 pi 第二輪）。
 - **雙引號／ANSI-C 的反斜線奇偶（2026-11-04 live，oc）**：transport 先折 `\\`，
   舊掃描器卻在 event 字串上成對消費 → event 2 的 `echo "\\$(cmd //c ver)"`
   （native 印字面 `$(cmd //c ver)`）被改成 `$(cmd /c ver)`＝**資料改寫**；
   event 3（native 是真替換）反而漏修。現在 `backslashRun` 按 folded 奇偶判定，
   `scanDq`／`matchParen`／雙引號收尾／ANSI-C 收尾／主迴圈跳脫全部共用；
   event 2 不動、event 3/4 照常改寫。heredoc 的單引號定界符與終止行也先折疊再比
-  （transport 對整條 command 生效）。pi 尚未套用（記臺帳）。
+  （transport 對整條 command 生效）。**pi 同輪套用**（`backslashRun`／`foldedRun`
+  同一組輔助，見上節 pi 第二輪）。
 - **`builtin cmd //c`（零效應，2026-11-04 移除）**：`builtin` 只查內建表，cmd 不是
   內建 → bash 在 spawn 前就失敗；改寫旗標只改死文字。oc 現在不把 `builtin` 後的
-  cmd 當程式（`builtin exec/command cmd //c` 仍照常命中，因為位置來自 exec/command）。
+  cmd 當程式（`builtin exec/command cmd //c` 仍照常命中，因為位置來自 exec/command）；
+  pi 同輪同法（`commitTok` 裡 `prevTok === "builtin"` 就不開旗標區、也不留
+  prevTokCmdPos）。
 - `( … ) cmd //c`、`{ …; } cmd //c`、`if … fi cmd //c`、`while … done cmd //c`、
   `case … esac cmd //c`——原生語法錯誤（exit 2）。oc 現在把 group/subshell close
   與終止關鍵字（`fi`／`done`／`esac`／`}`）視為結束指令位置，不再改寫死文字；

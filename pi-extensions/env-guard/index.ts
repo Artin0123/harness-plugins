@@ -23,7 +23,8 @@
 //     雙斜線形（//? ///c //server/share）、緊貼形（cmd//c／"cmd"//c：bash 把它
 //     當程式名、原生 127 大聲失敗——插空格拆詞＝替模型改錯字）、exec/command/
 //     builtin 後的賦值形與引號詞裡的偽賦值形（bash 把它當指令名跑、原生就
-//     大聲失敗）、del 與 dir /b 等 cmd-ism
+//     大聲失敗）、`builtin cmd //c`（builtin 只查內建表、cmd 不是內建 → 兩態
+//     同訊息，改寫只落在死文字）、del 與 dir /b 等 cmd-ism
 //   漏修（回傳≠原生，但靜態修法＝開放集合的猜測、誤修風險大於漏修）：
 //     外部 wrapper 後的 cmd、taskkill/sc/net/reg/findstr/robocopy 等原生
 //     工具的 //x 旗標、原生 exe 的 POSIX 路徑參數、
@@ -33,18 +34,21 @@
 //     「envp 殘餘形」）、重導向前綴後的 cmd（`> log cmd //c ver` 合法、cmd 真的
 //     執行；重導向目標是 bash 自己解析的路徑，目標詞結束了指令位置——要修得
 //     先追「本 simple command 是否已有指令字」，為有機頻率 ~0 的形而加狀態
-//     不值得）、
-//     指令字串裡成對的反斜線抵達 bash 時只剩一個（病灶已
-//     量到：git-bash 對 `-c` 操作數的引號處理把成對反斜線縮一層，stdin／檔案
-//     傳輸保真；資訊在 hook 之前就丟了，加倍反斜線會破壞合法的跳脫＝誤修，
-//     見 spec 臺帳）、算術位移的識別字運算元（`$((1<<N))`／`((x<<N))`：`<<N`
+//     不值得）、加引號的 ANSI-C 定界符帶跳脫（`<<$'E\tF'`：定界符要展開才
+//     知道，整條指令 inert ＝漏修、安全方向）、$'cmd' //c 這種 ANSI-C 指令字、
+//     coproc cmd //c、算術位移的識別字運算元（`$((1<<N))`／`((x<<N))`：`<<N`
 //     被當 heredoc 開頭、等不到定界符 → 換行後整段不再改寫＝其後的 cmd 旗標
 //     與 envp 全部漏修；與 `$((1<<2))` 同形，兩側都靜態不可分，見 spec）
 //   已知邊界（非 bit-identical／有機頻率 ~0，記錄不修）：
+//     - 指令字串裡的成對反斜線抵達 bash 時只剩一個（病灶在 transport：git-bash
+//       對 `-c` 操作數做一次「每組 \\ → \」，stdin／檔案傳輸保真）。掃描器
+//       **模擬這層**（foldTransport／foldedRun／lexWord）所以判定是對的，但
+//       位元組損失本身修不了（hook 看不到原始位元組，加倍反斜線會破壞合法的
+//       跳脫＝誤修）——要保位元組請用 write 工具落檔或 `\134`。
 //     - 未引號定界符第一字是 ASCII 標點或純數字（`<<*X`、`<<.E`、`<<$S`、
 //       `<<3`…實測都合法）——掃描器不認得，本體會被當指令掃描；放寬第一字會
 //       把 `$((x<<$y))` 這類算術誤判成 heredoc，兩個方向都是猜。非 ASCII 第一
-//       字（`<<中文`、`<<·`）已納入（非 ASCII 不可能開算術/替換，放寬無風險）。
+//       字（`<<中文`、`<<·`、`<<😀`）已納入（非 ASCII 不可能開算術/替換）。
 //     - envp 值的冗餘分隔符與 `.` 段：MSYS 會正規化（`/c//x`→`C:/x`、
 //       `/c/./x`→`C:/x`），掃描器只做前綴替換（→`C://x`、`C:/./x`）——路徑
 //       語意等價、字串不同；要對齊就得在這裡重實作路徑正規化（誤修風險大於
@@ -181,6 +185,46 @@ export function pathConvDisabled(): boolean {
   return noPathConvCache;
 }
 
+// git-bash 對 `-c` 操作數做一次「每組 \\ → \」的縮減（2→1、3→2、4→2、6→3；
+// stdin／檔案傳輸保真）——hook 看到的是 event 字串，bash 看到的是縮過的
+// 那一份（本機實測：hook 看到 `'a\\b'`（run 2）時 bash 印 `a\b`（run 1）；
+// `"a\\$(echo Z)"`（run 2）印**字面** `a$(echo Z)`、`"a\\\$(echo Z)"`（run 3）
+// 印 `a\Z`＝字面反斜線＋真替換；`cmd\\ //c ver` 的程式名是 `cmd\`＝127）。
+// 所以「跳脫了嗎」的判定要照 bash 看到的那份：run 長度 n 縮成 ceil(n/2)，
+// 奇數＝下一個字元被跳脫、偶數＝這串是字面反斜線。輸出永遠照原樣複製
+//（縮減是 transport 的責任，在這裡動它就等於改寫合法跳脫＝誤修）；
+// 被改寫的字串（`//c`→`/c`、envp 值）都不含反斜線，所以原樣輸出後
+// transport 縮減的結果與原本一致。
+const foldTransport = (s: string) => s.replace(/\\\\/g, "\\");
+const foldedRun = (n: number) => Math.ceil(n / 2);
+
+// 位置 from 起的反斜線 run 長度
+function backslashRun(s: string, from: number): number {
+  let k = from;
+  while (k < s.length && s[k] === "\\") k++;
+  return k - from;
+}
+
+// 未引號詞在 bash 眼裡的樣子：transport 縮一層，再過 bash lexer 的跳脫（\x → x）。
+// 這是 `isCmdTok` 要的字——`C:\Windows\System32\cmd.exe`（event 每個分隔符一個
+// 反斜線）縮完只剩 `C:Windows…`（原生 127，不動）；`C:\\\Windows\\\…`（event
+// 三個）縮成兩個 → lexer 留一個真反斜線 → `C:\Windows\…`＝真的會跑 cmd。此前用
+// 「全刪反斜線」比對兩者會得到同一個字：後者（真的跑）漏修、`c\\\md`（127）
+// 反而改寫＝零效應。
+function lexWord(t: string): string {
+  const s = foldTransport(t);
+  let w = "";
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === "\\") {
+      k++;
+      if (k < s.length) w += s[k];
+      continue;
+    }
+    w += s[k];
+  }
+  return w;
+}
+
 // 在 s 中從 from 開始找與 "$(" 配對的 ")"，回傳其索引；找不到回傳 -1。
 // 需理解 bash 的巢狀：引號會重新開啟語境，但引號內的 $( )、反引號仍會作用，
 // 單引號則完全字面。遞迴處理雙引號內的命令取代。
@@ -190,7 +234,24 @@ function matchParen(s: string, from: number): number {
   while (i < s.length) {
     const c = s[i];
     if (c === "\\") {
-      i += 2;
+      const run = backslashRun(s, i);
+      i += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
+      continue;
+    }
+    if (c === "'" && i > 0 && s[i - 1] === "$") {
+      // ANSI-C 字串（$'…'）：\' 不結束、\\ 才是字面（實測 $'a\'b' 印 a'b、
+      // $'a\\' 收尾）；折疊後的奇偶判定同主迴圈
+      let p = i + 1;
+      while (p < s.length) {
+        if (s[p] === "\\") {
+          const run = backslashRun(s, p);
+          p += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
+          continue;
+        }
+        if (s[p] === "'") break;
+        p++;
+      }
+      i = p + 1;
       continue;
     }
     if (c === "'") {
@@ -203,7 +264,8 @@ function matchParen(s: string, from: number): number {
       let p = i + 1;
       while (p < s.length && s[p] !== '"') {
         if (s[p] === "\\") {
-          p += 2;
+          const run = backslashRun(s, p);
+          p += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
           continue;
         }
         if (s[p] === "$" && s[p + 1] === "(") {
@@ -369,7 +431,11 @@ function scanBash(command: string): BashScanResult {
   // 第一字也接受非 ASCII（`<<中文`、`<<·` 實測都是合法 heredoc）：先前只認 ASCII
   // 字母/底線，本體被當指令掃描、`cmd //c` 被改成 `cmd /c`（資料改寫）。非 ASCII
   // 字元不可能開 `$((x<<$y))` 這類算術（識別字是 ASCII）或 `$(`, 所以放寬安全。
-  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\d*[A-Za-z_\u0080-\uFFFF][^\s"'><;&|()\\`]*))/y; // sticky 已錨定 lastIndex
+  const heredoc = /<<(-?)[ \t]*(\\?)(?:(\$)?"([^"\r\n]*)"|(\$)?'([^'\r\n]*)'|(\d*[A-Za-z_\u0080-\uFFFF][^\s"'><;&|()\\`]*))/y; // sticky 已錨定 lastIndex
+  // `$'…'`／`$"…"`（ANSI-C／locale）也是合法定界符（實測 `cat <<$'EOF'`、
+  // `<<$'E\tF'`）；定界符 word **不做展開**，但 `$'…'` 内的跳脫會先解開，
+  // 靜態算不出來（`\t` 是真 tab）→ 帶反斜線的引號定界符整條指令原樣放行
+  //（inert，安全方向）：此前不認得這種形，本體被當指令掃描＝資料改寫。
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
   // 語法關鍵字閉集合：envp 觸發判定用（這些詞不是「真指令字」）。刻意大小寫
   // 敏感：大寫 ENV 是路徑上的程式名、IF/TIME 不是 bash 關鍵字。
@@ -412,8 +478,11 @@ function scanBash(command: string): BashScanResult {
   let out = "";
   let i = 0;
   const n = command.length;
-  let pendingDelim: string | null = null;
-  let pendingStripTabs = false; // <<- ：終止符行先去掉前導 tab 再比（bash 只去 tab，不去空白）
+  // heredoc 佇列：一行可以開多個（`cat <<A <<B`），本體依開啟順序逐個吃完。
+  // 單槽會被後面的定界符覆蓋——第一個本體內出現 B 行時就提前結束、之後的
+  // 資料被當指令掃描（實測 `cat <<A <<B` + `B`／`A`／`cmd //c ver`／`B`：
+  // 真正印出來的本體從 `cmd //c ver` 變成 `cmd /c ver`＝資料改寫）。
+  const pendingHeredocs: { delim: string; stripTabs: boolean }[] = [];
   let inHeader = false;
   let cmdFlagFixed = false;
   let envPathFixed = false;
@@ -474,19 +543,20 @@ function scanBash(command: string): BashScanResult {
   // cmd 指令字用 **bash 實際看到的字** 的 basename 比對：
   //   `\cmd`、`c\md`、`/c/Windows/System32/cmd.exe`、`"C:/…/cmd.exe"` 都是同一顆
   //   cmd（實測轉換關閉時全進互動式 banner＝同一個故障）
-  // 未引號詞裡的反斜線是 bash 的跳脫字元（`\c` → `c`、`C:\Win…` → `C:Win…`），
-  // 所以要比對的是**去跳脫後的詞**：不改的話 `C:\Windows\System32\cmd.exe` 會被
-  // basename 命中而改寫，但它原生是 127（不存在的程式名）⇒ 改寫只落在死文字上
-  // （文字有變、行為完全一樣＝零效應改寫，实测確認）。反之 `c\md //c` 去跳脫
-  // 後就是 `cmd`，是真的會跑的指令——這一條同時把那個漏修變成修復。
-  // 引號詞的內容不經跳脫（雙引號内 `\W` 保留反斜線），所以照原樣取 basename。
-  // 未引號詞**尾**的反斜線例外：`cmd\\ //c ver` 的成對反斜線先被 bash 縮成一個，
-  // 再讓它跳脫後面的分隔符 → bash 看到的程式名是 `cmd\` 而不是 cmd（實測 rc 127
-  // 、兩種轉換狀態同訊息）。這種詞不是指令字，不改寫（oc 同守門）；不加這道
-  // 判斷就是零效應改寫（文字有變、行為一樣），與本檔的稽核標準衝突。
+  // 未引號詞要算的是「transport 縮一層後、再過 bash lexer」的字（lexWord）：
+  //   `c\md`（1）→ `cmd` 命中；`c\\md`（2）→ 縮成 `c\md` → lexer 仍是 `cmd`；
+  //   `c\\\md`（3）→ 縮成 `c\\md` → lexer 留字面反斜線 → 127（不動）
+  //   `C:\Windows\…\cmd.exe`（1）→ `C:Windows…`（127，不動）；
+  //   `C:\\\Windows\\\…`（3）→ `C:\Windows\…`＝真的跑 cmd（此前全刪反斜線
+  //   比對兩者會得到同一個字，後者漏修、前者反而被改寫）。
+  // 引號詞的內容不經 lexer（雙引號内 `\W` 保留反斜線），照原樣取 basename。
+  // 未引號詞**尾**的反斜線例外：`cmd\\ //c ver` 的成對反斜線先被 transport
+  // 縮成一層、再讓它跳脫後面的分隔符 → bash 看到的程式名是 `cmd\` 而不是 cmd
+  //（實測 rc 127、兩種轉換狀態同訊息）。這種詞不是指令字，不改寫（oc 同守門）。
   const isCmdTok = (t: string, quoted = false) => {
-    if (!quoted && /\\$/.test(t)) return false;
-    const word = quoted ? t : t.replace(/\\/g, "");
+    const folded = foldTransport(t);
+    if (!quoted && folded.endsWith("\\")) return false; // 尾反斜線跳脫分隔符
+    const word = quoted ? t : lexWord(t);
     const base = word.split(/[\\/]/).pop()!.toLowerCase();
     return base === "cmd" || base === "cmd.exe";
   };
@@ -559,7 +629,15 @@ function scanBash(command: string): BashScanResult {
     }
     // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
-    if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) cmdFlagZone = true;
+    if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) {
+      // `builtin cmd`：`builtin` 只查內建表、cmd 不是內建 → bash 在 spawn 前就
+      // 失敗（實測 exit 1、`builtin: cmd: not a shell builtin`、兩種轉換狀態同
+      // 訊息）⇒ 改寫旗標只改死文字＝零效應。讓 `cmd` 不取得旗標區、也不留
+      // prevTokCmdPos（`//x` 分支的 atCmd 看它），就不改寫；`builtin exec／
+      // command cmd //c` 仍照常（位置由 exec/command 提供，cmd 真会被打開）。
+      if (prevTok === "builtin") prevTokCmdPos = false;
+      else cmdFlagZone = true;
+    }
     // 前綴賦值路徑改寫的暫存／套用：賦值 token（整詞未引號、值可轉換）在
     // 指令位置 → 暫存；非賦值、非語法關鍵字的 token 在指令位置落地 ＝
     // simple command 的指令字 → 此時暫存賦值確定會進它的 envp，套用。
@@ -599,10 +677,12 @@ function scanBash(command: string): BashScanResult {
 
   // 双引號內的 $( ) 與 `…` 會真的被 bash 執行（如 R="$(cmd //c ver)"），
   // 必須遞迴掃描；引號本身是字面，但命令取代區域內是完整 shell 語法。
-  // 跳脫序成對消費："\$" 的 $ 是字面（其後 "(" 是資料、不是替換開頭——
-  // bash 實測 "\$(x)" 印字面 $(x)；改此修之前 "\$( )" 內被當替換掃描改寫＝
-  // 靜默誤修 echo 的資料）；"\\" 是字面反斜線、其後的 $( 才是真替換（實測
-  // "\\$(pwd)" 印 "\<pwd>"）——成對跳過讓兩側都對。
+  // 反斜線 run 的跳脫判定看 fold 後的奇偶（見 foldTransport）：奇數 → 下一個
+  // 字元是字面（`\$(` 不開替換）；偶數 → 這串是字面反斜線、`$(` 是真的替換。
+  // 實測（event run ／ bash 看到的）：run 2 → `\$(` 字面；run 3 → `\\$(`＝字面
+  // 反斜線＋真替換。
+  // 此前成對消費（每次跳兩個）在 event 字串上判：`"\\$(cmd //c ver)"` 被當
+  // 真替換改寫＝資料靜默被改；`"\\\$(cmd //c ver)"` 反而漏修。
   const scanDq = (seg: string): string => {
     let s = "";
     let k = 0;
@@ -610,8 +690,14 @@ function scanBash(command: string): BashScanResult {
     while (k < m2) {
       const c = seg[k];
       if (c === "\\") {
-        s += seg.slice(k, k + 2);
-        k += 2;
+        const run = backslashRun(seg, k);
+        const odd = foldedRun(run) % 2 === 1;
+        s += seg.slice(k, k + run);
+        k += run;
+        if (odd && k < m2) {
+          s += seg[k];
+          k++;
+        }
         continue;
       }
       if (c === "$" && seg[k + 1] === "(") {
@@ -656,18 +742,25 @@ function scanBash(command: string): BashScanResult {
     // 不能用 trim()——bash 不把空白差異當終止符，提早結束會讓「仍是本體」的資料
     // 被當指令掃描、進而改寫（`cat <<'EOF'` 後一行 `  EOF` 就是這種案例）。
     // 只容許行尾一個 \r：CRLF 文字下 bash 的 delimiter 也帶 \r，兩邊一起去掉才等價。
-    if (pendingDelim !== null && !inHeader) {
+    // 比對前兩邊都先過 transport fold：hook 看到的是 event 字串、bash 看到的是
+    // 縮過的一份，所以 `<<'E\\F'`（event 兩個）的定界符是 `E\F`、終止行 `E\F`
+    // 才算相等（fold 是函數：event 相等 ⇒ bash 看到的也相等，反向不成立——
+    // 不 fold 只會讓本體多收（漏修、安全方向），不會提早結束）。
+    if (pendingHeredocs.length && !inHeader) {
+      const hd = pendingHeredocs[0]!;
       let lineEnd = command.indexOf("\n", i);
       if (lineEnd === -1) lineEnd = n;
       const rawLine = command.slice(i, lineEnd);
       const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-      if ((pendingStripTabs ? line.replace(/^\t+/, "") : line) === pendingDelim) {
+      const candidate = hd.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (foldTransport(candidate) === foldTransport(hd.delim)) {
         out += command.slice(i, Math.min(lineEnd + 1, n));
         i = lineEnd + 1;
-        pendingDelim = null;
+        pendingHeredocs.shift();
         curTok = "";
         clearTok();
-        cmdPosNext = true; // 標記行後是新指令列
+        // 同一行開的多個 heredoc：還在本體模式就接著吃下一個（標記行不是新指令）
+        cmdPosNext = pendingHeredocs.length === 0;
         continue;
       }
       out += command.slice(i, Math.min(lineEnd + 1, n));
@@ -675,7 +768,7 @@ function scanBash(command: string): BashScanResult {
       continue;
     }
     const ch = command[i];
-    if (ch === "\n" && pendingDelim !== null && inHeader) {
+    if (ch === "\n" && inHeader) {
       out += "\n";
       i++;
       inHeader = false;
@@ -684,11 +777,22 @@ function scanBash(command: string): BashScanResult {
       continue;
     }
     if (ch === "\\") {
-      const seg = command.slice(i, i + 2);
+      // 反斜線 run：跳脫判定看 bash 看到的那份（transport 先縮一層，見
+      // foldTransport 註解）。奇數 → 下一個字元被跳脫（屬於同一個詞、不觸發
+      // 任何分支）；偶數 → 這串是字面反斜線，下一個字元照常處理（`\\$(` 在
+      // bash 是真的替換、`\\\\"` 是真的收尾引號）。
+      const run = backslashRun(command, i);
+      const odd = foldedRun(run) % 2 === 1;
+      const seg = command.slice(i, i + run);
       out += seg;
       curTok += seg; // 跳脫字元屬於當前詞（\> 不構成運算子）
-      if (command[i + 1] === "$") escapedDollar.add(i + 1); // \$：$ 是字面（見 escapedDollar）
-      i += 2;
+      i += run;
+      if (odd && i < n) {
+        if (command[i] === "$") escapedDollar.add(i); // \$：$ 是字面（見 escapedDollar）
+        out += command[i];
+        curTok += command[i];
+        i++;
+      }
       continue;
     }
     if (ch === "'") {
@@ -701,7 +805,28 @@ function scanBash(command: string): BashScanResult {
       const feedTok = curTok === "" && cmdPosNext;
       commitTok();
       funcAwaitBody = false; // 引號詞不是函式本體
-      const end = command.indexOf("'", i + 1);
+      // ANSI-C 字串（`$'…'`）：`\'` 不結束、`\\` 才是字面（實測 `$'a\'b'` 印
+      // `a'b`、`$'a\\'` 收尾）——不認這個前綴就會在第一個 `'` 提前收尾，
+      // 把字串後半當命令掃描（實測 `echo $'x\' ; cmd //c ver'` 的資料被改成
+      // `cmd /c ver`＝資料改寫）。前綴 `$` 已進 curTok，不另外餵 token（ANSIC
+      // 指令字 `$'cmd' //c` 留在漏修臺）。
+      let end: number;
+      if (command[i - 1] === "$") {
+        end = i;
+        let p = i + 1;
+        while (p < n) {
+          if (command[p] === "\\") {
+            const run = backslashRun(command, p);
+            p += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
+            continue;
+          }
+          if (command[p] === "'") break;
+          p++;
+        }
+        end = p < n ? p : -1;
+      } else {
+        end = command.indexOf("'", i + 1);
+      }
       if (end === -1) {
         const seg = command.slice(i);
         out += seg;
@@ -720,11 +845,14 @@ function scanBash(command: string): BashScanResult {
       const feedTok = curTok === "" && cmdPosNext;
       commitTok();
       funcAwaitBody = false; // 引號詞不是函式本體
-      // 找關閉引號：$() 與反引號內會重新開啟引號語境，需跳過整個命令取代區域
+      // 找關閉引號：$() 與反引號內會重新開啟引號語境，需跳過整個命令取代區域；
+      // 反斜線 run 的跳脫判定看 fold 後的奇偶（`\\\\"` → 字面反斜線＋真收尾、
+      // `\\\"` → 字面引號——與 bash 一致，見 foldTransport）。
       let j = i + 1;
       while (j < n && command[j] !== '"') {
         if (command[j] === "\\") {
-          j += 2;
+          const run = backslashRun(command, j);
+          j += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
           continue;
         }
         if (command[j] === "$" && command[j + 1] === "(") {
@@ -759,14 +887,21 @@ function scanBash(command: string): BashScanResult {
       i = j + 1;
       continue;
     }
-    if (ch === "<" && command[i + 1] === "<") {
+    // here-string `<<<` 不是 heredoc：舊碼讓第二個 `<` 跟第三個 `<` 配成
+    // `<< "…"`（引號內容被當定界符）→ 整條指令的 `$(…)` 被當本體吞掉、
+    // 真替換漏修（實測 `cat <<< "$(cmd //c ver)"`：本機 banner、原生 version）。
+    if (ch === "<" && command[i + 1] === "<" && command[i + 2] !== "<" && command[i - 1] !== "<") {
       commitTok();
       funcAwaitBody = false; // heredoc 不是函式本體
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
-        pendingDelim = m[3] ?? m[4] ?? m[5]!;
-        pendingStripTabs = m[1] === "-";
+        const delim = m[4] ?? m[6] ?? m[7]!;
+        // `$'…'`／`$"…"` 的內容會被展開（`\t` 是真 tab），靜態算不準 → inert
+        if ((m[3] !== undefined || m[5] !== undefined) && delim.includes("\\")) {
+          return { command, cmdFlagFixed: false, envPathFixed: false };
+        }
+        pendingHeredocs.push({ delim, stripTabs: m[1] === "-" });
         inHeader = true;
         out += m[0];
         i += m[0].length;
