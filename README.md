@@ -169,14 +169,20 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法不同：
 | 項目                                                  | pi 版做法                                                                                                                                        |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/tmp`、`$TEMP`、`$TMP`、`$TMPDIR`、`%TEMP%`、`%TMP%` | 檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到 `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）                          |
-| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴與獨立成詞的引號指令字（`"cmd" //c`——引號不改變 word 身分）；指令字用 basename 比對，`\cmd`、`/c/Windows/System32/cmd.exe`、`"C:/…/cmd.exe"` 都是同一顆 cmd（實測三形同一個故障）。外部 wrapper 如 timeout/xargs 維持不修＝漏修臺：靜態修法需開放集合的參數結構猜測 |
+| `cmd //c` / `//k`                                     | bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗不改寫。指令位置含 env/exec/command/builtin 前綴與獨立成詞的引號指令字（`"cmd" //c`——引號不改變 word 身分），但**不含複合指令的收尾詞**（`fi`／`done`／`esac`／`}` 後接指令是語法錯誤）且 `f()` 後只認複合本體；指令字用 basename 比對，`\cmd`、`/c/Windows/System32/cmd.exe`、`"C:/…/cmd.exe"` 都是同一顆 cmd（實測三形同一個故障）。外部 wrapper 如 timeout/xargs 維持不修＝漏修臺：靜態修法需開放集合的參數結構猜測 |
 | 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字） | 原生 git-bash 的 envp 轉換（name-agnostic，只看值語法）會把值轉成 Windows 形式；本機被 `MSYS_NO_PATHCONV` 停用 → 值原樣抵達、被當磁碟相對路徑寫到 `C:\c\...`（靜默錯位）。重現該層規則改寫（盤符→`C:/...`、`/tmp`→錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）與引號內建（`A=/c/x "bash" -c`）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發，實測這些形原生不走 envp 轉換或方向安全；`env X=/c/... node` 的賦值參數會跨邊界、照樣修，exec/command/builtin 後的賦值形原生就錯、不修） |
 
 **零效應改寫不新增**：會被改寫的輸入都真的跑過「原版 vs 改寫版」比對 exit 與
-stdout（88 條語料，2026-11-03 重跑）——文字有變、行為一樣的形一律不動（細節見
-spec）：38 條被改寫的輸入有 37 條「改寫後 ≡ 原生」，唯一例外是 `case $x in
-esac) …`（語法錯誤行）這條已記載的死文字改寫；`cmd\\ //c`（詞尾成對反斜線、
-bash 當程式名 `cmd\`）原本也是零效應，已改成不動。
+stdout（2026-11-03：88 條；2026-11-04：再加 45 條 cmd/envp＋16 條 heredoc＋22 條
+envp 變體，每條在 git-bash 腳本檔跑 local（轉換關閉）、native（`env -u
+MSYS_NO_PATHCONV -u BASH_ENV`）、rewritten 三態；詳細證據見 spec）。2026-11-04 的
+結果：三類**真的有害**的形已修——① `echo $(case x in esac) cmd //c ver`（空 case
+的 `esac` 後 `)` 是外層替換收尾，cmd 是 echo 的參數——先前改寫＝**輸出內容被改**）；
+② 非 ASCII heredoc 定界符（`<<中文`、`<<·`；本體是資料，先前被當指令改寫）；
+③ 收尾詞／函式本體的死文字（`fi cmd`、`done cmd`、`} cmd`、`f() cmd`、
+`{ true; } cmd`——兩態都是語法錯誤 exit 2，改寫只讓 stderr 回印的那一行不同）。
+零效應的形一律不動；先前留下的死文字改寫（`case $x in esac) …`）也在 11-04 一併
+收掉。
 
 **刻意不修**（回傳≡原生：原生就壞，或 host 已經處理——讓它壞，agent 看得到
 真原因）：`C:\tmp`（原生寫入成功）、MSYS 盤符路徑 `/c/...`（pi 的檔案工具解析
@@ -185,7 +191,8 @@ bash 當程式名 `cmd\`）原本也是零效應，已改成不動。
 `cmd //server/share`（模型錯字）、**緊貼形** `cmd//c`／`"cmd"//c`（bash 當程式名、
 原生 127）、`exec/command/builtin X=…` 與引號偽賦值（原生當指令名跑）、
 `del`／`dir /b`／`sc /query` 等 cmd-ism、未引號 `C:\…\cmd.exe`（跳脫吃掉反斜線、
-原生 127）、`( … ) cmd …`（語法錯誤）。
+原生 127）、`( … ) cmd …` 與 `fi cmd`／`done cmd`／`} cmd`／`f() cmd`／
+`{ …; } cmd`（語法錯誤，兩個 host 都不再改寫死文字）。
 
 **只能靠「寫對」的形**（插件不修或不該修；唯一改善途徑是改寫法——完整表在
 spec〈只能靠「寫對」的形〉）：
@@ -195,12 +202,21 @@ spec〈只能靠「寫對」的形〉）：
   `/IM` 可用；原生相反）。
 - 給原生 exe 的路徑用 Windows 形式（`python C:/x.py`）或先 `cygpath -w`。
 - 不要在 wrapper（`timeout`/`xargs`/`nice`）或 `time -p` 之後放 `cmd //c`；
-  也不要把它塞進引號 payload（`bash -c '…'`）或反斜線續接。
-- heredoc 定界符用**字母開頭**（`EOF`、`EOF2`、`2EOF` 都認得）；`<<3`、`<<*X`
-  這種第一字是標點/數字的寫法認不出來（本體會被當指令掃描＝資料會被改）；
-  也別用識別字當算術位移量（`$((1<<N))`）——它會被誤認成 heredoc 開頭，
-  換行之後的指令全部不再改寫（漏修，安全方向）。
+  也不要把它塞進引號 payload（`bash -c '…'`）或反斜線續接。**重導向寫在指令
+  後面**：`> log cmd //c ver` 這種前置形不改寫（漏修臺：得追「本 simple command
+  是否已有指令字」）。
+- heredoc 定界符用**字母開頭**（ASCII 或中文都行：`EOF`、`EOF2`、`2EOF`、`中文`
+  都認得）；`<<3`、`<<*X` 這種第一字是 ASCII 標點/數字的寫法認不出來（本體會被
+  當指令掃描＝資料會被改）；也別用識別字當算術位移量（`$((1<<N))`）——它會被誤
+  認成 heredoc 開頭，換行之後的指令全部不再改寫（漏修，安全方向）。
+- `find` 的目錄要寫在 `path`：`pattern:"/tmp/*.txt"` 這種把 temp 路徑塞進
+  pattern 的寫法靜默回 0 筆（host 把 pattern 原樣交給 fd、絕對 pattern 對 Windows
+  全路徑永不匹配）；改寫它會把 fd 從 full-path 切成 basename 遞迴（多出子目錄、
+  改語意），所以不修。
+- 函式用 `f() { …; }` 形式：`function f { … cmd //c …; }` 的名稱槽沒追蹤（漏修）。
 - envp 前綴值寫盤符形式（`A=C:/x`）；重導向／`env -u` 選項放到指令後面。
+  （`A=/c//x`、`A=/c/./x` 這種冗餘段：原生會正規化成 `C:/x`、插件只換前綴
+  （`C://x`、`C:/./x`）——路徑語意等價、字串不同，寫乾淨就好。）
 - cmd 輸出 GBK 亂碼、以及指令字串裡成對反斜線被 `-c` 折一層——治療點在宿主
   （解碼層／transport），插件只能記錄；要保位元組請用 write 工具落檔。
 

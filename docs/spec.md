@@ -76,7 +76,10 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   指令位置認定含 env/exec/command/builtin（bash 內建／POSIX 標準、後接指令字的
   閉集合，與 oc 版 SHELL_KEYWORDS 對齊）——實測 env/exec/command cmd //c ver
   原生跑 ver、本機 banner（同一故障）；也含獨立成詞的引號指令字（`"cmd" //c`：
-  bash 先做 quote removal 才解析指令字）；外部 wrapper（timeout/nice/xargs）
+  bash 先做 quote removal 才解析指令字）；**不含收尾詞** `fi`／`done`／`esac`／
+  `}`（後面直接接簡單指令是語法錯誤，2026-11-04 與 oc 對齊）——`f()` 之後
+  延後到下一詞、只有複合起始詞（`{`／`(`／`if`／`while`／`until`／`for`／
+  `case`／`select`／`[[`）才開本體；外部 wrapper（timeout/nice/xargs）
   維持漏修（同一環境層故障，靜態修法需開放集合的參數結構猜測，見〈刻意不修
   與漏修的分界〉）。
 - 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字）：原生
@@ -89,7 +92,9 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   皆經 mount 表轉換，如 `A=/m/x node` → `M:/x`，非只有 /c）、`/tmp` 形→cygpath
   錨點（正斜線風格與原生
   envp 輸出一致）。**實測**：修前 node 收到 `/c/foo`、修後與原生（轉換開啟）
-  同為 `C:/foo`；`/tmp` 形亦同。
+  同為 `C:/foo`；`/tmp` 形亦同。**已知 bit 邊界**：冗餘分隔符與 `.` 段不
+  正規化——`A=/c//x` native→`C:/x`、改寫→`C://x`（`A=/c/./x`、`A=/c/x//y`
+  同理；路徑語意等價、字串不同）。
 
 **活體 e2e（透過 pi 實際的 write 工具管道重測）**：`/c/Users/.../x.txt` 落在
 `C:\Users\...`（無 `C:\c` 錯位，host 解析層原生平規化）；`$TEMP/x`、`/tmp/x`
@@ -97,6 +102,15 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 原展開到 home。GBK 主張重驗：cmd 輸出經 chcp 65001 後同一命令首跑 GBK、
 後續 UTF-8（非確定性重現）；bash 傳給 `cmd echo` 的 UTF-8 參數原樣往返（解釋
 了「無 chcp 也是 UTF-8」的現象）。
+
+**工具面（與 oc 的 surface 對照；pi 1.5.0 實讀 `dist/core/tools/*.js`）**：
+host 自己解析的路徑欄位只有 `read`／`write`／`edit`／`grep`／`find`／`ls` 的
+`path`。`bash` 與 `powershell` 兩個 shell 工具都只有 `command`／`timeout`，
+**沒有 `workdir`**（oc 的 `shell.workdir` 面在 pi 不存在）；pi 沒有 `patch` 與
+`glob` 內建工具（oc 的 patch 指令行與 glob 前綴面沒有直接對應），`find` 的
+`pattern` 與 `grep` 的 `glob` 是另一回事（前者見〈只能靠寫對的形〉，後者是
+相對 path 的過濾字串、不是根目錄，沒有 host 解析故障點）。所以 oc 的四類
+temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境裡沒有那個面」。
 
 ### 刻意不修與漏修的分界
 
@@ -225,7 +239,7 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 | 引號偽賦值 `A=/c/x "B=/c/y" node` | 原生 127（`B=/c/y: No such file or directory`）：賦值判定在 quote removal 之前 | 同上；引號詞不是賦值前綴 |
 | 未引號 `C:\Windows\…\cmd.exe //c`、`C:\\Windows\\…`、`/c/Windows\System32\cmd.exe` | 原生 127（`-c` 操作數先把成對 `\\` 折一層、未引號 lexer 再把剩下的反斜線吃掉 → 程式名是 `C:Windows…`；路徑本身不存在）＝改寫只有文字變化。pi／oc 都比對「未引號全去反斜線、引號詞照原樣」的字；**引號**的 `"C:\Windows\…\cmd.exe"`／`"/c/Windows\…"` 實測會跑 cmd（反斜線是字面分隔符），照樣命中 | 用全正斜線的 POSIX 路徑，或直接寫 `cmd` |
 | `del x`、`dir /b`、`sc /query …`、`reg query //?`、`findstr //?` | 兩態同結果（`del` 不存在、`dir /b` 是 MSYS `dir` 的非法參數、`sc` 的子命令是 `sc query` 不是 `/query`） | 用 bash 原生工具：`rm`、`ls`、`sc query` |
-| `( … ) cmd //c …`、`{ …; } cmd //c …`、`if … fi cmd //c …`、`while … done cmd //c …`、`case … esac cmd //c …`、`f() cmd //c …` | 原生語法錯誤（exit 2）：複合指令／函式本體結束後沒有分隔符就接簡單指令（函式本體必須是複合指令） | 加 `;`／`&&`／換行；oc 在這些位置已不開指令位置（pi 的 `( )` 已修，`{ }`／`fi`／`done`／`esac` 仍是死文字改寫） |
+| `( … ) cmd //c …`、`{ …; } cmd //c …`、`if … fi cmd //c …`、`while … done cmd //c …`、`case … esac cmd //c …`、`f() cmd //c …` | 原生語法錯誤（exit 2）：複合指令／函式本體結束後沒有分隔符就接簡單指令（函式本體必須是複合指令） | 加 `;`／`&&`／換行。**兩個 host 都已不開命令位置**（pi 2026-11-04 補上收尾詞集與函式本體槽，見〈零效應改寫稽核〉） |
 | `for x in cmd //c …`、`case … in … pattern` 這類 slot | list／pattern 是資料，不是指令（實測 `for x in cmd //c` 印 `[cmd] [//c]`） | 要執行就寫在 body／指令位置；插件不會改寫 list 內容 |
 
 **B. 無法修復（回傳≠原生，但靜態不可判定／開放集合；記臺帳不補貼）**
@@ -241,9 +255,11 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 | envp 殘餘值形：引號值 `A="/c/x"`、根相對 `A=/usr/x`、清單 `A=/c/x:/d/y`、含 `\` 的值、動態頭 `A=$(echo /c/x)`、緊貼 `VAR=/c$(…)`、`env -u V X=/c/…`、`A=/c/x 2>&1 cmd` | 整值或參數語意靜態看不到（詳見〈envp 殘餘形〉） | 值直接寫盤符形式 `A=C:/x`；重導向／選項放到指令後面 |
 | 函式名與其他 msys 程式（`A=/c/x git …`、`A=/c/x f`）的混合邊界 | 開放集合；原生「讀值」與「spawn 後代」兩側行為相反 | 需要轉換就直接寫 `C:/…` |
 | `function f { … cmd //c …; }`（`function` 名稱槽後的本體） | 掃描器追蹤 `f()` 形式、不追 `function NAME` 的名稱槽；實測這個寫法漏修（`f() { … }` 會改寫） | 用 `f() { …; }` 形式 |
-| heredoc 定界符第一字非數字/字母/底線（`<<3`、`<<*X`、`<<.E`；實測都是合法 heredoc） | 掃描器不認（第一字限制）→ 本體被當指令掃描＝**資料改寫**；放寬第一字會把 `$((x<<$y))` 這類算術誤判成 heredoc，兩側都是猜 | 定界符用字母開頭（`EOF`、`EOF2`、`2EOF` 都認） |
+| heredoc 定界符第一字是 **ASCII 標點或純數字**（`<<3`、`<<*X`、`<<.E`、`<<$S`；實測都是合法 heredoc） | 掃描器不認（第一字限制）→ 本體被當指令掃描＝**資料改寫**；放寬第一字會把 `$((x<<$y))`／`$((x<<3))` 這類算術誤判成 heredoc，兩側都是猜。**非 ASCII 第一字已收錄**（`<<中文`、`<<中文EOF`、`<<·` 實測是合法 heredoc；非 ASCII 不可能開算術/替換，放寬無風險——pi 2026-11-04 已修，oc 仍不認） | 定界符用字母開頭（ASCII 或中文都行：`EOF`、`EOF2`、`2EOF`、`中文` 都認） |
 | 算術位移用識別字（`$((1<<N))`、`((x<<N))`）之後還有指令 | `<<N` 被當 heredoc 開頭、等不到定界符 → 換行後整段不再改寫（其後的 cmd 旗標／envp 全部漏修；實測 live 是靜默 banner）。與 `$((1<<2))` 同形、靜態不可分 | 位移量寫數字（`1<<1`），或把算術與後續指令分成不同次呼叫 |
-| `case $x in esac) …` 的死文字 | 整行是語法錯誤（exit 2）；改寫只影響 stderr 回印的文字。**oc** 已把 stray `)` 視為語法錯誤、不開指令位置 → 不再改寫；**pi** 仍會改寫（未動） | 不要用 `esac` 當樣式字面 |
+| `case $x in esac) …` 的死文字 | 整行是語法錯誤（exit 2）；改寫只影響 stderr 回印的文字。**兩個 host 都已**把樣式區的 `esac` 視為空 case 的結束、把 stray `)` 視為語法錯誤 → 不再改寫（pi 2026-11-04 對齊；同一修法同時修掉 `echo $(case x in esac) cmd //c ver` 這條**真誤修**） | 不要用 `esac` 當樣式字面 |
+| 重導向**前綴**後的 cmd：`> log cmd //c ver` | 這是合法 bash（重導向可前置，`cmd` 真的執行）；實測轉換關閉＝banner、native 跑 ver。修法要追「本 simple command 是否已有指令字」（`echo x > log cmd //c` 的 cmd 是 echo 的參數），為有機頻率 ~0 的形加狀態不值得 | 重導向寫在指令後面：`cmd //c ver > log`（`;`／換行後也照常改寫） |
+| `find` 的 `pattern` 內嵌 temp 前綴（pi 專屬）：`pattern:"/tmp/*.txt"`、`pattern:"$TEMP/*.txt"` 且無 `path` | host 把 pattern 原樣交給 fd（含 `/` 就走 `--full-path`），絕對 pattern 對 Windows 全路徑永遠不匹配 → **靜默 0 筆**（實測檔案真的存在）。拆成 `path`＋其餘 pattern 會讓 fd 從 full-path 切成 basename 遞迴（實測 1 筆→3 筆，多出子目錄）＝**改語意**，所以不修；oc 的 `glob` 是另一個引擎（pattern 本來就相對 path），它的拆前綴修法不搬過來 | 把目錄寫在 `path`、pattern 只寫檔名：`path:"/tmp"`, `pattern:"*.txt"`（`$TEMP` 等變數形式也一樣） |
 
 **C. 治療點在插件權限外（host 層；插件只能記臺帳）**
 
@@ -342,8 +358,9 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   `/c/Windows\System32\cmd.exe` 也一併不再命中），電池釘樁。
 - `case $x in esac) cmd //c ver;; esac`——樣式字面 `esac` 讓整行是語法錯誤
   （exit 2）；改寫落在死文字，唯一差異是 bash 的 stderr 會回印改寫後的那一行。
-  **保留但如實記載**：把它 gate 掉就必須回頭接受 `echo $(case … echo esac;; b)
-  cmd //c …)` 這條真漏修（那條是實測的活碼），兩害相權留死文字改寫。
+  當時的顧慮是「gate 掉它就得回頭接受 `echo $(case … echo esac;; b) cmd //c …)`
+  那條真漏修」；**2026-11-04 用「pattern 區段也認 `esac`」＋「stray `)` 不開
+  指令位置」兩道規則同時解掉**（前者不動死文字、後者保住活碼），見下節。
 - `cmd\\ //c ver`（未引號詞尾的成對反斜線）——bash 先把 `\\` 縮成一層、
   再讓它跳脫後面的分隔符，程式名是 `cmd\`（原生 127，兩種轉換狀態同訊息）；
   掃描器若只做「去反斜線」比對就會命中 cmd 而改寫 `//c`＝零效應。
@@ -359,6 +376,52 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 的那幾族（`A="/c/x"`、`A=/c/x:/d/y`、`env -u V X=/c/x`、`A=/c/x 2>&1 cmd`、
 `A=$(echo /c/x)`、`time -p`、`timeout`、反斜線續接）也逐一重測，行為與臺帳
 分類一致。
+
+**2026-11-04 重跑（pi，每條 payload 寫成腳本檔跑 local／native／rewritten 三態）**：
+45 條 cmd/envp 形態 + 16 條 heredoc + 22 條 envp 變體（cmd 形態另驗 WSL bash
+5.3.0；WSL 沒有 cmd.exe → N/A）。腳本檔傳輸是 byte-faithful（`-c` 會折成對
+反斜線），local＝轉換關閉、native＝`env -u MSYS_NO_PATHCONV -u BASH_ENV`（讓
+MSYS 自己轉），比 exit＋stdout。結果與處置：
+
+- **已修（真誤修）**：`echo $(case x in esac) cmd //c ver`——空 case 的 `esac`
+  結束區段後，`)` 是外層 `$(` 的收尾、`cmd //c ver` 是 echo 的參數（實測
+  local／native 都印 `cmd //c ver`），pi 先前把 `//c` 改掉＝**輸出內容被改**。
+  同一修法讓 `case $x in esac) …` 的死文字保持原樣（先前是零效應改寫）。
+  `x=$(case x in esac) cmd …` 這條活碼仍照常改寫（對照組，rewritten≡native）。
+- **已修（零效應改寫移除）**：`fi cmd //c ver`、`done …`、`} …`、`f() …`、
+  `f()`＋換行再接 `cmd …`、`{ true; } …`——兩態都是 exit 2（`syntax error near
+  unexpected token`），改寫只讓 stderr 回印的那一行不同。處置與 oc 相同：指令
+  位置續位集移除 `fi`／`done`／`esac`／`}`（`COMMAND_POS_CONTINUES`），`f()` 後
+  延後到下一詞、只有複合起始詞開本體（`FUNC_BODY_STARTERS`）——本體槽不承認的
+  詞連「本詞在指令位置」也不該成立（`f()` 後換行再 `cmd` 的殘留就是這條修掉的）。
+  對照組（`f() { … }`、`f() (…)`、`f() if …`、`f()` 換行再接 `{ … }`、
+  `… fi; cmd …`、`… done; cmd …`、`{ …; } ; cmd …`）仍改寫且 rewritten≡native。
+  殘餘（兩 host 同、記臺帳）：`f() && cmd …`、`f(); cmd …` 這類「本體缺失」的
+  同行語法錯誤仍會被掃描（分號／`&&` 之後到行尾之間是死文字，但下一個新行又是
+  真的指令；要分清楚得給分隔符加「本體缺失」狀態，頻率 ~0）。
+- **已修（資料改寫）**：非 ASCII 定界符 `<<中文`／`<<中文EOF`／`<<·`／`<<2中文`
+  ——local／native 本體都原樣輸出（合法 heredoc），pi／oc 先前都把本體裡的
+  `cmd //c` 改成 `cmd /c`。pi 的定界符第一字類已收 `\u0080-\uFFFF`（非 ASCII
+  不可能開 `$((x<<$y))`，放寬無風險）；ASCII 標點／純數字（`<<3`、`<<*X`、
+  `<<.E`、`<<$S`）仍是邊界（pin 現況），oc 未動。
+- **漏修臺新增一條**：`> log cmd //c ver`（重導向前綴＋真指令）——local＝
+  banner、native＝ver，兩 host 都不改寫；修法要追「本 simple command 是否已有
+  指令字」，為 ~0 頻率的形加狀態不值得，記臺帳。
+- **既有臺帳重測成立**：`time -p`、反斜線續接、`bash -c 'cmd //c …'`、
+  `function f { … }`、`$((1<<N))`／`((x<<N))` 之後的指令、`A="/c/x"`、
+  `A=/c/x:/d/y`、`env -u V A=/c/x`、`A=/c$(echo foo)`、`python /tmp/x.py`
+  （本機 `C:\tmp\…` 找不到、native 執行）、`taskkill //IM`（本機無效／native
+  成功；`/IM` 相反）、`cmd /c ver` 在轉換開啟時被轉成 `C:/` → banner、
+  `> //out`（`Is a directory`）、`>nul`（兩態都建實體檔）、`<nul`（ENOENT）、
+  `2>&nul`（ambiguous redirect）。
+- **新記錄的 bit 邊界**：envp 值的冗餘段不被正規化——`A=/c//x` native→`C:/x`、
+  改寫→`C://x`；`A=/c/./x` native→`C:/x`、改寫→`C:/./x`；`A=/c/x//y` 同理
+  （路徑語意等價、字串不同）。要對齊得在此重實作路徑正規化，誤修風險大於收益
+  → 記邊界、不修。
+- **`find` 的 `pattern` 前綴**（oc `glob` 的對應面）：實測 `find(pattern:
+  "/tmp/eg-*.txt")` 靜默 0 筆（檔案存在）、`find(path:"$TEMP", pattern:
+  "eg-*.txt")` 找得到；但拆前綴會把 fd 從 full-path 切成 basename 遞迴
+  （1→3 筆，多出子目錄）＝改語意 → **不修**，形狀入〈只能靠寫對的形〉。
 
 **零效應改寫稽核（oc，逐條實跑）**：同一份判準套到 oc 的掃描器與路徑面，找到並
 修掉下列「文字有變、行為一樣」或「改到資料」的形：
@@ -389,10 +452,12 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 - `echo $(case x in esac) cmd //c ver`——**這是真的行為誤修**：空 case 的
   `esac` 後面的 `)` 是外層 `$()` 的收尾，`cmd //c ver` 是 echo 的參數（實測輸出
   `cmd //c ver`）。舊的 `esac` gate 只看命令位置，兩 host 都會把 `//c` 改掉。
-  oc 改成「pattern 區段也認 `esac`（排除主詞與引號樣式）」→ 不再改寫；pi 仍有
-  這個誤修（未動，形狀記於〈只能靠寫對的形〉）。
+  oc 改成「pattern 區段也認 `esac`（排除主詞與引號樣式）」→ 不再改寫；
+  **pi 已於 2026-11-04 同法修掉**（三態實測：local／native 都印 `cmd //c ver`，
+  修前 rewritten 印 `cmd /c ver`；見上節 2026-11-04 重跑）。
 - `case $x in esac) …` 的死文字——oc 的 stray `)` 不再開指令位置 → 不改寫；
-  pi 仍保留（見上表）。
+  **pi 也在 2026-11-04 一併修掉**（同一個 `)` 分支：stack 空或 group 收尾都不
+  開指令位置），電池從「改寫」pin 改成「不動」pin。
 - **UNC 與旗標內斜線形（2026-11-03 抓到並已修）**：`cmd //server/share ver`
   與 `cmd //c/d/e ver` 曾被旗標正則改寫（終止字類 `(?![\w.-])` 少 `/`）。
   前者四態全 banner＝零效應改寫（spec 此前聲明「掃描器跳過＋電池釘樁」，實查
@@ -404,8 +469,9 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
   bash heredoc（`<<3` 純數字實測也合法），此前不認得 → 本體被當指令掃描，
   實測觸發（本 session 頂層呼叫的本體 `cmd //c ver` 被改成 `cmd /c ver`）。
   定界符正則改為 `\d*[A-Za-z_…]`（純數字仍不認，與算術靜態同形，記邊界）。
-  **pi 同源掃描器同病灶，未動**——修法已同源驗證、但 pi 的 live 端到端未做
-  ，記臺帳待補（詳見〈掃描器要點〉heredoc 段）；oc 電池 +3 釘。
+  **pi 同源掃描器同病灶，已於 2026-11-03 移植同一條正則**（live 端到端：安裝中的
+  0.6.3 本體被改成 `cmd /c ver`、0.6.5 本體保真；詳見〈掃描器要點〉heredoc 段）；
+  2026-11-04 另把第一字放寬到非 ASCII（`<<中文`）；oc 電池 +3 釘。
 - **統計與改寫同源**：oc 的 temp 分類只有一份 `TEMP_FAMILIES`／`splitTempPath`，
   `rewritePathFix` 一次回傳值＋機制；`glob`／`patch`／`workdir` 都用同一份結果。
   `bumpFix` 只在值真的變了的分支呼叫；`bumpTool` 是分母，不是修復。兩個 host
@@ -553,14 +619,18 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
   副本改同一行後的對照（本體保真、`$((1<<2))` 算術與 `<<<` 行為不變、電池
   全綠）；patch 上到安裝副本後已 live 複驗（0.6.5：`cat <<2EOF` 本體保真、
   `<<3` 仍掃、`cmd\\` 不觸發改寫）。
-  **兩個靜態邊界（兩 host 同）：**
-  - 第一字非數字/字母/底線的定界符（實測合法：`* . : = $ [ ] / @ + % ^ , ~ ! ? { }`）
-    與純數字 `<<3` 不認——本體會被當指令掃描（＝資料改寫，是誤修不是漏修）。
-    放寬第一字會把 `$((x<<$y))` 這類算術誤判成 heredoc（兩側都是猜），所以留著
+  **三個靜態邊界（pi / oc 同源，第一條是 pi 已修、oc 未動）：**
+  - 第一字是 **ASCII 標點或純數字**的定界符（實測合法：`* . : = $ [ ] / @ + % ^ , ~ ! ? { }`
+    與 `<<3`）不認——本體會被當指令掃描（＝資料改寫，是誤修不是漏修）。
+    放寬第一字會把 `$((x<<$y))`／`$((x<<3))` 這類算術誤判成 heredoc（兩側都是猜），所以留著
     並在電池釘住「現況」。oc live 複驗（2026-11-03）：`<<3`／`<<.E` 在外掛 ON 時
     本體 `cmd //c ver` 遭改寫成 `cmd /c ver`（資料改寫實證）、OFF 原樣；`<<*X` 被
     host 的 Portable scanner 整體擋下（見 oc 接線段），兩側都到不了插件掃描器——
     這三形的「本體不應被掃」判準不變，電池照釘現況。
+    例外（**2026-11-04 pi 已修**）：非 ASCII 第一字（`<<中文`、`<<中文EOF`、`<<·`、
+    `<<2中文` 實測都是合法 heredoc）——非 ASCII 不可能開算術（識別字是 ASCII）
+    或 `$(`，所以放寬到 `\u0080-\uFFFF` 無風險；先前本體被當指令掃描＝資料改寫。
+    oc 仍不認（本 repo 不改 oc），所以這條是兩 host 唯一的定界符差異。
   - 反方向：`$((1<<N))`／`((x<<N))` 的識別字運算元被當 heredoc 開頭、等不到
     定界符 → 換行後整段不再改寫（＝其後的 cmd 旗標與 envp 全部漏修；live 是
     靜默 banner，oc live 複驗 2026-11-03 同形）。與 `$((1<<2))` 同形、靜態不可分，
@@ -613,10 +683,15 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
   `VAR=/c/x$(…)` 的值組合由後面的指令字收尾）；組合律前提＝動態尾部以 / 開頭
   （否則原生把整值當根相對路徑——實測 `A=/c$(echo foo)` 原生 → msys 根/cfoo）。
   盤符形錨點是**字母通用**（實測 /m /b /q /x /y /z 皆經 mount 表轉換：
-  `A=/m/x node` → `M:/x`），轉換輸出＝大寫盤符＋正斜線、與原生 bit-identical
-  （pin 測試＋e2e 電池把原生側 env 的 `MSYS_NO_PATHCONV`／`BASH_ENV`／`PWD`
+  `A=/m/x node` → `M:/x`），**正常形**的轉換輸出＝大寫盤符＋正斜線、與原生
+  bit-identical（pin 測試＋e2e 電池把原生側 env 的 `MSYS_NO_PATHCONV`／`BASH_ENV`／`PWD`
   刪掉當判準：改寫後輸出≡原生轉換輸出；`PWD` 是環境相依值——harness 可能
-  匯出 Windows 形，`$(pwd)` 會因此與改寫無關地發散，兩側都隔離掉）；/tmp 形→cygpath 錨點。殘餘邊界
+  匯出 Windows 形，`$(pwd)` 會因此與改寫無關地發散，兩側都隔離掉）。
+  **例外（2026-11-04 量到）**：冗餘段不被正規化——MSYS 把 `//` 縮成 `/`、
+  去掉 `.` 段（`A=/c//x`→`C:/x`、`A=/c/./x`→`C:/x`、`A=/c/x//y`→`C:/x/y`），
+  掃描器只做前綴替換（→`C://x`、`C:/./x`、`C:/x//y`）——Windows 路徑語意等價、
+  字串不同；要對齊得在此重實作路徑正規化（誤修風險大於收益），記邊界不修。
+  /tmp 形→cygpath 錨點。殘餘邊界
   如實記錄：函式名與其他 msys 程式（git/cat…）是開放集合且為混合邊界
   ——body/動態範圍内 spawn native 時原生會轉（實測 `f(){ node …; };
   A=/c/x f` → C:/x，與改寫一致）、直接讀值時原生不轉（實測 → [/c/x]、
@@ -722,8 +797,14 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
 「修過的命令數」，不是「修過的旗標／值個數」——要數實際修了幾個就得看命令
 本身，統計檔案只回答「這種故障在幾個命令上出現過」。pi 已按此釘樁。
 
-- **分母** `toolCalls[tool]`：清單內工具每次呼叫 +1，且都在 gate 之後——統計範圍
-  ＝外掛實際作用的範圍（非 win32／無 MSYS bash 時整體 inert，不灌水）。
+- **分母** `toolCalls[tool]`：清單內工具每次呼叫 +1。gate 的實際邊界（2026-11-04
+  重測後矯正文件說法）：非 win32 → 根本不安裝 hook（不計數）；Windows 上 hook
+  一定計數——**探測不到 MSYS bash 時，cmd 旗標與 envp 改寫 inert，但「分母仍計數、
+  temp 路徑改寫仍發生」**（錨點退 `os.tmpdir()`，不依賴 shell 探測；實測
+  `EG_SHELL=System32\bash.exe` 時 `toolCalls` 仍 +1、`path.tempVar` 仍 +1、
+  `cmd //c` 不改寫不計數）。先前寫的「無 MSYS bash 時整體 inert、不灌水」把兩件
+  事混為一談，已改正；不改程式去 gate 分母，因為那要嘛在載入時就付 ~370ms 探測
+  、要嘛在熱路徑上多 spawn 一顆行程。
 - **分子** `fixes[key]`：真的改寫才 +1，以故障點為 key；同性質 variant 合併、
   不同類型分開。
 
@@ -757,6 +838,11 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
   from-load 累加、後寫覆蓋先寫（last-writer-wins）會吃掉對方增量，合併把
   「本 session 的增量（現値−載入基準）」疊到檔上最新値，合併結果同時成為
   新的記憶體値與基準（重複 flush 不雙計；計數僅 advisory）。
+  **2026-11-04 修**：基準原本只在「合併」分支更新——**首寫**（檔案不存在／讀不了
+  →直寫現値）之後基準還是全零，下一次 flush 會把同一批增量再疊一次（實測：全新
+  統計檔＋一個 `shell.cmdFlag`＋`session_shutdown` → 記成 **2**）。現在寫檔後
+  無條件把基準 re-base 到剛落盤的值（幂等），電池用全新 process＋空 agent dir
+  釘樁。實務影響限於「剛刪檔／首次執行」那一批；舊資料不重算。
 - **任何統計失敗都吞掉**：先做完原有改寫再計數；storage 壞掉時 hook 照常註冊、
   改寫照常運作、cleanup 不拋錯；壞檔／畸形資料 shape-check + 數值轉換，絕不致命。
 - oc（**2026-11-03 版**，與 pi 同機制的移植）：`ctx.storage` 無 compare-and-set，
@@ -862,7 +948,8 @@ hook 的 typeof 契約守門——無實測故障點、釘的是契約）、gate
 的機器都能跑同一份電池）、統計的分母 gate、各 fix key、persisted 往返與
 read-modify-write、畸形資料、壞 storage 韌性、並發 server 的 delta 合併／幂等
 flush／合併後仍會遞增（2026-11-03 H6 修的釘樁，兩份拋棄式 module 副本共用一個
-fake store 模擬兩進程）。
+fake store 模擬兩進程）、以及 pi 首寫不雙計（2026-11-04：全新 process＋空 agent
+目錄的 worker）。
 
 執行方式見 README 的〈開發〉。
 

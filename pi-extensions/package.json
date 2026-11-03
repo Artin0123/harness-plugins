@@ -1,11 +1,16 @@
 {
 	"name": "harness-plugins-pi",
-	"version": "0.7.2",
+	"version": "0.7.3",
 	"description": "env-guard（Windows 下 bash 工具的 cmd //c 與檔案路徑修復）的 pi extension 版。",
-	"keywords": ["pi-package", "pi-extension"],
+	"keywords": [
+		"pi-package",
+		"pi-extension"
+	],
 	"type": "module",
 	"repository": "git+https://github.com/Artin0123/harness-plugins.git",
 	"pi": {
-		"extensions": ["./env-guard"]
+		"extensions": [
+			"./env-guard"
+		]
 	}
 }

@@ -93,6 +93,19 @@ if (process.argv.includes('--report')) {
   }));
   process.exit(0);
 }
+if (process.argv.includes('--freshstats')) {
+  // Fresh module *and* fresh agent dir (EG_AGENT_DIR points at an empty dir):
+  // one fix bump (immediate flush) + session_shutdown (second flush) must land
+  // exactly 1, i.e. the write-path re-base keeps the delta from being counted
+  // twice. Prints the fixes object the file holds afterwards.
+  const handlers = {};
+  mod.default({ on: (n, h) => { handlers[n] = h; }, getSettings: () => ({}) });
+  handlers.tool_call({ toolName: 'bash', input: { command: 'cmd //c ver' } });
+  handlers.session_shutdown();
+  const file = join(process.env.EG_AGENT_DIR ?? '', 'env-guard-stats.json');
+  console.log(JSON.stringify({gate: mod.pathConvDisabled(), fixes: JSON.parse(readFileSync(file, 'utf8')).fixes}));
+  process.exit(0);
+}
 
 let pass = 0; const failures = [];
 const check = (name, ok, detail) => { if (ok) pass++; else failures.push(`${name} -> ${detail}`); };
@@ -442,12 +455,34 @@ for (const [label, text] of [
 ]) {
   check(`P: ${label} keeps the body literal`, bc(text).command === text, JSON.stringify(bc(text).command));
 }
+// 第一字是**非 ASCII**（CJK 字母、CJK 標點）的定界符實測也合法（`cat <<中文`
+// ／`<<·`／`<<2中文`）——先前的 ASCII-only 字元類不認得，本體被當指令掃描、
+// `cmd //c` 被改成 `cmd /c`（資料改寫）。非 ASCII 不可能開 `$((x<<$y))` 這類
+// 算術（識別字是 ASCII），所以放寬無風險。
+for (const [label, text] of [
+  ['CJK delimiter <<中文', 'cat <<中文\ncmd //c ver\n中文'],
+  ['CJK punctuation delimiter <<·', 'cat <<·\ncmd //c ver\n·'],
+  ['digit + CJK delimiter <<2中文', 'cat <<2中文\ncmd //c ver\n2中文'],
+]) {
+  check(`P: ${label} keeps the body literal`, bc(text).command === text, JSON.stringify(bc(text).command));
+}
 // 已知邊界（誤修、有機頻率 ~0）——這幾條 pin 的是「現況」不是「正確」：第一字
-// 不是數字/字母/底線的定界符實測也合法（`<<*X`、`<<.E`），純數字 `<<3` 同；
-// 辨識不到→本體被當指令掃描。放寬第一字會把 `$((x<<$y))` 誤判成 heredoc，
-// 兩個方向的猜測都只有副作用，所以留著並釘住，哪天動了會在這裡看到。
-check('P: BOUNDARY <<*X body is currently scanned', bc('cat <<*X\ncmd //c ver\n*X').command === 'cat <<*X\ncmd /c ver\n*X', JSON.stringify(bc('cat <<*X\ncmd //c ver\n*X').command));
-check('P: BOUNDARY <<3 body is currently scanned', bc('cat <<3\ncmd //c ver\n3').command === 'cat <<3\ncmd /c ver\n3', JSON.stringify(bc('cat <<3\ncmd //c ver\n3').command));
+// 是 ASCII 標點或純數字的定界符實測也合法（`<<*X`、`<<.E`、`<<$S`、`<<3`）；
+// 辨識不到→本體被當指令掃描。放寬第一字會把 `$((x<<$y))`／`$((x<<$3))` 這類
+// 算術誤判成 heredoc，兩個方向的猜測都只有副作用，所以留著並釘住，哪天動了
+// 會在這裡看到。（非 ASCII 第一字已收錄，見上。）
+// 「本體被掃」的現況 pin 要跟 gate 方向一致：轉換關閉（gate ON）時 cmd 旗標會真的
+// 被改寫，轉換開啟（gate OFF）時掃描器對 cmd 旗標 inert，本體即使被掃也原樣。
+const scannedBody = (bd) => (gateOn ? bd.replace('cmd //c ver', 'cmd /c ver') : bd);
+for (const [label, text] of [
+  ['<<*X', 'cat <<*X\ncmd //c ver\n*X'],
+  ['<<3', 'cat <<3\ncmd //c ver\n3'],
+  ['<<.E', 'cat <<.E\ncmd //c ver\n.E'],
+  ['<<$S', 'cat <<$S\ncmd //c ver\n$S'],
+]) {
+  const want = scannedBody(text);
+  check(`P: BOUNDARY ${label} body is currently scanned`, bc(text).command === want, JSON.stringify(bc(text).command));
+}
 // 反方向的邊界（漏修、安全方向）：`$((1<<N))` 的識別字運算元被當 heredoc 開頭、
 // 等不到定界符 → 換行後整段不再改寫（實測：後面的 `cmd //c` 保持原樣、live
 // 是靜默 banner）。同形不可分（`<<3` 也是合法 heredoc），記臺帳不補貼。
@@ -520,7 +555,6 @@ const caseFixes = [
   // esac）是 bash 語法錯誤（實測兩種轉換狀態皆 error）——掃描器照語法繼續
   // 追蹤、改寫落在死文字上，輸出仍同為語法錯誤＝回傳≡原生
   ['case $x in a) echo esac; cmd //c ver;; esac', 'case $x in a) echo esac; cmd /c ver;; esac'],
-  ['case $x in esac) cmd //c ver;; esac', 'case $x in esac) cmd /c ver;; esac'],
   ['echo $(case $x in a) cmd //c ver;; esac)', 'echo $(case $x in a) cmd /c ver;; esac)'],
   ['x=$(case 1 in 1) x;; esac) cmd //c ver', 'x=$(case 1 in 1) x;; esac) cmd /c ver'],
   ['case x in a) echo $(case y in b) cmd //c ver;; esac);; esac', 'case x in a) echo $(case y in b) cmd /c ver;; esac);; esac'],
@@ -548,6 +582,38 @@ for (const c of caseData) {
   const r = bc(c);
   check(`P: untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
 }
+
+// --- 收尾詞與函式本體槽：語法錯誤行不改寫（零效應改寫移除，與 oc 對齊）---
+// `fi`／`done`／`}` 是複合指令的**收尾**，後面直接接簡單指令是 bash 語法錯誤
+// （實測兩種轉換狀態都是 exit 2、訊息相同＝回傳≡原生）；`f()` 的本體必須是
+// 複合指令（`f() cmd` 同為語法錯誤）；`{ …; } cmd` 同理。改寫死文字＝文字有變
+// 、行為一樣（零效應），所以這些位置不再開指令位置。空 case 的 `esac` 結束區段
+// 後，`)` 是**外層替換**的收尾：`echo $(case x in esac) cmd //c ver` 的 cmd 是
+// echo 的參數（實測印出資料）——先前改寫它＝真誤修，現已不動。
+const tailDead = [
+  'fi cmd //c ver',
+  'done cmd //c ver',
+  '} cmd //c ver',
+  'f() cmd //c ver',
+  // `f()` 後換行再接簡單指令——同樣是語法錯誤（實測兩態 exit 2）；
+  // 本體槽不承認非複合詞，所以 prevTokCmdPos 也不得残留
+  'f()\ncmd //c ver',
+  '{ true; } cmd //c ver',
+  'echo $(case x in esac) cmd //c ver',
+  'case $x in esac) cmd //c ver;; esac',
+];
+for (const c of tailDead) {
+  const r = bc(c);
+  check(`P: syntax-error tail untouched ${c}`, r.command === c && !r.cmdFlagFixed, JSON.stringify(r));
+}
+// 對照組：合法本體／收尾後有分隔符的形仍照常改寫
+flagCase('function body after f()', 'f() { cmd //c ver; }', 'f() { cmd /c ver; }');
+flagCase('subshell body after f()', 'f() (cmd //c ver)', 'f() (cmd /c ver)');
+flagCase('command after fi separator', 'if true; then :; fi; cmd //c ver', 'if true; then :; fi; cmd /c ver');
+flagCase('command after done separator', 'while false; do :; done; cmd //c ver', 'while false; do :; done; cmd /c ver');
+flagCase('command after } separator', '{ true; } ; cmd //c ver', '{ true; } ; cmd /c ver');
+flagCase('empty-case assignment prefix keeps position', 'x=$(case x in esac) cmd //c ver', 'x=$(case x in esac) cmd /c ver');
+flagCase('empty-case value substitution keeps position', 'x=$(case 1 in 1) y;; esac) cmd //c ver', 'x=$(case 1 in 1) y;; esac) cmd /c ver');
 
 // --- rewriteBashCommand: deliberate misses (same in both gate states) ---
 // Wrappers would need per-program argument layouts (open-ended guessing);
@@ -581,6 +647,11 @@ const misses = [
   // 反斜線換行續接：跳脫對被併進 token、指令字身分失效（實測：轉換開＝
   // 續接後 //c 轉成 /c 真跑；本機＝banner 靜默 exit 0）→ 漏修臺
   'cmd \\\n//c ver',
+  // 重導向**前綴**後的 cmd：合法 bash（`> log cmd //c ver` 的 cmd 真的執行；
+  // 實測轉換關閉＝banner、native＝ver）。修法要追「本 simple command 是否已有
+  // 指令字」（`echo x > log cmd //c` 的 cmd 是 echo 的參數）＝狀態成本為
+  // 有機頻率 ~0 的形不划算 → 漏修臺（2026-11-04 重測）
+  '> log cmd //c ver',
   // / 前綴原生工具：與 cmd //c 同一個故障點（實測 taskkill //IM
   // exit 1 報『無效參數』；失敗大聲但大聲≠豁免，回傳≠原生才是判準），
   // 留在漏修臺（見 docs/spec.md）——釘住不升級成誤修
@@ -836,6 +907,12 @@ toolCall({ toolName: 'read', input: { path: '/tmp/x' } }, uiCtx);
 toolCall({ toolName: 'read', input: { path: '$TEMP/y' } }, uiCtx); // 同一個 temp 修復、不同故障點
 toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx);
 toolCall({ toolName: 'find', input: {} }, uiCtx);       // denominator even without a path field
+// `find` 的 `pattern` 一字不動（spec〈只能靠寫對的形〉）：把目錄塞進 pattern
+// （`/tmp/*.txt`）靜默回 0 筆，但拆前綴會把 fd 從 full-path 切成 basename
+// 遞迴（實測 1→3 筆、多出子目錄）＝改語意 → 不修，只計分母。
+const findPattern = { pattern: '/tmp/*.txt' };
+toolCall({ toolName: 'find', input: findPattern }, uiCtx);
+check('P: find.pattern is left alone (no temp-prefix split)', findPattern.pattern === '/tmp/*.txt', JSON.stringify(findPattern));
 toolCall({ toolName: 'webfetch', input: {} }, uiCtx);   // outside the guard list: not counted
 toolCall({ toolName: 'bash', input: { command: 'cmd //c ver' } }, uiCtx);
 toolCall({ toolName: 'bash', input: { command: 'cmd /c echo 中文' } }, uiCtx); // 非 ASCII：不偵測不改寫，命令原樣通過
@@ -858,8 +935,8 @@ if (msysBash) {
 }
 
 const saved = JSON.parse(readFileSync(statsPath, 'utf8'));
-check('S: denominators merged with prior (read 10, find 1, bash 3)',
-  saved.toolCalls.read === 10 && saved.toolCalls.find === 1 && saved.toolCalls.bash === 3,
+check('S: denominators merged with prior (read 10, find 2, bash 3)',
+  saved.toolCalls.read === 10 && saved.toolCalls.find === 2 && saved.toolCalls.bash === 3,
   JSON.stringify(saved.toolCalls));
 check('S: unguarded tool not counted', saved.toolCalls.webfetch === undefined, JSON.stringify(saved.toolCalls));
 check('S: temp mount fix counted under its own key (path.tempMount)', saved.fixes['path.tempMount'] === 1, JSON.stringify(saved.fixes));
@@ -881,8 +958,28 @@ toolCall({ toolName: 'read', input: { path: 'plain.txt' } }, uiCtx); // 本 sess
 shutdown({}, uiCtx);
 const merged = JSON.parse(readFileSync(statsPath, 'utf8'));
 check('S: concurrent increments merged (read 10+5+1)', merged.toolCalls.read === 16, JSON.stringify(merged.toolCalls));
-check('S: concurrent merge keeps other keys (find/bash)', merged.toolCalls.find === 1 && merged.toolCalls.bash === 3, JSON.stringify(merged.toolCalls));
+check('S: concurrent merge keeps other keys (find/bash)', merged.toolCalls.find === 2 && merged.toolCalls.bash === 3, JSON.stringify(merged.toolCalls));
 check('S: concurrent merge preserves since', merged.since === '2025-01-01T00:00:00.000Z', JSON.stringify(merged.since));
+
+// --- 首寫路徑不雙計（write-path re-base）---
+// 新機器／刪檔後第一次落盤：分子 bump 先 flush 一次（檔案還不存在），shutdown
+// 再 flush 一次。先前只有「合併」分支更新基準，第二次 flush 會把同一批增量
+// 再疊一次（實測新檔案 + 一個 cmdFlag → 記成 2）。worker 用全新 process＋空的
+// EG_AGENT_DIR 釘住。
+{
+  const freshDir = join(scratch, 'fresh-agent');
+  mkdirSync(freshDir, {recursive: true});
+  const out = spawnSync(process.execPath, [selfPath, '--freshstats'], {
+    env: {...process.env, EG_SCRATCH: scratch, EG_AGENT_DIR: freshDir},
+    encoding: 'utf8',
+  });
+  let got = null;
+  try { got = JSON.parse(out.stdout.trim()); } catch { /* reported below */ }
+  const expected = got?.gate ? 1 : undefined;
+  check('S: first write does not double count the delta',
+    got !== null && got.fixes['shell.cmdFlag'] === expected,
+    JSON.stringify({stdout: out.stdout, stderr: out.stderr, status: out.status}));
+}
 
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== pi unit battery: ${pass} passed, ${failures.length} failed (gate ${gateOn ? 'ON: path conversion disabled' : 'OFF: conversion enabled'}) ===`);

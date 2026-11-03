@@ -30,16 +30,30 @@
 //     反斜線換行續接後的 cmd //c（\⟨newline⟩ 被當跳脫對併進 token、指令字
 //     身分失效）、bash -c '…' 引號內的指令碼、envp 殘餘值形（env 選項交錯形
 //     env -u V X=…、賦值值的引號/清單/根相對形等；見 convertEnvPath 與 spec
-//     「envp 殘餘形」）、指令字串裡成對的反斜線抵達 bash 時只剩一個（病灶已
+//     「envp 殘餘形」）、重導向前綴後的 cmd（`> log cmd //c ver` 合法、cmd 真的
+//     執行；重導向目標是 bash 自己解析的路徑，目標詞結束了指令位置——要修得
+//     先追「本 simple command 是否已有指令字」，為有機頻率 ~0 的形而加狀態
+//     不值得）、
+//     指令字串裡成對的反斜線抵達 bash 時只剩一個（病灶已
 //     量到：git-bash 對 `-c` 操作數的引號處理把成對反斜線縮一層，stdin／檔案
 //     傳輸保真；資訊在 hook 之前就丟了，加倍反斜線會破壞合法的跳脫＝誤修，
 //     見 spec 臺帳）、算術位移的識別字運算元（`$((1<<N))`／`((x<<N))`：`<<N`
 //     被當 heredoc 開頭、等不到定界符 → 換行後整段不再改寫＝其後的 cmd 旗標
 //     與 envp 全部漏修；與 `$((1<<2))` 同形，兩側都靜態不可分，見 spec）
-//   已知邊界（誤修、有機頻率 ~0，記錄不修）：未引號定界符第一字不是數字/字母/
-//     底線（`<<*X`、`<<.E`、`<<$S`…，實測合法）與純數字 `<<3`——掃描器不認得，
-//     本體會被當指令掃描；放寬第一字會把 `$((x<<$y))` 這類算術誤判成 heredoc，
-//     兩個方向都是猜，見 spec 臺帳
+//   已知邊界（非 bit-identical／有機頻率 ~0，記錄不修）：
+//     - 未引號定界符第一字是 ASCII 標點或純數字（`<<*X`、`<<.E`、`<<$S`、
+//       `<<3`…實測都合法）——掃描器不認得，本體會被當指令掃描；放寬第一字會
+//       把 `$((x<<$y))` 這類算術誤判成 heredoc，兩個方向都是猜。非 ASCII 第一
+//       字（`<<中文`、`<<·`）已納入（非 ASCII 不可能開算術/替換，放寬無風險）。
+//     - envp 值的冗餘分隔符與 `.` 段：MSYS 會正規化（`/c//x`→`C:/x`、
+//       `/c/./x`→`C:/x`），掃描器只做前綴替換（→`C://x`、`C:/./x`）——路徑
+//       語意等價、字串不同；要對齊就得在這裡重實作路徑正規化（誤修風險大於
+//       收益，記邊界）。
+//     - `find` 的 `pattern` 裡嵌 temp 前綴（`pattern:"/tmp/*.txt"` 且無 `path`）：
+//       host 把 pattern 原樣交給 fd，`--full-path` 對絕對 pattern 靜默 0 筆
+//       （實測：檔案真的存在）。拆成 `path`＋其餘 pattern 會讓 fd 從 full-path
+//       切回 basename 遞迴＝多出子目錄結果（實測 1 筆→3 筆）＝改語意，
+//       所以記臺帳不修（spec〈只能靠寫對的形〉）。
 
 
 import * as os from "node:os";
@@ -352,19 +366,31 @@ function scanBash(command: string): BashScanResult {
   // 已知邊界（本體被掃、有機頻率 ~0，見 spec）。反方向也有一個邊界：
   // `$((1<<N))` 的識別字運算元被當 heredoc 開頭 → 換行後整段漏修（安全方向）。
   // （排掉 `)` 與反引號：它們會變成定界符本身的引號語法）
-  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\d*[A-Za-z_][^\s"'><;&|()\\`]*))/y; // sticky 已錨定 lastIndex
+  // 第一字也接受非 ASCII（`<<中文`、`<<·` 實測都是合法 heredoc）：先前只認 ASCII
+  // 字母/底線，本體被當指令掃描、`cmd //c` 被改成 `cmd /c`（資料改寫）。非 ASCII
+  // 字元不可能開 `$((x<<$y))` 這類算術（識別字是 ASCII）或 `$(`, 所以放寬安全。
+  const heredoc = /<<(-?)[ \t]*(\\?)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|(\d*[A-Za-z_\u0080-\uFFFF][^\s"'><;&|()\\`]*))/y; // sticky 已錨定 lastIndex
   const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
-  // 指令位置不結束的固定集合（bash 語法/內建層，閉集合）——不是「猜哪些程式
-  // 會轉發指令」：if/while/{/!/time 是語法關鍵字；exec/command/builtin 是 bash
-  // 內建、env 是 POSIX 標準程式，四者後接的第一個詞就是被執行的指令（例外
-  // ：exec/command/builtin 後的賦值形會被當指令名跑、原生就錯 → 不暫存，見
-  // commitTok；env 的 X= 參數會跨 msys→native 邊界 → 照常暫存）
-  //（實測 env/exec/command cmd //c ver 原生跑 ver、本機進互動模式——與裸
-  // cmd //c 同一故障；與 oc 版 SHELL_KEYWORDS 對齊）。界線仍在 shell 語法層
-  // ：timeout/nice/xargs 這類外部 wrapper 的參數結構才是開放集合（漏修臺見
-  // docs/spec.md）
-  //。刻意大小寫敏感：大寫 ENV 是路徑上的程式名、IF/TIME 不是 bash 關鍵字。
+  // 語法關鍵字閉集合：envp 觸發判定用（這些詞不是「真指令字」）。刻意大小寫
+  // 敏感：大寫 ENV 是路徑上的程式名、IF/TIME 不是 bash 關鍵字。
   const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|exec|command|builtin|env|[{}!])$/;
+  // 指令位置不結束的詞（閉集合）——不是「猜哪些程式會轉發指令」：
+  // if/then/elif/else/while/until/do/{/! 是語法關鍵字；time 是保留字；
+  // exec/command/builtin 是 bash 內建、env 是 POSIX 標準程式，四者後接的第一
+  // 個詞就是被執行的指令（例外：exec/command/builtin 後的賦值形會被當指令名跑
+  // 、原生就錯 → 不暫存，見 commitTok；env 的 X= 參數會跨 msys→native 邊界 →
+  // 照常暫存）。
+  // **不含 fi/done/esac/}**：它們是複合指令的**收尾**，後面直接接簡單指令是
+  // bash 語法錯誤（`fi cmd`、`done cmd`、`} cmd` 實測 exit 2、兩種轉換狀態同訊息
+  // ＝回傳≡原生）⇒ 放進續位集只會改寫死文字（文字有變、行為一樣＝零效應）。
+  // `esac` 由 case 區段追蹤處理（見 commitTok）；`}` 之後要 `;`／`&&`／換行。
+  // 界線仍在 shell 語法層：timeout/nice/xargs 這類外部 wrapper 的參數結構才是
+  // 開放集合（漏修臺見 docs/spec.md）。
+  const COMMAND_POS_CONTINUES = /^(?:if|then|elif|else|while|until|do|time|exec|command|builtin|env|[!{])$/;
+  // 函式定義的**本體必須是複合指令**（`f() cmd` 實測 exit 2＝語法錯誤）：
+  // `f()` 之後延後到下一詞才決定——複合起始詞開本體（`f() { cmd //c …; }` 的
+  // cmd 照常改寫），普通詞不開（死文字不動）。`(`/`((` 由括號分支處理。
+  const FUNC_BODY_STARTERS = /^(?:\(|\{|if|while|until|for|case|select|\[\[)$/;
 
   // 指令字排除集（觸發套用的反集合）——值「不經 msys→native exec 邊界」
   // 的閉集合，兩類：
@@ -437,6 +463,8 @@ function scanBash(command: string): BashScanResult {
   //   會被誤判成樣式 `)`，把 echo 的參數當命令改寫（實測踩過）
   let caseRegion: "none" | "pattern" | "body" = "none";
   let casePending = false; // 看過 `case`、還沒看到它的 `in`
+  // 看過 `f()`、還沒看到它的本體詞（見 FUNC_BODY_STARTERS）
+  let funcAwaitBody = false;
   // 最後一個 `)` 收的是什麼決定詞是否延續到括號外：替換／程序替換→延續
   // （`$(pwd)#z`、`<(true)#z` 的 # 是字面資料，實測）；群組／子殼／函式定義
   // 收尾與樣式區的 `)` → 開新詞（`(true)#c`、`a)#c` 的 # 是註解，實測）。
@@ -501,19 +529,34 @@ function scanBash(command: string): BashScanResult {
     tokQuoted = false;
     if (!curTok) return;
     prevTokCmdPos = cmdPosNext;
+    const lowTok = curTok.toLowerCase();
     if (cmdPosNext) {
       // FOO=bar 環境變數前綴、與 if/while/{/! 等語法關鍵字都不結束指令位置
-      cmdPosNext = RESERVED_WORD.test(curTok) || ASSIGN_PREFIX.test(curTok);
+      //（收尾詞 fi/done/esac/} 不在集合內：後面接指令是語法錯誤，見定義處）
+      cmdPosNext = COMMAND_POS_CONTINUES.test(lowTok) || ASSIGN_PREFIX.test(curTok);
+    }
+    // 函式本體槽：`f()` 之後只有複合起始詞開指令位置（`f() cmd` 是語法錯誤）
+    if (funcAwaitBody) {
+      const startsBody = FUNC_BODY_STARTERS.test(lowTok);
+      // 本詞的位置跟隨槽的結果：不是起始詞＝這詞在語法錯誤行上，不該授權
+      // cmd 旗標改寫（`f()` 後換行再接 `cmd //c`——兩態都是 syntax error，
+      // 先前 prevTokCmdPos 仍為 true 就把死文字改了）
+      prevTokCmdPos = startsBody;
+      cmdPosNext = startsBody;
+      funcAwaitBody = false;
     }
     // case 區段追蹤（語法見上方註解）：`case` 要在命令位置才算；`in` 在參數位置，
-    // 位置 gate 不適用，所以只認「看過 case」（casePending）；`esac` 同 `case` 一樣
-    // 只認命令位置——資料位置的 esac（`echo esac`、樣式字面 esac）不能把區段
-    // 打掉（實測：`echo esac` 曾把 body 重設成 none，`case $x in esac) …` 的樣式
-    // 字面曾被當結束符、造成後續旗標漏修）。
-    const lowTok = curTok.toLowerCase();
+    // 位置 gate 不適用，所以只認「看過 case」（casePending）；`esac` 在**樣式區**
+    // 就是空 case 的結束（`case x in esac` 合法，其後的 `)` 是外層替換的收尾——
+    // 實測 `echo $(case x in esac) cmd //c ver` 印出資料，改寫那裡＝真誤修），
+    // 在 body/none 則只認命令位置（資料位置的 esac 不能把區段打掉）。
+    // 不是終止符：case 主詞（`case esac in …`）、引號樣式字面、資料詞。
     if (lowTok === "case" && prevTokCmdPos) casePending = true;
     else if (lowTok === "in" && casePending) { caseRegion = "pattern"; casePending = false; }
-    else if (lowTok === "esac" && prevTokCmdPos) { caseRegion = "none"; casePending = false; }
+    else if (lowTok === "esac" && !quotedTok && !casePending && (caseRegion === "pattern" || prevTokCmdPos)) {
+      caseRegion = "none";
+      casePending = false;
+    }
     // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
     if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
     if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) cmdFlagZone = true;
@@ -657,6 +700,7 @@ function scanBash(command: string): BashScanResult {
       // 就不可靠，不猜。
       const feedTok = curTok === "" && cmdPosNext;
       commitTok();
+      funcAwaitBody = false; // 引號詞不是函式本體
       const end = command.indexOf("'", i + 1);
       if (end === -1) {
         const seg = command.slice(i);
@@ -675,6 +719,7 @@ function scanBash(command: string): BashScanResult {
       // 時不會命中任何閉集合＝與動態詞同類（安全方向）。
       const feedTok = curTok === "" && cmdPosNext;
       commitTok();
+      funcAwaitBody = false; // 引號詞不是函式本體
       // 找關閉引號：$() 與反引號內會重新開啟引號語境，需跳過整個命令取代區域
       let j = i + 1;
       while (j < n && command[j] !== '"') {
@@ -716,6 +761,7 @@ function scanBash(command: string): BashScanResult {
     }
     if (ch === "<" && command[i + 1] === "<") {
       commitTok();
+      funcAwaitBody = false; // heredoc 不是函式本體
       heredoc.lastIndex = i;
       const m = heredoc.exec(command);
       if (m) {
@@ -741,6 +787,7 @@ function scanBash(command: string): BashScanResult {
     }
     if (ch === "|" || ch === ";" || ch === "(") {
       commitTok();
+      funcAwaitBody = false; // 分隔符或括號收掉了本體槽
       // 只有 `;;` 會把 body 拉回樣式區；單一 `;` 只是 body 內的指令分隔
       if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") caseRegion = "pattern";
       // 管線／指令結束＝前綴賦值沒接上指令字（standalone）→ 丟棄。`(` 不丟：
@@ -775,6 +822,7 @@ function scanBash(command: string): BashScanResult {
     }
     if (ch === "&") {
       commitTok();
+      funcAwaitBody = false;
       if (command[i - 1] !== ">" && command[i - 1] !== "<") {
         clearTok();
         cmdPosNext = true; // 2>&1 的 & 不是分隔符
@@ -802,7 +850,19 @@ function scanBash(command: string): BashScanResult {
           //   subst/procsubst → 開括號時的位置（賦值前綴→true，參數→false）
           //   group → 不開命令位置（`( … ) word` 原生就是語法錯誤，不改死文字）
           const fr = parenStack.pop();
-          if (fr !== undefined) cmdPosNext = fr.kind === "func" || fr.kind === "case" ? true : fr.kind === "group" ? false : fr.pos;
+          if (fr === undefined || fr.kind === "group") {
+            // 多餘的 `)` 與群組／子殼收尾都不開指令位置（`( … ) word` 是語法
+            // 錯誤，實測 exit 2；多餘 `)` 同）——改寫死文字＝零效應
+            cmdPosNext = false;
+          } else if (fr.kind === "func") {
+            // 函式本體必須是複合指令：位置延後到下一詞（FUNC_BODY_STARTERS）
+            cmdPosNext = false;
+            funcAwaitBody = true;
+          } else if (fr.kind === "case") {
+            cmdPosNext = true;
+          } else {
+            cmdPosNext = fr.pos;
+          }
           restoreTrue = fr !== undefined && (fr.kind === "func" || (fr.kind === "subst" && fr.pos === true));
           // 詞是否延續到括號外：替換與程序替換收尾＝延續（`$(pwd)#z`、
           // `<(true)#z` 的 # 是字面，實測）；群組／子殼／函式定義收尾開新詞
@@ -829,6 +889,7 @@ function scanBash(command: string): BashScanResult {
       // 的替換本身就是指令名，cmd 只是它的參數 → 不再是指令位置。
       const inWord = curTok !== "";
       commitTok();
+      funcAwaitBody = false; // 替換不是函式本體
       if (!inBacktick) {
         btPos.push(inWord && cmdPosNext);
         inBacktick = true;
@@ -1010,6 +1071,11 @@ function persistStats(): void {
     const tmp = `${file}.${process.pid}.tmp`; // per-PID: concurrent sessions must not rename each other's half-written file
     writeFileSync(tmp, JSON.stringify(stats, null, 2) + "\n", "utf8");
     renameSync(tmp, file);
+    // 無論走哪條路徑（合併或首寫／壞檔直寫）寫完就把基準 re-base 到剛落盤的值：
+    // 只有合併分支更新基準的話，**首寫**（檔案不存在／讀不了）之後的下一次 flush
+    // 會把同一批增量再疊一次（實測：新檔案 + 一個 cmdFlag + shutdown → 記成 2）。
+    // 合併分支已經設過同樣的值，這裡重設是幂等的。
+    statsBase = { toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
   } catch {
     /* 統計失敗不影響工具執行 */
   }
