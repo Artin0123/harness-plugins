@@ -283,6 +283,9 @@ spec〈只能靠「寫對」的形〉）：
   `function f { …; }` 內的 `cmd //c` 目前漏修）。
 - cmd 輸出的 GBK 亂碼、以及指令字串裡成對反斜線被 `-c` 折一層——治療點在宿主
   （解碼層／transport），插件只能記錄；要保位元組請用 write 工具落檔或 `\134`。
+- host 自帶的 shell 預檢（「Portable shell scanner」）對 `cat <<*X` 一類 heredoc
+  直接回 error——外掛 ON/OFF 都到不了插件（WSL bash 原生接受，回傳≠原生）；
+  定界符用字母開頭可避免。
 
 **不適用／未涵蓋**：`experimental_image_generate` 的 `path`（本機沒有 image model，
 無從實測）；`session_move` 的 `directory`（session 工具、不是檔案路徑消費者）。
@@ -331,8 +334,9 @@ for k, v in con.execute("SELECT key, value FROM kv WHERE value LIKE '%toolCalls%
 '@ | py -
 ```
 
-分子（修復觸發）即時持久化，重啟不清零；統計失敗不影響工具執行（儲存與寫入時機
-的設計見 spec）。
+分子（修復觸發）即時持久化，重啟不清零；多個 opencode 並發共用同一 db 時，flush
+先重讀最新値、只把自己的增量疊上去（不是整包覆蓋），計數僅 advisory；統計失敗不
+影響工具執行（儲存與寫入時機的設計見 spec）。
 
 ---
 

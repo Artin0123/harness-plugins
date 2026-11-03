@@ -251,6 +251,7 @@ pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同
 | --- | --- | --- |
 | cmd 輸出的 GBK 亂碼 | host 的解碼層（插件看不到原始位元組） | 同任務改用 bash 原生工具（`ls`/`grep`/`find`） |
 | 指令字串裡成對的 `\\` 被 `-c` 折一層（實測 git-bash 專有；WSL bash 5.3.0 全部保留） | host 的 transport（stdin／temp script）；插件拿到的已是折過的字串 | 要位元組保真就把內容用 write 工具落檔，或寫 `\134` |
+| oc host 自帶的 shell 預檢層：「Portable shell scanner」對 `cat <<*X` 回 error `Portable shell scanner cannot analyze command: heredoc`（2026-11-03 實測，外掛 ON/OFF 都一樣＝插件拿不到該事件；同段 `<<3`／`<<.E`／`<<$S` 則放行——host scanner 的判準不與插件掃描器同形，未逐一建模）。WSL bash 原生對照（腳本檔）：`cat <<*X`／`cat <<.E` 本體照印、後續指令照跑＝host 擋掉的是**合法** heredoc，回傳≠原生 | host 的 shell tool 預檢（plugin 權限外）；插件掃描器只收到 host 放行的形 | 定界符用字母開頭；必要的資料本體先落檔再 `bash 檔` |
 
 - **cmd 的非 ASCII 亂碼**——cmd 照 console code page（本機 936＝GBK）編碼輸出、
   host 以 UTF-8 解碼 → 工具回傳≠真實終端機所見 → 依分界屬漏修；無忠實改寫：
@@ -450,12 +451,23 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
 `check` / `list` 由執行中的 server 回答（記憶體中的 registry），與磁碟狀態無關，server
 沒重啟就不會反映刪檔。
 
+**live 歸因前先對照快照新舊（2026-11-03 實測）**：安裝快照目錄可能整批落後 `master`
+（`git-harness-plugins-*` 三個 timestamp 目錄都停在舊版，while 源碼樹已含當日 16:39Z
+的修復 commit）——live 上看到的舊行為可能是「跑的是舊版模組」，不是「新版修復無效」。
+判斷 live 所見前，先比對 cache 快照的 timestamp 與 `git log` 的 commit 時刻；正在跑的
+session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差，不能只看本 session
+的反應就下結論。
+
 ## oc 版：接線與閘門
 
 - 路徑類：`ctx.tool.hook("execute.before")` 改 `event.input`（`path` /
   `patchText` / `glob` 的 `pattern`）——input 可就地改動、改動直達執行
   （v2.2.5 實測兩處改寫都落到 spawn 的指令行）。
 - 指令類：`ctx.shell.hook("create.before")` 改 `event.command` 與 `event.cwd`。
+  `event.shell`／`event.command` 先過 typeof 守門（非字串 → 整體放行，v2.2.5 實測
+  **無**非字串事件——對照上方工具 hook 的同類守門是實測故障點、這裡是契約一致化：
+  該 hook 拋 TypeError 會弄壞 spawn 本身（比任何漏修糟），契約外的分支一律選「外掛
+  不存在時的原狀」）。
 - temp 錨點問 bash 本身（`cygpath -w /tmp`）：`os.tmpdir()` 不是權威——本機對
   native 子行程 MSYS 已把 TEMP 轉成 Windows 路徑（實測），但定義 `/tmp` 的是
   shell 工具的 bash；`os.tmpdir()` 只在是真盤符路徑時當 fallback，無錨點 →
@@ -545,11 +557,14 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   - 第一字非數字/字母/底線的定界符（實測合法：`* . : = $ [ ] / @ + % ^ , ~ ! ? { }`）
     與純數字 `<<3` 不認——本體會被當指令掃描（＝資料改寫，是誤修不是漏修）。
     放寬第一字會把 `$((x<<$y))` 這類算術誤判成 heredoc（兩側都是猜），所以留著
-    並在電池釘住「現況」（`<<*X`／`<<3` 本體目前會被掃，有機頻率 ~0）。
+    並在電池釘住「現況」。oc live 複驗（2026-11-03）：`<<3`／`<<.E` 在外掛 ON 時
+    本體 `cmd //c ver` 遭改寫成 `cmd /c ver`（資料改寫實證）、OFF 原樣；`<<*X` 被
+    host 的 Portable scanner 整體擋下（見 oc 接線段），兩側都到不了插件掃描器——
+    這三形的「本體不應被掃」判準不變，電池照釘現況。
   - 反方向：`$((1<<N))`／`((x<<N))` 的識別字運算元被當 heredoc 開頭、等不到
     定界符 → 換行後整段不再改寫（＝其後的 cmd 旗標與 envp 全部漏修；live 是
-    靜默 banner）。與 `$((1<<2))` 同形、靜態不可分，記臺帳；電池釘「下一行
-    保持原樣」。
+    靜默 banner，oc live 複驗 2026-11-03 同形）。與 `$((1<<2))` 同形、靜態不可分，
+    記臺帳；電池釘「下一行保持原樣」。
 - 跳脫字元屬於當前詞（`\>` 不構成運算子）；`2>&1` 的 `&` 不是分隔符。
 - POSIX 語法關鍵字（if/then/do/{/！…）、`FOO=bar` 前綴與 env/exec/command/
   builtin（後接指令字的閉集合）不結束指令位置；`#` 在詞首是註解——bash 忽略
@@ -744,9 +759,17 @@ export 是帶 `id` / `setup` 的物件。`oc-plugins/tests/packaging/` 把這個
   新的記憶體値與基準（重複 flush 不雙計；計數僅 advisory）。
 - **任何統計失敗都吞掉**：先做完原有改寫再計數；storage 壞掉時 hook 照常註冊、
   改寫照常運作、cleanup 不拋錯；壞檔／畸形資料 shape-check + 數值轉換，絕不致命。
-- oc 的 `ctx.storage.set` 寫入序列化（鏈在前一筆之後）：debounce flush 與分子
-  即時 flush 可能重疊，兩個 racing 的 `set` 可能把舊快照最後落盤；錯誤照樣吞掉，
-  修復路徑不 await。
+- oc（**2026-11-03 版**，與 pi 同機制的移植）：`ctx.storage` 無 compare-and-set，
+  兩個 opencode share 同一 db kv——只有「讀檔-合併-寫入」的第一條時，各自 from-load
+  累加的整包快照會互相覆蓋（last-writer-wins 窗口＝整個進程壽命）。修法：flush 時
+  **先重讀 store 最新値**，把自己「當下本機計數−上次 baseline」的**增量**疊上去；
+  baseline 隨即 re-base 到本次快照（save 等待期間落進來的 bump 歸下一次 delta，
+  不再二次投遞——鏈式 flush 曾因 aliasing 雙計，電池有併發與連續 read-modify-write
+  釘樁）；命令數同值時重複 flush 冪等。寫入仍串行鏈在前一筆之後（racing 的 `set`
+  不會把舊快照最後落盤）。記憶體 `stats` 只持本機値（載入値＋本進程 bump），只有
+  寫入値是全域合併結果。**殘餘**：單次 flush 的 get..set 之間（無 CAS、持鎖無望，
+  計數僅 advisory）另一 server 的寫入仍可能被覆蓋——窗口從進程壽命收窄到單次
+  get..set，不再補貼；錯誤照樣吞掉，修復路徑不 await。
 
 ## oc 版：實測記錄（v2.2.5，一次乾淨對話）
 
@@ -834,9 +857,12 @@ import（`getAgentDir`）換成 stub、從系統暫存目錄的拋棄式副本�
 `@opencode/plugin`、default export 有 `id`/`setup`）。worker 場景（無錨點／探測開關）
 各自跑獨立 process（module 級快取會釘死情境）。
 
-涵蓋（env-guard）：每一條修復、每一條刻意不修（釘死防回歸）、hook 接線、gate 的
-兩個方向（轉換開／關的機器都能跑同一份電池）、統計的分母 gate、各 fix key、
-persisted 往返與 read-modify-write、畸形資料、壞 storage 韌性。
+涵蓋（env-guard）：每一條修復、每一條刻意不修（釘死防回歸）、hook 接線（含 shell
+hook 的 typeof 契約守門——無實測故障點、釘的是契約）、gate 的兩個方向（轉換開／關
+的機器都能跑同一份電池）、統計的分母 gate、各 fix key、persisted 往返與
+read-modify-write、畸形資料、壞 storage 韌性、並發 server 的 delta 合併／幂等
+flush／合併後仍會遞增（2026-11-03 H6 修的釘樁，兩份拋棄式 module 副本共用一個
+fake store 模擬兩進程）。
 
 執行方式見 README 的〈開發〉。
 

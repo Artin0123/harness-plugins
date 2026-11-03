@@ -1196,7 +1196,16 @@ interface Stats {
 }
 
 let stats: Stats | null = null;
-let saveStats: ((s: Stats) => Promise<void>) | null = null;
+// What this process last read/merged-wrote: the in-memory numbers are
+// "baseline + this process's increments", and only the increments are ours.
+// flushStats re-reads the stored value first and re-applies just the delta,
+// so two concurrent opencode servers sharing opencode.db no longer overwrite
+// each other's whole snapshot with last-writer-wins (that window was the
+// whole process lifetime; it is now the read..set window of a single flush --
+// ctx.storage has no compare-and-set, the residue is documented in spec.md,
+// and the counts stay advisory).
+let statsBaseline: Stats | null = null;
+let saveStats: (() => Promise<void>) | null = null;
 let statsTimer: ReturnType<typeof setTimeout> | undefined;
 let statsWrite: Promise<void> = Promise.resolve(); // serialization tail: sets must not land out of order
 
@@ -1215,6 +1224,36 @@ export function statsSnapshot(): Stats | null {
   return stats && { ...stats, toolCalls: { ...stats.toolCalls }, fixes: { ...stats.fixes } };
 }
 
+// latest = what the store holds at flush time (possibly another process's
+// write); current = our in-memory value (baseline + our increments). The
+// result keeps the store's since and adds our per-key delta -- and it re-bases
+// after every flush, so a repeated flush never double-counts. Misshapen store
+// data falls back to our snapshot (adoptCounts coerces what is usable).
+function mergeStats(latest: unknown, current: Stats, baseline: Stats): Stats {
+  const ok =
+    latest && typeof latest === "object" &&
+    (latest as Partial<Stats>).schema === 1 &&
+    typeof (latest as Partial<Stats>).since === "string";
+  // always a fresh object: callers hand `current` to the baseline afterwards,
+  // and a shared object would alias snapshots (measured zero deltas)
+  if (!ok) return { schema: 1, since: current.since, toolCalls: { ...current.toolCalls }, fixes: { ...current.fixes } };
+  const src = latest as Stats;
+  const out: Stats = { schema: 1, since: src.since, toolCalls: {}, fixes: {} };
+  for (const group of ["toolCalls", "fixes"] as const) {
+    for (const [k, v] of Object.entries(adoptCounts(src[group]))) {
+      const ours = current[group][k] ?? 0;
+      const then = baseline[group][k] ?? 0;
+      out[group][k] = v + Math.max(0, ours - then);
+    }
+    for (const [k, ours] of Object.entries(current[group])) {
+      if (out[group][k] !== undefined) continue; // already merged above
+      const then = baseline[group][k] ?? 0;
+      out[group][k] = Math.max(0, ours - then);
+    }
+  }
+  return out;
+}
+
 function flushStats(): Promise<void> {
   if (statsTimer) {
     clearTimeout(statsTimer);
@@ -1226,7 +1265,7 @@ function flushStats(): Promise<void> {
     // numerator flush can overlap, and two racing .set calls could otherwise
     // persist the older snapshot last (last-writer-wins with stale data)
     statsWrite = statsWrite
-      .then(() => saveStats!(snap))
+      .then(() => saveStats!())
       .catch(() => { /* telemetry stays silent */ });
   }
   return statsWrite;
@@ -1261,9 +1300,41 @@ export default define({
         saved && typeof saved === "object" && saved.schema === 1 && typeof saved.since === "string"
           ? { schema: 1, since: saved.since, toolCalls: adoptCounts(saved.toolCalls), fixes: adoptCounts(saved.fixes) }
           : { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
-      saveStats = (s) => ctx.storage.set(STATS_KEY, s);
+      // the loaded value is the first delta baseline; it must stay a COPY --
+      // bumps mutate `stats` in place, and an aliased baseline zeroes every
+      // delta (measured)
+      statsBaseline = statsSnapshot();
+      // Flush-time read-merge-write. Another process may have written since
+      // our last set landed (two oc servers share the same db kv), so the
+      // written value is the store's latest plus OUR delta: the local
+      // counters at save time minus what the baseline already counted. The
+      // baseline re-bases to that same snapshot at once, so
+      //  - bumps that land while this save is awaiting belong to the next
+      //    delta and are never re-delivered (the chained-save double count
+      //    that the battery pins),
+      //  - a repeated flush with unchanged counters writes exactly what the
+      //    store holds (idempotent),
+      //  - a snapshot held by an earlier chained save changes nothing -- the
+      //    delta is taken from the CURRENT counters, not from the stale
+      //    snapshot passed down the chain.
+      // `stats` is kept LOCAL (loaded value + our bumps); only the written
+      // value is global. Nothing aliases: statsSnapshot copies, mergeStats
+      // always builds a fresh object, and the baseline is never mutated
+      // (bumps change `stats` in place, aliased copies measured zero deltas).
+      saveStats = async () => {
+        const cur = statsSnapshot() ?? { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
+        const prevBase = statsBaseline ?? cur;
+        statsBaseline = cur;
+        let latest: unknown;
+        try {
+          latest = await ctx.storage.get(STATS_KEY);
+        } catch { latest = undefined; }
+        const merged = mergeStats(latest, cur, prevBase);
+        return ctx.storage.set(STATS_KEY, merged);
+      };
     } catch {
       stats = { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
+      statsBaseline = statsSnapshot();
       saveStats = null;
     }
 
@@ -1309,7 +1380,14 @@ export default define({
     });
 
     await ctx.shell.hook("create.before", (event) => {
-      if (!isMsysShell(event.shell)) return;
+      // String contract guards, the tool hook's typeof-gate counterpart: a
+      // non-string shell cannot be verified (and a non-string command cannot
+      // be scanned). No host non-string has ever been measured on v2.2.5 --
+      // this is defensive parity, not a measured fault point -- but a
+      // TypeError from this hook is the plugin breaking the spawn itself
+      // (worse than any missed fix), and every branch outside the measured
+      // contract chooses the pre-plugin status quo: no rewrite, no throw.
+      if (typeof event.shell !== "string" || !isMsysShell(event.shell)) return;
       bumpTool("bash");
       // `workdir` reaches this hook unresolved (`/tmp`) and the host checks it
       // with Windows semantics afterwards ("Working directory does not exist:
@@ -1323,6 +1401,7 @@ export default define({
         }
       }
       if (!pathConvDisabled(event.shell)) return;
+      if (typeof event.command !== "string") return;
       // convOff=true by construction here (the probe passed): with conversion
       // ON the native layer does both rewrites itself. Each rewrite reports
       // its own flag -- an envPath fix must not be mis-attributed to the

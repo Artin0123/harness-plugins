@@ -344,6 +344,23 @@ check('H: shell hook keeps workdir C:\\tmp', s7.cwd === 'C:\\tmp', JSON.stringif
 const s8 = evShell('pwd', process.execPath, '/tmp'); shellBefore(s8);
 check('H: shell hook keeps workdir for non-bash', s8.cwd === '/tmp', JSON.stringify(s8.cwd));
 
+// Defensive string-contract guards (the tool hook's typeof gates' counterpart
+// on the shell hook): no non-string event has ever been measured from the
+// host, so this pins contract parity, not a fault point -- the assertion is
+// that nothing outside the contract throws from the hook or rewrites.
+const hxU = evShell(undefined, bashPath, '/tmp');
+let hxThrew = false;
+try { shellBefore(hxU); } catch { hxThrew = true; }
+check('H: non-string command -> no throw, command untouched, workdir still rewritten',
+  !hxThrew && hxU.command === undefined && hxU.cwd === T, JSON.stringify({ hxThrew, command: hxU.command, cwd: hxU.cwd }));
+const hxD = evShell(42, bashPath); hxThrew = false;
+try { shellBefore(hxD); } catch { hxThrew = true; }
+check('H: numeric command -> no throw, untouched', !hxThrew && hxD.command === 42, JSON.stringify({ hxThrew, command: hxD.command }));
+const hxS = evShell('cmd //c ver', 42); hxThrew = false;
+try { shellBefore(hxS); } catch { hxThrew = true; }
+check('H: numeric shell -> no throw, command untouched',
+  !hxThrew && hxS.command === 'cmd //c ver' && hxS.cwd === '', JSON.stringify({ hxThrew, command: hxS.command }));
+
 // --- patch text: only directive lines are paths ---
 const patchAdd = mod.rewritePatchText('*** Begin Patch\n*** Add File: ${TEMP}/p.txt\n+hello\n*** End Patch');
 check('P: patch Add File rewritten', patchAdd.includes('*** Add File: ' + N + 'p.txt'), JSON.stringify(patchAdd));
@@ -783,14 +800,15 @@ if (bashPath) {
 const savedSets = [];
 const mkStatsCtx = (saved, broken = false) => {
   const h = {};
+  let current = saved; // a storage that reflects its own writes -- the real db kv does, and the merge reads it back
   const ctx = {
     tool: { hook: (name, cb) => { h['tool:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     shell: { hook: (name, cb) => { h['shell:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     storage: {
-      get: async () => { if (broken) throw new Error('db down'); return saved; },
+      get: async () => { if (broken) throw new Error('db down'); return current; },
       // 5ms delay: a cleanup that does not await its write cannot pass the
       // persistence assertions below without the old sleep-after-cleanup hack
-      set: async (k, v) => { await new Promise((r) => setTimeout(r, 5)); if (broken) throw new Error('db down'); savedSets.push(v); },
+      set: async (k, v) => { await new Promise((r) => setTimeout(r, 5)); if (broken) throw new Error('db down'); savedSets.push(v); current = v; },
     },
   };
   return { h, ctx };
@@ -902,6 +920,50 @@ await D.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/z' } });
 check('S: in-memory counting survives a broken storage', mod.statsSnapshot().toolCalls.read === 1, JSON.stringify(mod.statsSnapshot().toolCalls));
 await cleanupD(); // must not throw
 check('S: cleanup with broken storage does not throw', true, '');
+
+// --- concurrent servers: flush re-reads the store and adds only our delta --
+// Two plugin instances (two module copies, the shape of two processes) share
+// one storage; a whole-snapshot write after the other's write used to eat it
+// (a last-writer-wins window as wide as the process lifetime). The delta
+// merge keeps both counts, and the re-base keeps repeated flushes from
+// double-counting.
+const sharedStore = { value: undefined };
+const mkSharedCtx = () => {
+  const h = {};
+  const ctx = {
+    tool: { hook: (name, cb) => { h['tool:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
+    shell: { hook: (name, cb) => { h['shell:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
+    storage: {
+      get: async () => sharedStore.value,
+      set: async (k, v) => { sharedStore.value = v; },
+    },
+  };
+  return { h, ctx };
+};
+const mod2Path = join(scratch, 'index-two.ts');
+writeFileSync(mod2Path, src, 'utf8');
+const mod2 = await import(pathToFileURL(mod2Path).href);
+const run1 = mkSharedCtx(); const run2 = mkSharedCtx();
+const clean1 = await mod.default.setup(run1.ctx);
+const clean2 = await mod2.default.setup(run2.ctx); // run2 loads BEFORE run1 writes: its snapshot can go stale
+// run1 counts a read and lands it
+await run1.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/p1' } });
+await clean1();
+check('S: first server flush lands its count', sharedStore.value?.toolCalls?.read === 1, JSON.stringify(sharedStore.value));
+// run2 counts a read from its stale snapshot and flushes -- the store must
+// hold BOTH (1 from run1 + 1 from run2), not run1's count overwritten
+await run2.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/p2' } });
+await clean2();
+check('S: concurrent flush keeps the other server write (delta merge)',
+  sharedStore.value?.toolCalls?.read === 2, JSON.stringify(sharedStore.value));
+// a repeated flush of the same in-memory value must add nothing (re-based)
+await clean2();
+check('S: re-based flush is idempotent', sharedStore.value?.toolCalls?.read === 2, JSON.stringify(sharedStore.value));
+// a new increment after the merge still lands
+await run2.h['tool:execute.before']({ tool: 'read', input: { path: '/tmp/p2b' } });
+await clean2();
+check('S: increments after the merge base on the new baseline',
+  sharedStore.value?.toolCalls?.read === 3, JSON.stringify(sharedStore.value));
 
 for (const f of failures) console.log('  FAIL ' + f);
 console.log(`=== oc unit battery: ${pass} passed, ${failures.length} failed ===`);
