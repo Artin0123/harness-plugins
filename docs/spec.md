@@ -4,8 +4,9 @@
 [`README.md`](../README.md)；這份記**技術架構、設計判準與實測證據**。通用判準
 （原生執行優先、修復審查清單、驗證紀律）見 [`AGENTS.md`](../AGENTS.md)，此處不重複。
 
-三個 host 各自實作，掃描器同源（env-guard 的 `matchParen`／`scanBash` 等），但
-**每一條修復的「適用性」是在本 host 重新量過才留**：同一顆 bash 在不同 host 的
+三個 host 各自實作：cmdc 與 oc 目前共用同源的輸入側掃描器（env-guard 的
+`matchParen`／`scanBash` 等），pi 已於 2026-11-04 redesign 移除掃描器、改為
+輸出側偵測（見〈pi 版：機制〉）。但**每一條修復的「適用性」是在本 host 重新量過才留**：同一顆 bash 在不同 host 的
 執行層下，同一個病理可能存在、也可能被 host 自己的層攔掉（例：`/c/...` 在 pi
 由 host 自己的解析層正規化、在 OpenCode 由工具層處理；`nul` 重導向是 bash 原生
 行為，重測後兩個 host 都一樣會建實體檔——結論都是「不修」，但理由各自量過。
@@ -52,65 +53,25 @@ bash 語法的 `for i in …; do …; done` 與 `if …; then …; fi` 不誤判
 
 ## pi 版：機制
 
-pi 直接 spawn bash（沒有 cmd.exe 中介層），所以修法與 cmdc 不同：
+pi 直接 spawn bash，env-guard 僅保留三個低風險機制：
 
-- temp 路徑：檔案工具 host 端解析不經 MSYS 映射、不展開變數 → 改寫到
-  `cygpath -w /tmp` 探測的真實 temp（與 bash 的 `/tmp` 同一錨點）。
-- 探測對象：pi 的 spawn 決策就是 `getShellConfig(settings.shellPath)`（dist/
-  core/agent-session.js 讀 settings → bash 工具 → `createLocalShellOperations
-  ("bash", () => getShellConfig(options?.shellPath))`），擴充呼叫同一個函式＝
-  **由構造保證探測對象≡spawn 對象**（此前的自製掃描解析順序與 pi 不同：pi
-  先看 Program Files 的 Git、掃描先看 PATH，「Program Files 有 Git＋PATH 上
-  另有 MSYS2」的機器會漂移，已移除）。getShellConfig 的 PATH fallback 不跳
-  System32 → 可能挑到 WSL 啟動器：uname 驗證擋下 → gate 停用、錨點退
-  `os.tmpdir()`（與 pi 真的 spawn 該 shell 的原生行為一致）；找不到 shell 或
-  `settings.shellPath` 指到不存在的檔（getShellConfig 對它會 throw）→ 整體
-  inert。**宿主版本耦合**：`getShellConfig` 自 pi **0.48.0** 起才 export
-  （CHANGELOG #766），舊宿主上 import 是 `undefined`——擴充以
-  `typeof getShellConfig === "function"` 檢查，不成立就整體停用（完全不改寫；
-  早期版本會在第一次工具呼叫時 `notify` 一次，2026-11-03 移除）。
-- `cmd //c` / `//k`：bashrc 的 `MSYS_NO_PATHCONV=1` 讓雙斜線原樣抵達 cmd → 進互動
-  模式（橫幅、指令沒跑、exit 0）。以子 bash 探測實際值，確認關閉才改寫；探測失敗
-  不改寫。**實測**：pi 的 bash 經 `BASH_ENV` 一樣載入 bashrc、病理重現——banner 與
-  `ver` 輸出幾乎同形，無修復時模型會把 banner 誤讀成指令結果（靜默錯誤答案）。
-  指令位置認定含 env/exec/command/builtin（bash 內建／POSIX 標準、後接指令字的
-  閉集合，與 oc 版 SHELL_KEYWORDS 對齊）——實測 env/exec/command cmd //c ver
-  原生跑 ver、本機 banner（同一故障）；也含獨立成詞的引號指令字（`"cmd" //c`：
-  bash 先做 quote removal 才解析指令字）；**不含收尾詞** `fi`／`done`／`esac`／
-  `}`（後面直接接簡單指令是語法錯誤，2026-11-04 與 oc 對齊）——`f()` 之後
-  延後到下一詞、只有複合起始詞（`{`／`(`／`if`／`while`／`until`／`for`／
-  `case`／`select`／`[[`）才開本體；外部 wrapper（timeout/nice/xargs）
-  維持漏修（同一環境層故障，靜態修法需開放集合的參數結構猜測，見〈刻意不修
-  與漏修的分界〉）。
-- 前綴賦值的 POSIX 路徑值（`VAR=/c/...`、`VAR=/tmp/...` 後接指令字）：原生
-  git-bash 在 spawn 原生程式時對 envp 做「值語法」轉換（實測 name-agnostic：
-  變數名不參與，`FOO` 與 `XDG_CACHE_HOME` 一視同仁），本機 `MSYS_NO_PATHCONV`
-  一樣停用這層 → 值原樣抵達 node、被當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位
-  、exit 0）。修法＝重現該層規則（不猜哪個變數是路徑）：只修「前綴賦值＋後接
-  指令字」的靜態未引號整值——standalone 賦值是 shell 變數、bash 端需要 POSIX
-  值，改它是誤修；盤符形→`C:/...`（錨點**字母通用**——實測 /m /b /q /x /y /z
-  皆經 mount 表轉換，如 `A=/m/x node` → `M:/x`，非只有 /c）、`/tmp` 形→cygpath
-  錨點（正斜線風格與原生
-  envp 輸出一致）。**實測**：修前 node 收到 `/c/foo`、修後與原生（轉換開啟）
-  同為 `C:/foo`；`/tmp` 形亦同。**已知 bit 邊界**：冗餘分隔符與 `.` 段不
-  正規化——`A=/c//x` native→`C:/x`、改寫→`C://x`（`A=/c/./x`、`A=/c/x//y`
-  同理；路徑語意等價、字串不同）。
+1. **檔案工具 temp 路徑（輸入側）**：write/edit/read/grep/find/ls 的 `path` 欄位中，`/tmp`、`$TEMP`／`$TMP`／`$TMPDIR`、`${TEMP}` 族與 `%TEMP%`／`%TMP%` 改寫到由實際 bash 執行 `cygpath -w /tmp` 得到的錨點。探不到便不改；`/c/...`、`C:\tmp`、`~/x`、`nul` 仍交給 pi 原生處理。
+2. **cmd 互動 banner（輸出側）**：僅 Windows 上檢查成功的 bash `tool_result`。指紋＝輸出前兩個非空行：第一行以 `Microsoft Windows [` 開頭、第二行以 `(c) Microsoft` 開頭（GBK 亂碼下兩個 ASCII 前綴都存活；提示符行 `X:\…>` 在管線 stdin 形態在、`/dev/null` stdin 形態不在，故**不**列入指紋；單獨的版本行是 `cmd /c ver` 的正常輸出，不命中）。命中時附加 `[env-guard]` advisory，指出原命令沒執行且 exit 0 不代表成功。按實際 MSYS 探針提示 `cmd /c <command>` 或 `cmd //c <command>`；以回傳 patch 傳播（`structuredContent` 原樣帶回）。截斷後辨識不到就放行。banner 經非 tty 管線也會輸出且 exit 0（本機實測）。
+3. **envp 路徑（輸入側掃描已移除）**：不再改寫 bash 指令。僅在 Windows 且 `MSYS_NO_PATHCONV` 確實停用時，`before_agent_start` 加入一次純 ASCII 系統提示：前綴賦值路徑值寫 Windows 形（`VAR=C:/x`，`VAR=/c/x` 會被 native exe 當成磁碟相對路徑）；native exe 旗標用單斜線（`cmd /c`、`taskkill /IM`）。marker 保證同一 systemPrompt 不重複追加。
 
-**活體 e2e（透過 pi 實際的 write 工具管道重測）**：`/c/Users/.../x.txt` 落在
-`C:\Users\...`（無 `C:\c` 錯位，host 解析層原生平規化）；`$TEMP/x`、`/tmp/x`
-被改寫到真實 temp 且 stats `path.tempMount`／`path.tempVar` 各 +1（`/c/` 穿透不計）；`~/x` 由 host
-原展開到 home。GBK 主張重驗：cmd 輸出經 chcp 65001 後同一命令首跑 GBK、
-後續 UTF-8（非確定性重現）；bash 傳給 `cmd echo` 的 UTF-8 參數原樣往返（解釋
-了「無 chcp 也是 UTF-8」的現象）。
+**探測對象≡spawn 對象**：pi 的 spawn 決策是 `getShellConfig(settings.shellPath)`，擴充呼叫同一函式；不自製 PATH 搜尋。`uname -s` 驗證 MSYS 身分，非 MSYS／探測失敗便停用相關功能。`getShellConfig` 自 pi 0.48.0 起才 export；舊宿主上探測失敗即 fail-safe。`MSYS_NO_PATHCONV` 透過實際子 bash（含 BASH_ENV）探測並快取。
 
-**工具面（與 oc 的 surface 對照；pi 1.5.0 實讀 `dist/core/tools/*.js`）**：
-host 自己解析的路徑欄位只有 `read`／`write`／`edit`／`grep`／`find`／`ls` 的
-`path`。`bash` 與 `powershell` 兩個 shell 工具都只有 `command`／`timeout`，
-**沒有 `workdir`**（oc 的 `shell.workdir` 面在 pi 不存在）；pi 沒有 `patch` 與
-`glob` 內建工具（oc 的 patch 指令行與 glob 前綴面沒有直接對應），`find` 的
-`pattern` 與 `grep` 的 `glob` 是另一回事（前者見〈只能靠寫對的形〉，後者是
-相對 path 的過濾字串、不是根目錄，沒有 host 解析故障點）。所以 oc 的四類
-temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境裡沒有那個面」。
+**BASH_ENV 探針陷阱**：互動 bash 的 `.bashrc` 設定對非互動 `bash -c` 不必然可見；本機設定由 `BASH_ENV` 令子 bash 載入，因此探針以實際 spawn 子 bash 的值為準，而非讀取設定檔或假設預設值。
+
+pi bash 結果形狀（實讀 `dist/core/tools/bash.js`）：`content:[{type:"text",text:...}]`、`structuredContent.exit_code`、`isError`；非零 exit 會標 `isError:true` 並附退出碼文字。插件接受上述形狀及字串 content，無可檢視文字則不動。統計維持 schema 1、`env-guard-stats.json`、merge/debounce/per-PID tmp/session_shutdown flush；fix keys 為 `path.tempMount`、`path.tempVar`、`shell.cmdBanner`，歷史鍵仍由 `adoptCounts` 保留。
+
+### redesign 2026-11-04
+
+輸入側 bash lexer 是開放集合：wrapper、引號、重導向與 bash 語法持續產生新形；過去六天五個 misfix commit 顯示其結構性審查成本，且誤修會靜默破壞正確語法。輸出側只在可辨識的成功互動 banner 後提示；誤判的失效模式是多一段 advisory、零執行破壞。辨識保守，截斷或不確定即漏過。
+
+本文件的 pi 掃描器稽核段（零效應改寫稽核、兩輪重跑）隨掃描器一併移除，證據在 git 歷史（e5b415f 及其前）；oc 對應段落保留原文，待 oc 代理 redesign 時處理（交接說明：`docs/oc-env-guard-redesign.md`）。
+
+**活體 e2e 與工具面**：pi 檔案工具 host 端解析 `/c/...`，不重複改寫；host 自己解析的路徑欄位只有 read/write/edit/grep/find/ls 的 `path`。bash 與 powershell 沒有 `workdir`，pi 沒有 patch/glob 內建工具；find `pattern` 與 grep `glob` 不屬於 path 修復面。
 
 ### 刻意不修與漏修的分界
 
@@ -120,6 +81,8 @@ temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境�
 的猜測（以誤修風險為界：寧可漏修、不可誤修）。
 
 **刻意不修（原生行為或模型自身錯誤，讓它壞）：**
+
+> pi redesign 註記（2026-11-04）：pi 的輸入側掃描器已整體刪除——本節、〈只能靠寫對的形〉與〈掃描器要點〉中所有涉及「pi 掃描器會／不會改寫」的描述均為歷史記錄（證據在 git 歷史），對 pi 不再生效；pi 對 cmd 形的現行處置＝輸出側 banner backstop：凡實際進入互動 banner 的形（wrapper／payload／續行／重導向前綴／time／算術等邊界形）一律不改寫輸入、命中即附加 advisory；輸出被截斷或指紋不完整則漏過；cmd 以外的 native exe 旗標與 envp 賦值不在覆蓋範圍。條目中的 bash 原生行為實測與 oc 描述仍然有效（oc 尚未 redesign，交接見 `docs/oc-env-guard-redesign.md`）。
 
 - `C:\tmp`——原生寫入會成功。
 - **MSYS 盤符路徑 `/c/...`**——pi 的檔案工具解析層內建 `normalizeWindowsShellPath`
@@ -233,7 +196,7 @@ temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境�
 | `/c/Users/x`（檔案工具 `path`） | pi／oc host 原生映射成 `C:\Users\x` | 照寫即可（不要再期待插件改） |
 | `>nul`／`2>nul`／`<nul`／`2>&nul` | bash 原生：建實體 `nul` 檔／ENOENT／ambiguous redirect | 要丟棄輸出寫 `/dev/null` |
 | 重導向目標的 `//x`（`cmd //c x > //out`） | 目標由 bash 自己開檔，`//out: Is a directory` | 目標寫正常路徑 |
-| `cmd //?`、`cmd ///c ver`、`cmd //server/share`、`cmd //c/d/e ver` | 模型錯字。`///c` 兩態**輸出不同**：轉換開啟＝互動 banner、本機＝意外跑到 `ver`；都不改（修它＝替模型改錯字）。`//server/share` 四態全 banner；`//c/d/e` 同族（2026-11-03 起掃描器確實跳過，見〈零效應改寫稽核〉） | 執行就寫 `cmd //c <cmd>`（gate ON 時插件改寫成 `/c`） |
+| `cmd //?`、`cmd ///c ver`、`cmd //server/share`、`cmd //c/d/e ver` | 模型錯字。`///c` 兩態**輸出不同**：轉換開啟＝互動 banner、本機＝意外跑到 `ver`；都不改（修它＝替模型改錯字）。`//server/share` 四態全 banner；`//c/d/e` 同族（2026-11-03 起掃描器確實跳過，見〈零效應改寫稽核〉） | 執行就寫 `cmd //c <cmd>`（使用 `cmd /c`；需轉換開啟的環境則為 `cmd //c`） |
 | 緊貼形 `cmd//c`、`cmd//k`、`"cmd"//c`、`x=1 cmd//c` | 原生 127：bash 把 `cmd//c` 當**程式名** | 程式名與旗標之間要有空格 |
 | `exec X=/c/x …`／`command X=/c/x …`／`builtin X=/c/x …` | 原生 127／127／1：bash 把 `X=/c/x` 當指令名跑 | 前綴賦值要直接接真指令字 |
 | 引號偽賦值 `A=/c/x "B=/c/y" node` | 原生 127（`B=/c/y: No such file or directory`）：賦值判定在 quote removal 之前 | 同上；引號詞不是賦值前綴 |
@@ -279,7 +242,8 @@ temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境�
   注入 `chcp 65001` 實測非確定性（同命令有時 UTF-8 有時仍 GBK）且會把內建訊息
   切英文；治本在 host 的解碼層（權限外）——如實記錄並回報，不在自己的層打補丁
   ；亂碼本身是可見訊號，模型可自矯正（改用 bash 原生工具）。
-- **envp 殘餘形**（本章〈掃描器要點〉末段）——根相對路徑值、引號開頭值、清單值
+- **envp 前綴賦值改寫已移除（2026-11-04）**：輸入側掃描器及其 envp 改寫整體刪除；誤修風險與開放集合成本不值得保留。替代為 path-conversion-disabled 時的系統提示（Windows 形值 `VAR=C:/x`）；殘餘形仍需照正確形寫。
+- **envp 殘餘形**（不再由插件改寫）——根相對路徑值、引號開頭值、清單值
   、含 `\` 的值、`export X=/c/…`（內建、argv 位置）、env 的選項交錯形（
   `env -u V X=/c/… node`——`-u` 之後的詞在參數位置；不帶選項的 `env X=/c/… node`
   已修：env 是 POSIX 外部程式、X= 參數跨 msys→native 邊界，實測原生轉換
@@ -359,133 +323,10 @@ temp 面在本機只剩 `path` 一個，其餘不是「漏抄」而是「環境�
   `\\`、正則、Windows 路徑字面）用 write 工具落檔或 `\134` 寫法。
 
 
-**零效應改寫稽核（pi，逐條實跑）**：把語料裡每個「真的會被改寫」的輸入（80 條）
-送進 bash 跑兩次——原版與改寫版——比對 exit 與 stdout，只保留行為真的有差的。
-結果：envp 族與 cmd 旗標族的差值都可觀測（`A=/c/x node` 轉換關閉＝`/c/x`、
-改寫後＝`C:/x`＝原生轉換開啟的值；`cmd //c ver` 轉換關閉＝banner、改寫後＝真的
-`ver`）。稽核抓到兩個**文字有變、行為一樣**的形，處理如下：
-
-- `C:\Windows\…\cmd.exe //c ver`（未引號）——bash 把反斜線當跳脫吃掉、程式名
-  不存在（原生 127）。**已修掉**：isCmdTok 改用去跳脫後的詞（同族的
-  `/c/Windows\System32\cmd.exe` 也一併不再命中），電池釘樁。
-- `case $x in esac) cmd //c ver;; esac`——樣式字面 `esac` 讓整行是語法錯誤
-  （exit 2）；改寫落在死文字，唯一差異是 bash 的 stderr 會回印改寫後的那一行。
-  當時的顧慮是「gate 掉它就得回頭接受 `echo $(case … echo esac;; b) cmd //c …)`
-  那條真漏修」；**2026-11-04 用「pattern 區段也認 `esac`」＋「stray `)` 不開
-  指令位置」兩道規則同時解掉**（前者不動死文字、後者保住活碼），見下節。
-- `cmd\\ //c ver`（未引號詞尾的成對反斜線）——bash 先把 `\\` 縮成一層、
-  再讓它跳脫後面的分隔符，程式名是 `cmd\`（原生 127，兩種轉換狀態同訊息）；
-  掃描器若只做「去反斜線」比對就會命中 cmd 而改寫 `//c`＝零效應。
-  **2026-11-03 已修**：isCmdTok 對未引號且以 `\` 結尾的詞直接回 false（oc 同
-  守門），電池釘樁。
-
-**2026-11-03 重跑（88 條語料，三態比對）**：每個輸入都跑 native（env 去
-`MSYS_NO_PATHCONV`／`BASH_ENV`／`PWD`，讓 MSYS 自己轉）、live、rewritten 三態，
-比 exit＋stdout。38 條被改寫的輸入中 **37 條「改寫後 ≡ 原生」**（＝修復真的
-成立，含 `//C`、`//q //c`、`"cmd" //c`、`\cmd //c`、`c\md //c`、`A=/c/中文`、
-`A=/c/x$(pwd)`〔PWD 兩側一起隔離後〕；只做單側隔離會讓 `$(pwd)` 自己發散，
-變成假 DIVERGE）；1 條是資料改寫（純數字定界符 `<<3`，見下節邊界）。預期漏修
-的那幾族（`A="/c/x"`、`A=/c/x:/d/y`、`env -u V X=/c/x`、`A=/c/x 2>&1 cmd`、
-`A=$(echo /c/x)`、`time -p`、`timeout`、反斜線續接）也逐一重測，行為與臺帳
-分類一致。
-
-**2026-11-04 重跑（pi，每條 payload 寫成腳本檔跑 local／native／rewritten 三態）**：
-45 條 cmd/envp 形態 + 16 條 heredoc + 22 條 envp 變體（cmd 形態另驗 WSL bash
-5.3.0；WSL 沒有 cmd.exe → N/A）。腳本檔傳輸是 byte-faithful（`-c` 會折成對
-反斜線），local＝轉換關閉、native＝`env -u MSYS_NO_PATHCONV -u BASH_ENV`（讓
-MSYS 自己轉），比 exit＋stdout。結果與處置：
-
-- **已修（真誤修）**：`echo $(case x in esac) cmd //c ver`——空 case 的 `esac`
-  結束區段後，`)` 是外層 `$(` 的收尾、`cmd //c ver` 是 echo 的參數（實測
-  local／native 都印 `cmd //c ver`），pi 先前把 `//c` 改掉＝**輸出內容被改**。
-  同一修法讓 `case $x in esac) …` 的死文字保持原樣（先前是零效應改寫）。
-  `x=$(case x in esac) cmd …` 這條活碼仍照常改寫（對照組，rewritten≡native）。
-- **已修（零效應改寫移除）**：`fi cmd //c ver`、`done …`、`} …`、`f() …`、
-  `f()`＋換行再接 `cmd …`、`{ true; } …`——兩態都是 exit 2（`syntax error near
-  unexpected token`），改寫只讓 stderr 回印的那一行不同。處置與 oc 相同：指令
-  位置續位集移除 `fi`／`done`／`esac`／`}`（`COMMAND_POS_CONTINUES`），`f()` 後
-  延後到下一詞、只有複合起始詞開本體（`FUNC_BODY_STARTERS`）——本體槽不承認的
-  詞連「本詞在指令位置」也不該成立（`f()` 後換行再 `cmd` 的殘留就是這條修掉的）。
-  對照組（`f() { … }`、`f() (…)`、`f() if …`、`f()` 換行再接 `{ … }`、
-  `… fi; cmd …`、`… done; cmd …`、`{ …; } ; cmd …`）仍改寫且 rewritten≡native。
-  殘餘（兩 host 同、記臺帳）：`f() && cmd …`、`f(); cmd …` 這類「本體缺失」的
-  同行語法錯誤仍會被掃描（分號／`&&` 之後到行尾之間是死文字，但下一個新行又是
-  真的指令；要分清楚得給分隔符加「本體缺失」狀態，頻率 ~0）。
-- **已修（資料改寫）**：非 ASCII 定界符 `<<中文`／`<<中文EOF`／`<<·`／`<<2中文`
-  ——local／native 本體都原樣輸出（合法 heredoc），pi／oc 先前都把本體裡的
-  `cmd //c` 改成 `cmd /c`。pi 的定界符第一字類已收 `\u0080-\uFFFF`（非 ASCII
-  不可能開 `$((x<<$y))`，放寬無風險）；ASCII 標點／純數字（`<<3`、`<<*X`、
-  `<<.E`、`<<$S`）仍是邊界（pin 現況）。**oc 於 2026-11-04 同步同一條第一字類**
-  （另修多 heredoc／ANSI-C 定界符，見 oc 稽核段）。
-- **漏修臺新增一條**：`> log cmd //c ver`（重導向前綴＋真指令）——local＝
-  banner、native＝ver，兩 host 都不改寫；修法要追「本 simple command 是否已有
-  指令字」，為 ~0 頻率的形加狀態不值得，記臺帳。
-- **既有臺帳重測成立**：`time -p`、反斜線續接、`bash -c 'cmd //c …'`、
-  `function f { … }`、`$((1<<N))`／`((x<<N))` 之後的指令、`A="/c/x"`、
-  `A=/c/x:/d/y`、`env -u V A=/c/x`、`A=/c$(echo foo)`、`python /tmp/x.py`
-  （本機 `C:\tmp\…` 找不到、native 執行）、`taskkill //IM`（本機無效／native
-  成功；`/IM` 相反）、`cmd /c ver` 在轉換開啟時被轉成 `C:/` → banner、
-  `> //out`（`Is a directory`）、`>nul`（兩態都建實體檔）、`<nul`（ENOENT）、
-  `2>&nul`（ambiguous redirect）。
-- **新記錄的 bit 邊界**：envp 值的冗餘段不被正規化——`A=/c//x` native→`C:/x`、
-  改寫→`C://x`；`A=/c/./x` native→`C:/x`、改寫→`C:/./x`；`A=/c/x//y` 同理
-  （路徑語意等價、字串不同）。要對齊得在此重實作路徑正規化，誤修風險大於收益
-  → 記邊界、不修。
-- **`find` 的 `pattern` 前綴**（oc `glob` 的對應面）：實測 `find(pattern:
-  "/tmp/eg-*.txt")` 靜默 0 筆（檔案存在）、`find(path:"$TEMP", pattern:
-  "eg-*.txt")` 找得到；但拆前綴會把 fd 從 full-path 切成 basename 遞迴
-  （1→3 筆，多出子目錄）＝改語意 → **不修**，形狀入〈只能靠寫對的形〉。
-
-**2026-11-04 第二輪（pi；oc 端交叉驗證回報逐條複驗）**：oc 端 agent 那輪的
-6 類修正＋2 條附帶逐條拿到 pi 重測（同一套三態 harness：`fold()` 模擬 transport、
-local＝轉換關、native＝`env -u MSYS_NO_PATHCONV -u BASH_ENV`、rewritten＝新模組
-餵出的字串；`fold` 模型先用 live 探針驗（run 2→1、3→2、4→2、6→3；lone `\` 不動；
-單引號內也折）。local／native／rewritten 一律比 exit＋stdout＋stderr。結果：
-
-- **成立且已修（真誤修／資料被改）**：
-  - **一行多個 heredoc**：pi 是單槽（後面的定界符覆蓋前面的），不是 oc 的
-    「第一個本體提前結束」；要第一個本體內出現**第二個**定界符行才爆。實測
-    `cat <<A <<B` + `B`／`A`／`cmd //c ver`／`B`：bash 印的本體是
-    `cmd //c ver`（local≡native），pi 改成 `cmd /c ver`。改法＝佇列
-    （`pendingHeredocs`，本體依開啟順序逐個吃完）。
-  - **ANSI-C／locale 引號定界符**：`<<$'EOF'`、`<<$"EOF"` 實測合法，pi 不認得
-    → 本體被改寫。現在認得；內容帶反斜線的（`<<$'E\tF'`，`\t` 是真 tab）靜態
-    算不準 → **整條指令 inert**（原樣放行，安全方向）。
-  - **ANSI-C 字串 `$'…'` 裡的 `\'`**：`echo $'x\' ; cmd //c ver'` 的資料被改成
-    `cmd /c ver`（local≡native 都印 `x' ; cmd //c ver`）——pi 在第一個 `'` 提前
-    收尾。同一個修法把 `echo $'a\'b'; cmd //c ver`（字串後真的接指令，先前漏修）
-    變成修復。
-  - **反斜線奇偶（transport fold）**：`echo "\\$(cmd //c ver)"`（event run 2）
-    local／native 都印字面 `$(cmd //c ver)`，pi 把內部的 `//c` 改掉＝資料改寫；
-    `echo "\\\$(cmd //c ver)"`（run 3）反而是真替換、pi 漏修。現在主迴圈／
-    `scanDq`／`matchParen`／雙引號收尾／ANSI-C 收尾全部按 `foldedRun` 奇偶判定
-    （run 1–2 字面、3–4 真替換；收尾引號同理，`echo "a\\\\" ; cmd //c ver` 現在
-    會改寫）。
-  - **未引號 Windows 路徑**：event run 1–2 → bash 看到 `C:Windows…`（127，不動）；
-    run 3–4 → 真的跑 cmd（local banner、native ver），舊「全刪反斜線」模型兩者
-    同字 → **漏修**。現在 `isCmdTok` 用 `lexWord`（fold＋lexer）：3/4 命中並改寫，
-    並回頭把 `c\\\md`（event run 3、原生 127）從「被改寫」變成不動。
-  - **here-string `<<<`**：舊碼讓第二個 `<` 跟第三個 `<` 配成 `<< "…"`——引號內容
-    被當定界符，`cat <<< "$(cmd //c ver)"` 的真替換被當本體吞掉（local banner、
-    native ver），後面的行也一起埋。現在 `<<<` 不進 heredoc 分支（前後都不是 `<`）。
-  - **`builtin cmd //c` 零效應**：`builtin` 只查內建表、cmd 不是內建 → 實測 exit 1、
-    `builtin: cmd: not a shell builtin`、兩態同訊息，改寫只落在死文字。已不改寫；
-    `builtin exec／command cmd //c` 仍照常（位置由 exec/command 提供）。
-- **不成立（pi 沒有這個缺陷；oc 段落的 pi 對照句已改）**：
-  - **`case` 的 `;&` fallthrough**：`;&` 之後的樣式**永遠不會被比對**（bash 直接
-    跳去下一個 body），所以即使 pi 把那段樣式當 body 掃也沒有可観測差異。實測
-    可匹配的形（`case "cmd //c ver" in a) true;& cmd\ //c\ ver) echo HIT;; esac`）
-    三態都是 `HIT`、pi 不改寫；`;;`／`;;&` 同樣不動。→ 不為它加狀態。
-  - **非 ASCII 定界符不是 pi 的缺口**：pi 自 2026-11-04 第一輪就有（含 astral
-    `<<😀`——UTF-16 surrogate 落在 `\u0080-\uFFFF` 內），兩邊現在都有。
-- **仍是邊界（兩 host 一致、記臺帳）**：`<<3`／`<<*X`／`<<.E`／`<<$S` 本體仍被掃
-  （pin 現況）；`$'cmd' //c`（ANSI-C 指令字）、`coproc cmd //c` 仍不修；
-  `echo \$(cmd //c ver)`（裸 `\$(` 是原生語法錯誤）改寫只影響 stderr 回印行；
-  `A+=/c/x` 不在 envp 形狀內。
-- **回歸**：既有 45 條 cmd/envp＋16 條 heredoc 全重跑，另加 ~40 條新語料
-  （`<<A <<B <<C`、heredoc 嵌 `if`、`<<<` 與 heredoc 同行、CRLF、`<<'E\\F'`
-  折疊比對、`time cmd //c`、閉合引號 parity）——除臺帳那幾條外全部
-  rewritten≡native；pi 電池 418 條（gate ON／OFF 各跑一次）。
+**pi 掃描器稽核段已移除（2026-11-04 redesign）**：原「零效應改寫稽核（pi）」、
+2026-11-03／04 兩輪重跑、第二輪交叉驗證等記錄（約 130 行）隨掃描器一併刪除，
+完整過程與證據在 git 歷史（commit e5b415f 及其前的版本）。下方 oc 稽核段引用的
+「pi 第二輪」「pi 同輪」等交叉參照均指該歷史內容。pi 現行機制見〈pi 版：機制〉。
 
 **零效應改寫稽核（oc，逐條實跑）**：同一份判準套到 oc 的掃描器與路徑面，找到並
 修掉下列「文字有變、行為一樣」或「改到資料」的形：
@@ -690,7 +531,7 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
   字面 `${TEMP}` 目錄才把該 key 加進 `PATH_TOOLS`；`session_move.directory` 屬
   工作區移動、temp 形態不太會有機出現，僅記錄。
 
-### 掃描器要點（pi / oc 共用語法感知規則）
+### 掃描器要點（oc；pi 掃描器已於 2026-11-04 redesign 移除，以下規則現僅約束 oc 版）
 
 - 單引號／雙引號內的字面 `> nul`、`cmd //c` 是資料，不動（唯一例外是「獨立
   成詞的引號指令字」以去引號形式參與指令字判定，本體仍原樣輸出；見下方 envp
@@ -779,7 +620,7 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
   上；exit code 與原生同為 2，但 bash 的 stderr 會回印被改寫後的那一行
   （死文字改寫，零語意影響）。
 - 替換／分隔符收尾清 token 狀態：替換內累積的 token 不能授權外面的改寫。
-- 前綴賦值路徑改寫（**pi / oc 兩 host 已落地，掃描器同源**）：指令位置的賦值
+- 前綴賦值路徑改寫（**oc 已落地；pi 已於 2026-11-04 redesign 移除**）：指令位置的賦值
   token 暫存（記下在 out 的跨度
   ），真指令字落地才套用——非賦值（含空值 `B=`）、非語法關鍵字、非
   BUILTIN_WORD（bash 內建與 bash/sh：值不經 msys→native 邊界——實測
@@ -876,7 +717,7 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
 ## 使用統計（實作）
 
 量測外掛實際命中率：清單內工具的呼叫次數（分母）與各修復的觸發次數（分子）。
-分類學 pi／oc 共用（cmdc 未實作；OpenCode 的各 surface 用同一組機制鍵）：
+分類學 pi／oc 沿用（cmdc 未實作；OpenCode 的各 surface 用同一組機制鍵；pi 的 cmdFlag／envPath 已於 2026-11-04 redesign 移除，歷史鍵保留）：
 
 | key                                                            | 觸發點                                             | variant 合併範圍 |
 | -------------------------------------------------------------- | -------------------------------------------------- | ---------------- |
@@ -884,8 +725,9 @@ session 的 plugin hook 也可快取舊 module，新碼上到 live 有時間差�
 | `glob.tempMount` / `glob.tempVar`                              | oc：glob pattern 前綴拆分                          | 同上兩族；前綴只能落在其中一族（沒有 `.other`，glob split 只回 temp 命中） |
 | `patch.tempMount` / `patch.tempVar` / `patch.other`            | oc：patch 指令行改寫                               | 同上；一次 patch 可同時 +1 兩個機制 |
 | `shell.workdir.tempMount` / `shell.workdir.tempVar` / `shell.workdir.other` | oc：shell `workdir` 改寫              | 同上 |
-| `shell.cmdFlag`                                                | cmd `//x` → `/x`（pi／oc）                         | `//c`、`//k`、多旗標、引號名、basename 路徑：同一個 argv 旗標轉換機制（緊貼形 `cmd//c` 不修） |
-| `shell.envPath`                                                | 前綴賦值路徑值改寫（pi／oc）                       | 碟符值與 `/tmp` 值：同一個 envp 轉換機制 |
+| `shell.cmdFlag`                                                | cmd `//x` → `/x`（oc；pi 已移除，改由 cmdBanner 輸出側偵測） | `//c`、`//k`、多旗標、引號名、basename 路徑：同一個 argv 旗標轉換機制（緊貼形 `cmd//c` 不修） |
+| `shell.envPath`                                                | 前綴賦值路徑值改寫（oc；pi 已移除，改系統提示）   | 碟符值與 `/tmp` 值：同一個 envp 轉換機制 |
+| `shell.cmdBanner`                                              | 輸出側 cmd 互動 banner 偵測（pi）                  | 單一故障點（成功輸出＋雙行 banner 指紋）：無 variant 合併問題 |
 
 **切鍵判準**：key ＝**surface × 故障機制**，不是「值長什麼樣」。同一機制下的
 拼法差異（`//c` 與 `//k`、碟符值與 `/tmp` 值、大小寫與分隔符）合併；機制不同的
@@ -1068,7 +910,7 @@ fake store 模擬兩進程）、以及 pi 首寫不雙計（2026-11-04：全新 
 
 執行方式見 README 的〈開發〉。
 
-**E2E 對照（envp 家族，oc 電池內；pi 電池同形）**：不只比字串，而是把指令送進
+**E2E 對照（envp 家族，oc 電池內；pi 已於 2026-11-04 redesign 移除 envp 改寫，此對照現為 oc 專屬）**：不只比字串，而是把指令送進
 真 bash 跑兩次——原生（把 env 的 `MSYS_NO_PATHCONV`／`BASH_ENV`／`PWD` 刪掉，
 讓 MSYS 自己做 envp 轉換）與改寫後（保留本機環境），比 exit 與 stdout。`PWD`
 必須兩側一起隔離：harness 可能匯出 Windows 形，`$(pwd)` 會與改寫無關地發散

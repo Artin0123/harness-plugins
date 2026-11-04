@@ -1,64 +1,10 @@
-// env-guard.ts — 防護 pi 在 Windows 上的路徑與 shell 事故。
-// 使用者視角與安裝：README.md；刻意不修／漏修的逐條病理與實測證據：docs/spec.md
-//（注意：手動安裝的副本不會帶走 repo 的 docs，註解只留判準、證據在 spec）。
-// 此處與程式內註解只留「讀懂、防誤改所需」的內容。
-//
-// 優先序：原生執行最優先——原生就會壞的讓它壞（工具回傳≡原生，agent 看到
-// 真實原因、可自癒）；只修「本環境的轉換/處理層弄壞」的失敗（回傳≠原生，
-// 大聲或靜默都是漏修，大聲≠豁免）；探測/閘門失敗一律不改寫（寧可漏修、
-// 不可誤修）。
-//
-// 三個修復（故障點都在 Windows 的工具/轉換層；細節見各自函式註解）：
-//   1. 檔案工具（write/edit/read/grep/find/ls）的 path：/tmp、$TEMP、
-//      %TEMP% … → 真實 temp（rewritePath；錨點 realTempDir／probeShell）
-//   2. bash 的 cmd //c|//k → /c|/k：MSYS_NO_PATHCONV 讓 //c 原樣抵達 cmd、
-//      進互動模式（靜默錯）（scanBash；閘門 pathConvDisabled）
-//   3. bash 前綴賦值的 POSIX 路徑值 → Windows 值：原生 envp 轉換會轉、本機
-//      停用 → /c/foo 被 node 當磁碟相對路徑解析成 C:\c\foo（靜默錯位）
-//      （convertEnvPath；掃描器 scanBash）
-//
-// 不修的事（此處只列清單防回歸誤加；逐條病理與實測在 spec）：
-//   刻意不修（回傳≡原生）：C:\tmp、nul 重導向與 <nul/2>&nul、重導向目標的
-//     雙斜線（bash 自己開檔、不經被關掉的 argv 轉換層）、原生就壞的 cmd
-//     雙斜線形（//? ///c //server/share）、緊貼形（cmd//c／"cmd"//c：bash 把它
-//     當程式名、原生 127 大聲失敗——插空格拆詞＝替模型改錯字）、exec/command/
-//     builtin 後的賦值形與引號詞裡的偽賦值形（bash 把它當指令名跑、原生就
-//     大聲失敗）、`builtin cmd //c`（builtin 只查內建表、cmd 不是內建 → 兩態
-//     同訊息，改寫只落在死文字）、del 與 dir /b 等 cmd-ism
-//   漏修（回傳≠原生，但靜態修法＝開放集合的猜測、誤修風險大於漏修）：
-//     外部 wrapper 後的 cmd、taskkill/sc/net/reg/findstr/robocopy 等原生
-//     工具的 //x 旗標、原生 exe 的 POSIX 路徑參數、
-//     反斜線換行續接後的 cmd //c（\⟨newline⟩ 被當跳脫對併進 token、指令字
-//     身分失效）、bash -c '…' 引號內的指令碼、envp 殘餘值形（env 選項交錯形
-//     env -u V X=…、賦值值的引號/清單/根相對形等；見 convertEnvPath 與 spec
-//     「envp 殘餘形」）、重導向前綴後的 cmd（`> log cmd //c ver` 合法、cmd 真的
-//     執行；重導向目標是 bash 自己解析的路徑，目標詞結束了指令位置——要修得
-//     先追「本 simple command 是否已有指令字」，為有機頻率 ~0 的形而加狀態
-//     不值得）、加引號的 ANSI-C 定界符帶跳脫（`<<$'E\tF'`：定界符要展開才
-//     知道，整條指令 inert ＝漏修、安全方向）、$'cmd' //c 這種 ANSI-C 指令字、
-//     coproc cmd //c、算術位移的識別字運算元（`$((1<<N))`／`((x<<N))`：`<<N`
-//     被當 heredoc 開頭、等不到定界符 → 換行後整段不再改寫＝其後的 cmd 旗標
-//     與 envp 全部漏修；與 `$((1<<2))` 同形，兩側都靜態不可分，見 spec）
-//   已知邊界（非 bit-identical／有機頻率 ~0，記錄不修）：
-//     - 指令字串裡的成對反斜線抵達 bash 時只剩一個（病灶在 transport：git-bash
-//       對 `-c` 操作數做一次「每組 \\ → \」，stdin／檔案傳輸保真）。掃描器
-//       **模擬這層**（foldTransport／foldedRun／lexWord）所以判定是對的，但
-//       位元組損失本身修不了（hook 看不到原始位元組，加倍反斜線會破壞合法的
-//       跳脫＝誤修）——要保位元組請用 write 工具落檔或 `\134`。
-//     - 未引號定界符第一字是 ASCII 標點或純數字（`<<*X`、`<<.E`、`<<$S`、
-//       `<<3`…實測都合法）——掃描器不認得，本體會被當指令掃描；放寬第一字會
-//       把 `$((x<<$y))` 這類算術誤判成 heredoc，兩個方向都是猜。非 ASCII 第一
-//       字（`<<中文`、`<<·`、`<<😀`）已納入（非 ASCII 不可能開算術/替換）。
-//     - envp 值的冗餘分隔符與 `.` 段：MSYS 會正規化（`/c//x`→`C:/x`、
-//       `/c/./x`→`C:/x`），掃描器只做前綴替換（→`C://x`、`C:/./x`）——路徑
-//       語意等價、字串不同；要對齊就得在這裡重實作路徑正規化（誤修風險大於
-//       收益，記邊界）。
-//     - `find` 的 `pattern` 裡嵌 temp 前綴（`pattern:"/tmp/*.txt"` 且無 `path`）：
-//       host 把 pattern 原樣交給 fd，`--full-path` 對絕對 pattern 靜默 0 筆
-//       （實測：檔案真的存在）。拆成 `path`＋其餘 pattern 會讓 fd 從 full-path
-//       切回 basename 遞迴＝多出子目錄結果（實測 1 筆→3 筆）＝改語意，
-//       所以記臺帳不修（spec〈只能靠寫對的形〉）。
-
+// env-guard — conservative Windows safeguards for pi.
+// 1. File-tool temp paths are rewritten to the real MSYS /tmp mount.
+// 2. Successful cmd interactive banners are detected after execution and receive an advisory.
+// 3. With MSYS path conversion disabled, system instructions advise Windows-form env paths
+//    and single-slash native executable flags. Native execution has priority: uncertain inputs
+//    are left alone. The input-side bash lexer was an open set: false fixes silently broke
+//    valid syntax. Output-side false positives add only an advisory and cannot alter execution.
 
 import * as os from "node:os";
 import * as path from "node:path";
@@ -185,124 +131,6 @@ export function pathConvDisabled(): boolean {
   return noPathConvCache;
 }
 
-// git-bash 對 `-c` 操作數做一次「每組 \\ → \」的縮減（2→1、3→2、4→2、6→3；
-// stdin／檔案傳輸保真）——hook 看到的是 event 字串，bash 看到的是縮過的
-// 那一份（本機實測：hook 看到 `'a\\b'`（run 2）時 bash 印 `a\b`（run 1）；
-// `"a\\$(echo Z)"`（run 2）印**字面** `a$(echo Z)`、`"a\\\$(echo Z)"`（run 3）
-// 印 `a\Z`＝字面反斜線＋真替換；`cmd\\ //c ver` 的程式名是 `cmd\`＝127）。
-// 所以「跳脫了嗎」的判定要照 bash 看到的那份：run 長度 n 縮成 ceil(n/2)，
-// 奇數＝下一個字元被跳脫、偶數＝這串是字面反斜線。輸出永遠照原樣複製
-//（縮減是 transport 的責任，在這裡動它就等於改寫合法跳脫＝誤修）；
-// 被改寫的字串（`//c`→`/c`、envp 值）都不含反斜線，所以原樣輸出後
-// transport 縮減的結果與原本一致。
-const foldTransport = (s: string) => s.replace(/\\\\/g, "\\");
-const foldedRun = (n: number) => Math.ceil(n / 2);
-
-// 位置 from 起的反斜線 run 長度
-function backslashRun(s: string, from: number): number {
-  let k = from;
-  while (k < s.length && s[k] === "\\") k++;
-  return k - from;
-}
-
-// 未引號詞在 bash 眼裡的樣子：transport 縮一層，再過 bash lexer 的跳脫（\x → x）。
-// 這是 `isCmdTok` 要的字——`C:\Windows\System32\cmd.exe`（event 每個分隔符一個
-// 反斜線）縮完只剩 `C:Windows…`（原生 127，不動）；`C:\\\Windows\\\…`（event
-// 三個）縮成兩個 → lexer 留一個真反斜線 → `C:\Windows\…`＝真的會跑 cmd。此前用
-// 「全刪反斜線」比對兩者會得到同一個字：後者（真的跑）漏修、`c\\\md`（127）
-// 反而改寫＝零效應。
-function lexWord(t: string): string {
-  const s = foldTransport(t);
-  let w = "";
-  for (let k = 0; k < s.length; k++) {
-    if (s[k] === "\\") {
-      k++;
-      if (k < s.length) w += s[k];
-      continue;
-    }
-    w += s[k];
-  }
-  return w;
-}
-
-// 在 s 中從 from 開始找與 "$(" 配對的 ")"，回傳其索引；找不到回傳 -1。
-// 需理解 bash 的巢狀：引號會重新開啟語境，但引號內的 $( )、反引號仍會作用，
-// 單引號則完全字面。遞迴處理雙引號內的命令取代。
-function matchParen(s: string, from: number): number {
-  let depth = 1;
-  let i = from;
-  while (i < s.length) {
-    const c = s[i];
-    if (c === "\\") {
-      const run = backslashRun(s, i);
-      i += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
-      continue;
-    }
-    if (c === "'" && i > 0 && s[i - 1] === "$") {
-      // ANSI-C 字串（$'…'）：\' 不結束、\\ 才是字面（實測 $'a\'b' 印 a'b、
-      // $'a\\' 收尾）；折疊後的奇偶判定同主迴圈
-      let p = i + 1;
-      while (p < s.length) {
-        if (s[p] === "\\") {
-          const run = backslashRun(s, p);
-          p += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
-          continue;
-        }
-        if (s[p] === "'") break;
-        p++;
-      }
-      i = p + 1;
-      continue;
-    }
-    if (c === "'") {
-      let p = i + 1;
-      while (p < s.length && s[p] !== "'") p++;
-      i = p + 1;
-      continue;
-    }
-    if (c === '"') {
-      let p = i + 1;
-      while (p < s.length && s[p] !== '"') {
-        if (s[p] === "\\") {
-          const run = backslashRun(s, p);
-          p += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
-          continue;
-        }
-        if (s[p] === "$" && s[p + 1] === "(") {
-          const cl = matchParen(s, p + 2);
-          if (cl === -1) return -1;
-          p = cl + 1;
-          continue;
-        }
-        if (s[p] === "`") {
-          let q2 = p + 1;
-          while (q2 < s.length && s[q2] !== "`") {
-            if (s[q2] === "\\") q2++;
-            q2++;
-          }
-          p = q2 + 1;
-          continue;
-        }
-        p++;
-      }
-      i = p + 1;
-      continue;
-    }
-    if (c === "(") {
-      depth++;
-      i++;
-      continue;
-    }
-    if (c === ")") {
-      depth--;
-      if (depth === 0) return i;
-      i++;
-      continue;
-    }
-    i++;
-  }
-  return -1;
-}
 
 // 統計分類：temp 修復的兩個**不同故障點**（不是同名 variant）：
 //   tempMount＝`/tmp` 這種 MSYS 掛載路徑——host 不套 MSYS 映射，解析到碟根
@@ -328,10 +156,6 @@ function splitTempPath(p: string): { kind: "path.tempMount" | "path.tempVar"; re
     if (m) return { kind: f.kind, rest: m[1] ?? "" };
   }
   return null;
-}
-
-export function classifyTempFix(p: string): "path.tempMount" | "path.tempVar" | null {
-  return splitTempPath(p)?.kind ?? null;
 }
 
 // 回傳「改寫後的值 + 族別」：族別給統計用，值給工具用——同一次判斷同時餵兩邊，
@@ -364,743 +188,37 @@ export function rewritePath(p: string): string {
   return rewritePathFix(p).value;
 }
 
-// 前綴賦值路徑值轉換（bash 掃描器用）：重現原生 git-bash envp 轉換層對
-// 「值是 POSIX 絕對路徑」的不變式規則（name-agnostic——轉換層只看值語法，
-// 不猜哪個變數是路徑；實測 FOO/RANDOMNAME/XDG_CACHE_HOME 一視同仁）。
-// 範圍刻意只有兩個可驗證錨點：
-//   盤符形 /c、/c/… → C:/…（實測原生輸出大寫盤符＋正斜線，輸入不分大小寫）
-//   /tmp、/tmp/…   → cygpath 錨點（實測原生 envp 轉換輸出正斜線風格）
-// 不修：根相對路徑（/usr…——原生映射到 MSYS 安裝根，非不變式）、含 : 的清單值
-// （原生清單轉換是另一套規則，輸出 C:\a;C:\b）、含 \ 的值（cmd-ism）。
-// 回傳 null ＝ 不修（掃描器照原樣保留）。
-function convertEnvPath(v: string): string | null {
-  if (/[:\\]/.test(v)) return null; // 清單分隔符／cmd-ism：另一套規則，不碰
-  let m = /^\/([a-zA-Z])(\/.*)?$/.exec(v);
-  if (m) return m[1]!.toUpperCase() + ":" + (m[2] ?? "/");
-  m = /^\/tmp(\/.*)?$/i.exec(v);
-  if (m) {
-    const anchor = realTempDir();
-    if (!anchor) return null; // 問不到錨點就不修（不猜佈局）
-    return anchor.replace(/\\/g, "/") + (m[1] ?? "");
-  }
-  return null;
+
+const CMD_HINT_MARKER = "[env-guard]";
+const SYSTEM_HINT_MARKER = "[env-guard:windows-paths]";
+
+export function pickCmdHint(noConv: boolean): string {
+  return noConv
+    ? `${CMD_HINT_MARKER} cmd entered interactive mode; the intended command never ran. Exit 0 is not success. In this environment, use cmd /c <command>.`
+    : `${CMD_HINT_MARKER} cmd entered interactive mode; the intended command never ran. Exit 0 is not success. In this environment, use cmd //c <command>.`;
 }
 
-// bash 指令改寫（語法感知掃描器，單次掃描處理兩件事）：
-//   1. cmd //c|//k → /c|/k：轉換關閉時 //c 原樣抵達 cmd、進互動模式（靜默錯）。
-//      只在「指令位置」改寫（echo cmd //c 等資料位置不動）；指令位置涵蓋獨立
-//      成詞的引號指令字（"cmd" //c、A=/c/x "bash" …——引號不改變 word 身分
-//      ，引號内含 $()/跳脫時不命中任何閉集合）；為何只修 cmd、其他 //x 工具
-//      為何留在漏修臺：docs/spec.md「刻意不修與漏修的分界」。
-//   2. 前綴賦值的 POSIX 路徑值 → Windows 值：只在「指令位置的賦值前綴＋後接
-//      指令字」改寫（值形錨點見 convertEnvPath；殘餘值形＝漏修，清單與逐條
-//      實測見 spec「envp 殘餘形」）。暫存-套用模型見 pendingEnv／
-//      applyPendingEnv 註解；緊貼形 VAR=/c/x$(…) 的組合律見 `(` 分支。
-// 指令位置判定與 token 狀態機規則逐條寫在各分支的行內註解（引號／heredoc／
-// 括號堆疊／反引號／替換收尾／註解行）；兩個閉集合界定在 RESERVED_WORD／
-// BUILTIN_WORD；所有形態都有測試釘樁（../tests/env-guard/index.mjs）。
-export interface BashScanResult {
-  command: string;
-  cmdFlagFixed: boolean;  // cmd //c|//k 被改寫為 /c|/k
-  envPathFixed: boolean;  // 前綴賦值的 POSIX 路徑值被改寫（VAR=/c/… → VAR=C:/…）
+// cmd 互動模式 banner 的輸出指紋（判別特徵以本機實抓位元組釘樁，spawn 形狀＝
+// pi 的 stdio 全管線；stdin=/dev/null 形態另抓）：
+//   病理形（NO_PATHCONV 下 `cmd //c …`／`//k`／裸 cmd）：首非空行
+//     "Microsoft Windows [版本 …]"（GBK 亂碼，但 ASCII 前綴存活）、第二非空行
+//     "(c) Microsoft Corporation…"（所有語系此行 ASCII 前綴存活）、提示符行
+//     `X:\…>` 有時在（管線 stdin）、有時不在（/dev/null stdin）——指紋只認
+//     前兩行，不認提示符。
+//   無害形 `cmd /c ver`（NO_PATHCONV 下正常執行）：輸出只有版本一行 → 不命中。
+//   轉換開啟的機器 `cmd //c ver`：//c 被轉換層削成 /c → 同上單行 → 不命中。
+//   （banner 永遠兩行成對出現：版本行＋版權行；單獨的版本行是 ver 的正常輸出。）
+// 命中只附加 advisory＝零破壞；誤判代價＝多一段文字，不會改壞任何東西。
+export function detectCmdBanner(text: string): boolean {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  return lines.length >= 2 && lines[0]!.startsWith("Microsoft Windows [") && lines[1]!.startsWith("(c) Microsoft");
 }
 
-export function rewriteBashCommand(command: string): BashScanResult {
-  const r = scanBash(command);
-  return {
-    command: r.command,
-    cmdFlagFixed: r.cmdFlagFixed,
-    envPathFixed: r.envPathFixed,
-  };
-}
-
-function scanBash(command: string): BashScanResult {
-  // heredoc 定界符是 bash 的 word：加引號時可含任意內容（`<<'END OF FILE'`，
-  // 終止行去引號比對；空引號 `<<""` 也是合法定界符——終止行是空行，實測），
-  // 也可寫成 `<<\EOF`（跳脫＝字面化，定界符是 EOF）。**未加引號的定界符可以含
-  // 任意非元字元字元**：/ # $ = : * [ ] . - 都實測合法（`<<EOF/x`、`<<EOF#x`
-  // 的終止行就是原字面）。辨識不到就會把本體當指令掃描（＝改到資料），所以
-  // 這個字元類要寬。**數字開頭也合法**（`<<2EOF`、`<<-2ND`、`<< 2EOF`、
-  // `<<\2X` 實測）——此前第一字限字母/底線，本體被當指令掃描、`cmd //c` 被
-  // 改成 `cmd /c`（live 實測：pi bash 工具的本體輸出真的變了）；已比照 oc 修成
-  // `\d*[A-Za-z_…]`。第一字仍限「數字/字母/底線」：放寬它會把 `$((x<<$y))`
-  // 這類算術位移誤判成 heredoc，`<<*X`／`<<.E`／`<<$S` 與純數字 `<<3` 留在
-  // 已知邊界（本體被掃、有機頻率 ~0，見 spec）。反方向也有一個邊界：
-  // `$((1<<N))` 的識別字運算元被當 heredoc 開頭 → 換行後整段漏修（安全方向）。
-  // （排掉 `)` 與反引號：它們會變成定界符本身的引號語法）
-  // 第一字也接受非 ASCII（`<<中文`、`<<·` 實測都是合法 heredoc）：先前只認 ASCII
-  // 字母/底線，本體被當指令掃描、`cmd //c` 被改成 `cmd /c`（資料改寫）。非 ASCII
-  // 字元不可能開 `$((x<<$y))` 這類算術（識別字是 ASCII）或 `$(`, 所以放寬安全。
-  const heredoc = /<<(-?)[ \t]*(\\?)(?:(\$)?"([^"\r\n]*)"|(\$)?'([^'\r\n]*)'|(\d*[A-Za-z_\u0080-\uFFFF][^\s"'><;&|()\\`]*))/y; // sticky 已錨定 lastIndex
-  // `$'…'`／`$"…"`（ANSI-C／locale）也是合法定界符（實測 `cat <<$'EOF'`、
-  // `<<$'E\tF'`）；定界符 word **不做展開**，但 `$'…'` 内的跳脫會先解開，
-  // 靜態算不出來（`\t` 是真 tab）→ 帶反斜線的引號定界符整條指令原樣放行
-  //（inert，安全方向）：此前不認得這種形，本體被當指令掃描＝資料改寫。
-  const cmdFlag = /\/\/([A-Za-z]+)(?![\w.-])/iy; // cmd 旗標都是字母（/v:on 這類冒號參數自然保留在後）
-  // 語法關鍵字閉集合：envp 觸發判定用（這些詞不是「真指令字」）。刻意大小寫
-  // 敏感：大寫 ENV 是路徑上的程式名、IF/TIME 不是 bash 關鍵字。
-  const RESERVED_WORD = /^(?:if|then|elif|else|fi|while|until|do|done|time|exec|command|builtin|env|[{}!])$/;
-  // 指令位置不結束的詞（閉集合）——不是「猜哪些程式會轉發指令」：
-  // if/then/elif/else/while/until/do/{/! 是語法關鍵字；time 是保留字；
-  // exec/command/builtin 是 bash 內建、env 是 POSIX 標準程式，四者後接的第一
-  // 個詞就是被執行的指令（例外：exec/command/builtin 後的賦值形會被當指令名跑
-  // 、原生就錯 → 不暫存，見 commitTok；env 的 X= 參數會跨 msys→native 邊界 →
-  // 照常暫存）。
-  // **不含 fi/done/esac/}**：它們是複合指令的**收尾**，後面直接接簡單指令是
-  // bash 語法錯誤（`fi cmd`、`done cmd`、`} cmd` 實測 exit 2、兩種轉換狀態同訊息
-  // ＝回傳≡原生）⇒ 放進續位集只會改寫死文字（文字有變、行為一樣＝零效應）。
-  // `esac` 由 case 區段追蹤處理（見 commitTok）；`}` 之後要 `;`／`&&`／換行。
-  // 界線仍在 shell 語法層：timeout/nice/xargs 這類外部 wrapper 的參數結構才是
-  // 開放集合（漏修臺見 docs/spec.md）。
-  const COMMAND_POS_CONTINUES = /^(?:if|then|elif|else|while|until|do|time|exec|command|builtin|env|[!{])$/;
-  // 函式定義的**本體必須是複合指令**（`f() cmd` 實測 exit 2＝語法錯誤）：
-  // `f()` 之後延後到下一詞才決定——複合起始詞開本體（`f() { cmd //c …; }` 的
-  // cmd 照常改寫），普通詞不開（死文字不動）。`(`/`((` 由括號分支處理。
-  const FUNC_BODY_STARTERS = /^(?:\(|\{|if|while|until|for|case|select|\[\[)$/;
-
-  // 指令字排除集（觸發套用的反集合）——值「不經 msys→native exec 邊界」
-  // 的閉集合，兩類：
-  // 1) bash 內建（本機 enable -a 可列舉，＋ . [ 與 [[ ]] 特殊語法詞）：內建
-  //    本身不 spawn；但 eval/source 這類特殊內建的動態範圍内 spawn 原生程
-  //    式時原生會轉（實測 A=/c/x eval 'node …' 原生 C:/x）——字串會做什麼
-  //    無法靜態判定；排除＝純內建情形與原生一致（實測 A=/c/x eval
-  //    'echo $A' 原生 [/c/x]）、動態範圍 spawn 情形＝漏修（安全方向）。
-  // 2) bash/sh：msys 程式，msys→msys 邊界不轉 envp（實測 A=/c/x bash -c
-  //    'echo $A' 原生 [/c/x]）；內層再 spawn native 時原生在內層邊界補轉
-  //    （實測 C:/x）、此處漏修——同上安全方向。
-  // exec/command/env 刻意不列：RESERVED_WORD 續位、由後面的真指令字觸發
-  // （command node / env node 的 node 是 native、值經邊界）。函式名與其他
-  // msys 程式（git/cat…）是開放集合、無法靜態排除 → 殘餘混合邊界，如實
-  // 記錄（見 docs/spec.md「envp 殘餘形」）。純數字詞（fd 前緣，2>&1 的 2）也不觸發
-  // （實測 A=/c/x 2>&1 原生持久化 [/c/x]）。刻意大小寫敏感（與 RESERVED_WORD 同）
-  // 。防漂移：測試電池把本集合與 enable -a 逐一對照。
-  const BUILTIN_WORD = /^(?:\.|:|\[|\[\[|\]\]|alias|bg|bind|break|builtin|bash|caller|cd|compgen|compopt|complete|continue|declare|dirs|disown|echo|enable|eval|exit|export|false|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|pwd|read|readarray|readonly|return|set|sh|shift|shopt|source|suspend|test|times|trap|true|type|typeset|ulimit|umask|unalias|unset|wait)$/;
-  let out = "";
-  let i = 0;
-  const n = command.length;
-  // heredoc 佇列：一行可以開多個（`cat <<A <<B`），本體依開啟順序逐個吃完。
-  // 單槽會被後面的定界符覆蓋——第一個本體內出現 B 行時就提前結束、之後的
-  // 資料被當指令掃描（實測 `cat <<A <<B` + `B`／`A`／`cmd //c ver`／`B`：
-  // 真正印出來的本體從 `cmd //c ver` 變成 `cmd /c ver`＝資料改寫）。
-  const pendingHeredocs: { delim: string; stripTabs: boolean }[] = [];
-  let inHeader = false;
-  let cmdFlagFixed = false;
-  let envPathFixed = false;
-  // 前綴賦值暫存：賦值 token 在指令位置時記下它在 out 的跨度與改寫後整詞，
-  // 等後續「指令字」落地（＝值確定會進該 simple command 的 envp）才套用。
-  // 多筆由右至左套用（記錄時的跨度不受後續右側附加影響）。
-  let pendingEnv: { start: number; end: number; rep: string }[] = [];
-  // token 追蹤：判斷 cmd 是否在「指令位置」（可執行處），避免改到字面資料
-  let curTok = "";
-  let prevTok = "";
-  let prevTokCmdPos = false;
-  let cmdPosNext = true;
-  let cmdFlagZone = false; // cmd 之後的旗標區（cmd //q //c 的第二個旗標也要改）
-  // 本 token 的內容是否來自「引號詞餵入」（feedTok）：引號詞的內容在 out 裡
-  // 帶著前後引號，長度與 curTok 不一致——依它算出的暫存跨度會錯（實測
-  // `A=/c/x "B=/c/y" node` 曾被改成 `A=C:/x "BB=C:/y node`＝吃掉收尾引號）。
-  // 而且引號詞在 bash 裡本来就不是賦值前綴（quote removal 後才解析指令字）
-  // → 不暫存（見 commitTok）。
-  let tokQuoted = false;
-  // 上一個 token 是否來自引號詞（isCmdTok 的跳脫規則需要它：引號內的反斜線
-  // 不被 bash 當跳脫，未引號的才是）
-  let prevTokQuoted = false;
-  let inBacktick = false; // 反引號開/關（\` 由跳脫分支吃掉，所以是單層）
-  const btPos: boolean[] = []; // 每層反引號開頭的「外層是否在指令位置」
-  // 括號堆疊：每層 ( 記下 kind ＋「開括號時的外層指令位置」
-  //   foo(       → func：函式定義，`)` 之後接 { … } 群組（cmd 仍在指令位置）
-  //   $( / $((   → subst：還原開括號時的位置——賦值前綴（count=$(…)）→ true，
-  //                bash 真的跑 cmd；獨立替換（$(…)）→ false，替換結果本身就是
-  //                指令名、後面的 cmd 只是參數。詞**延續**到括號外（`$(pwd)#z`）
-  //   <( / >(   → procsubst：同上還原位置，詞也延續（實測 `echo <(true)#z`）
-  //   樣式包裹 ( → case：`)` 是樣式終止符（不是這層的）；不要與外層混淆
-  //   群組 ( … ) → group：`( … ) word` 原生就是語法錯誤，`)` 後不開命令位置
-  //                （不改寫死文字）；`(true)#c` 的 # 是註解（實測）
-  // 單一堆疊（kind 與位置同進同出）——兩張平行陣列會漂移
-  const parenStack: { kind: "subst" | "procsubst" | "func" | "group" | "case"; pos: boolean }[] = [];
-  // 被 \$ 跳脫分支成對消費的 "$" 位置：該 "$" 是字面——其後的 "(" 不是
-  // $( 替換開頭（bash 剖析為語法錯誤），括號分類不得把它當開頭
-  const escapedDollar = new Set<number>();
-  // case 樣式的 `)`（`case x in a) …`）在 bash 語法上沒有對應的 `(`：它終止樣式、
-  // 開 body，若讓它 pop 就會偷走外層 $( 的堆疊項。所以照 bash 語法追蹤區段
-  //（這段註解是唯一防腐劑，別當不明狀態碼刪）：
-  //   case（在命令位置）備位 → 該 case 的 `in` 開「樣式區」
-  //   樣式區的 `)`：無對應 (、**不 pop 外層堆疊**（只收選配的 `( 樣式 )` 包裹）、
-  //                  重開命令位置並進入 body
-  //   `;;`（只有 ;;；單一 ; 是 body 內的指令分隔）→ 回樣式區；`esac` → 結束
-  //   body 內的 `)` 一律是普通括號、照常 pop 還原——否則 case body 裡的 $( )
-  //   會被誤判成樣式 `)`，把 echo 的參數當命令改寫（實測踩過）
-  let caseRegion: "none" | "pattern" | "body" = "none";
-  let casePending = false; // 看過 `case`、還沒看到它的 `in`
-  // 看過 `f()`、還沒看到它的本體詞（見 FUNC_BODY_STARTERS）
-  let funcAwaitBody = false;
-  // 最後一個 `)` 收的是什麼決定詞是否延續到括號外：替換／程序替換→延續
-  // （`$(pwd)#z`、`<(true)#z` 的 # 是字面資料，實測）；群組／子殼／函式定義
-  // 收尾與樣式區的 `)` → 開新詞（`(true)#c`、`a)#c` 的 # 是註解，實測）。
-  // 判別依據＝parenStack 的 kind；stack 空（多餘的 `)`＝語法錯誤）→ 維持舊值
-  let parenContinuesWord = false;
-
-  // cmd 指令字用 **bash 實際看到的字** 的 basename 比對：
-  //   `\cmd`、`c\md`、`/c/Windows/System32/cmd.exe`、`"C:/…/cmd.exe"` 都是同一顆
-  //   cmd（實測轉換關閉時全進互動式 banner＝同一個故障）
-  // 未引號詞要算的是「transport 縮一層後、再過 bash lexer」的字（lexWord）：
-  //   `c\md`（1）→ `cmd` 命中；`c\\md`（2）→ 縮成 `c\md` → lexer 仍是 `cmd`；
-  //   `c\\\md`（3）→ 縮成 `c\\md` → lexer 留字面反斜線 → 127（不動）
-  //   `C:\Windows\…\cmd.exe`（1）→ `C:Windows…`（127，不動）；
-  //   `C:\\\Windows\\\…`（3）→ `C:\Windows\…`＝真的跑 cmd（此前全刪反斜線
-  //   比對兩者會得到同一個字，後者漏修、前者反而被改寫）。
-  // 引號詞的內容不經 lexer（雙引號内 `\W` 保留反斜線），照原樣取 basename。
-  // 未引號詞**尾**的反斜線例外：`cmd\\ //c ver` 的成對反斜線先被 transport
-  // 縮成一層、再讓它跳脫後面的分隔符 → bash 看到的程式名是 `cmd\` 而不是 cmd
-  //（實測 rc 127、兩種轉換狀態同訊息）。這種詞不是指令字，不改寫（oc 同守門）。
-  const isCmdTok = (t: string, quoted = false) => {
-    const folded = foldTransport(t);
-    if (!quoted && folded.endsWith("\\")) return false; // 尾反斜線跳脫分隔符
-    const word = quoted ? t : lexWord(t);
-    const base = word.split(/[\\/]/).pop()!.toLowerCase();
-    return base === "cmd" || base === "cmd.exe";
-  };
-
-  // 收尾/分隔符要把 token 狀態一起清掉：替換內累積的 prevTok（如 `echo $(cmd) //x`
-  // 的 cmd）不能授權外面的改寫，否則 //x 這種 echo 的參數會被當 cmd 旗標改寫。
-  const clearTok = () => {
-    prevTok = "";
-    prevTokCmdPos = false;
-    cmdFlagZone = false;
-  };
-
-  // 套用暫存的前綴賦值改寫。gate：轉換層沒被 MSYS_NO_PATHCONV 關閉＝原生
-  // 會自己轉，不改（重複防護），此時直接丟掉暫存、不套用。
-  const applyPendingEnv = () => {
-    if (!pendingEnv.length) return;
-    if (!pathConvDisabled()) {
-      pendingEnv = [];
-      return;
-    }
-    for (let k = pendingEnv.length - 1; k >= 0; k--) {
-      const r = pendingEnv[k]!;
-      out = out.slice(0, r.start) + r.rep + out.slice(r.end);
-    }
-    envPathFixed = true;
-    pendingEnv = [];
-  };
-
-  const ASSIGN_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
-  // 真指令字判定（三個決策點共用：commit 時 staging、真指令字落地時套用、EOF
-  // 收尾）：非賦值（含空值 B=）、非語法關鍵字、非內建、非純數字（fd 前緣
-  // 2>&1 的 2）。三處各寫一份會漂移（oc 版同一個 predicate）
-  const envpTrigger = (t: string) =>
-    !ASSIGN_PREFIX.test(t) && !RESERVED_WORD.test(t) && !BUILTIN_WORD.test(t) && !/^\d+$/.test(t);
-
-  const commitTok = () => {
-    // 引號詞餵入的來源標記只管到下一個 token 收尾為止：先取再清（下面 `!curTok`
-    // 提前返回時也不留殘值——`""` 餵入空內容就是這種形）
-    const quotedTok = tokQuoted;
-    tokQuoted = false;
-    if (!curTok) return;
-    prevTokCmdPos = cmdPosNext;
-    const lowTok = curTok.toLowerCase();
-    if (cmdPosNext) {
-      // FOO=bar 環境變數前綴、與 if/while/{/! 等語法關鍵字都不結束指令位置
-      //（收尾詞 fi/done/esac/} 不在集合內：後面接指令是語法錯誤，見定義處）
-      cmdPosNext = COMMAND_POS_CONTINUES.test(lowTok) || ASSIGN_PREFIX.test(curTok);
-    }
-    // 函式本體槽：`f()` 之後只有複合起始詞開指令位置（`f() cmd` 是語法錯誤）
-    if (funcAwaitBody) {
-      const startsBody = FUNC_BODY_STARTERS.test(lowTok);
-      // 本詞的位置跟隨槽的結果：不是起始詞＝這詞在語法錯誤行上，不該授權
-      // cmd 旗標改寫（`f()` 後換行再接 `cmd //c`——兩態都是 syntax error，
-      // 先前 prevTokCmdPos 仍為 true 就把死文字改了）
-      prevTokCmdPos = startsBody;
-      cmdPosNext = startsBody;
-      funcAwaitBody = false;
-    }
-    // case 區段追蹤（語法見上方註解）：`case` 要在命令位置才算；`in` 在參數位置，
-    // 位置 gate 不適用，所以只認「看過 case」（casePending）；`esac` 在**樣式區**
-    // 就是空 case 的結束（`case x in esac` 合法，其後的 `)` 是外層替換的收尾——
-    // 實測 `echo $(case x in esac) cmd //c ver` 印出資料，改寫那裡＝真誤修），
-    // 在 body/none 則只認命令位置（資料位置的 esac 不能把區段打掉）。
-    // 不是終止符：case 主詞（`case esac in …`）、引號樣式字面、資料詞。
-    if (lowTok === "case" && prevTokCmdPos) casePending = true;
-    else if (lowTok === "in" && casePending) { caseRegion = "pattern"; casePending = false; }
-    else if (lowTok === "esac" && !quotedTok && !casePending && (caseRegion === "pattern" || prevTokCmdPos)) {
-      caseRegion = "none";
-      casePending = false;
-    }
-    // 旗標區維持規則：cmd 本身開啟旗標區；區內的 /旗標（含剛改寫的）不關閉；其他 token 關閉
-    if (cmdFlagZone && !curTok.startsWith("/")) cmdFlagZone = false;
-    if (prevTokCmdPos && isCmdTok(curTok, quotedTok)) {
-      // `builtin cmd`：`builtin` 只查內建表、cmd 不是內建 → bash 在 spawn 前就
-      // 失敗（實測 exit 1、`builtin: cmd: not a shell builtin`、兩種轉換狀態同
-      // 訊息）⇒ 改寫旗標只改死文字＝零效應。讓 `cmd` 不取得旗標區、也不留
-      // prevTokCmdPos（`//x` 分支的 atCmd 看它），就不改寫；`builtin exec／
-      // command cmd //c` 仍照常（位置由 exec/command 提供，cmd 真会被打開）。
-      if (prevTok === "builtin") prevTokCmdPos = false;
-      else cmdFlagZone = true;
-    }
-    // 前綴賦值路徑改寫的暫存／套用：賦值 token（整詞未引號、值可轉換）在
-    // 指令位置 → 暫存；非賦值、非語法關鍵字的 token 在指令位置落地 ＝
-    // simple command 的指令字 → 此時暫存賦值確定會進它的 envp，套用。
-    // prevTokCmdPos 此時仍是本 token 的位置（commitTok 開頭賦的值）。
-    if (prevTokCmdPos) {
-      // 賦值判定與 keeper/EOF 一致（含空值 B=）：空值賦值既不暫存（無可轉換
-      // 值）也不觸發套用——套用必須是「真指令字」（見 BUILTIN_WORD 註解）。
-      // exec/command/builtin 後的賦值形是參數不是前綴（bash 把 X=/c/x 當指令名
-      // 跑、原生就大聲失敗——實測三形在兩種轉換狀態下皆 127/127/1 同訊息）：
-      // 不暫存、照普通詞結束指令位置（其後的詞都是它的參數，原生命令也不會跑）。
-      // env 例外：POSIX 外部程式、X= 參數會跨 msys→native 邊界（實測
-      // env X=/c/x node 原生轉換 C:/x）→ 照舊暫存、由後續指令字觸發。
-      if (ASSIGN_PREFIX.test(curTok)) {
-        if (quotedTok) {
-          // 引號詞（`"B=/c/y"`）不是 bash 的賦值前綴：原生把它當指令字跑
-          // （實測 `A=/c/x "B=/c/y" node` → bash: B=/c/y: No such file or
-          // directory、127）→ 不暫存、照普通詞結束指令位置（不能走下面
-          // 的跨度算術：那些跨度假設 curTok 是 out 的字尾，引號詞不是）
-          cmdPosNext = false;
-        } else if (/^(?:exec|command|builtin)$/.test(prevTok)) {
-          cmdPosNext = false;
-        } else {
-          const em = /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(curTok);
-          if (em) {
-            const conv = convertEnvPath(em[2]!);
-            if (conv) pendingEnv.push({ start: out.length - curTok.length, end: out.length, rep: em[1]! + "=" + conv });
-          }
-        }
-      } else if (envpTrigger(curTok)) {
-        applyPendingEnv();
-      }
-    }
-    prevTok = curTok;
-    prevTokQuoted = quotedTok;
-    curTok = "";
-  };
-
-  // 双引號內的 $( ) 與 `…` 會真的被 bash 執行（如 R="$(cmd //c ver)"），
-  // 必須遞迴掃描；引號本身是字面，但命令取代區域內是完整 shell 語法。
-  // 反斜線 run 的跳脫判定看 fold 後的奇偶（見 foldTransport）：奇數 → 下一個
-  // 字元是字面（`\$(` 不開替換）；偶數 → 這串是字面反斜線、`$(` 是真的替換。
-  // 實測（event run ／ bash 看到的）：run 2 → `\$(` 字面；run 3 → `\\$(`＝字面
-  // 反斜線＋真替換。
-  // 此前成對消費（每次跳兩個）在 event 字串上判：`"\\$(cmd //c ver)"` 被當
-  // 真替換改寫＝資料靜默被改；`"\\\$(cmd //c ver)"` 反而漏修。
-  const scanDq = (seg: string): string => {
-    let s = "";
-    let k = 0;
-    const m2 = seg.length;
-    while (k < m2) {
-      const c = seg[k];
-      if (c === "\\") {
-        const run = backslashRun(seg, k);
-        const odd = foldedRun(run) % 2 === 1;
-        s += seg.slice(k, k + run);
-        k += run;
-        if (odd && k < m2) {
-          s += seg[k];
-          k++;
-        }
-        continue;
-      }
-      if (c === "$" && seg[k + 1] === "(") {
-        const close = matchParen(seg, k + 2);
-        if (close === -1) {
-          s += seg.slice(k);
-          break;
-        }
-        const sub = scanBash(seg.slice(k + 2, close));
-        s += "$(" + sub.command + ")";
-        cmdFlagFixed ||= sub.cmdFlagFixed;
-        envPathFixed ||= sub.envPathFixed;
-        k = close + 1;
-        continue;
-      }
-      if (c === "`") {
-        let p = k + 1;
-        while (p < m2 && seg[p] !== "`") {
-          if (seg[p] === "\\") p++;
-          p++;
-        }
-        if (p >= m2) {
-          s += seg.slice(k);
-          break;
-        }
-        const sub = scanBash(seg.slice(k + 1, p));
-        s += "`" + sub.command + "`";
-        cmdFlagFixed ||= sub.cmdFlagFixed;
-        envPathFixed ||= sub.envPathFixed;
-        k = p + 1;
-        continue;
-      }
-      s += c;
-      k++;
-    }
-    return s;
-  };
-
-  while (i < n) {
-    // heredoc 本體：逐行原樣複製；結束標記行整行跳過（標記行殘字視為本體，同 bash）
-    // 終止符照 bash 規則比：<< 要整行等於 delimiter；<<- 先去掉前導 tab 再比。
-    // 不能用 trim()——bash 不把空白差異當終止符，提早結束會讓「仍是本體」的資料
-    // 被當指令掃描、進而改寫（`cat <<'EOF'` 後一行 `  EOF` 就是這種案例）。
-    // 只容許行尾一個 \r：CRLF 文字下 bash 的 delimiter 也帶 \r，兩邊一起去掉才等價。
-    // 比對前兩邊都先過 transport fold：hook 看到的是 event 字串、bash 看到的是
-    // 縮過的一份，所以 `<<'E\\F'`（event 兩個）的定界符是 `E\F`、終止行 `E\F`
-    // 才算相等（fold 是函數：event 相等 ⇒ bash 看到的也相等，反向不成立——
-    // 不 fold 只會讓本體多收（漏修、安全方向），不會提早結束）。
-    if (pendingHeredocs.length && !inHeader) {
-      const hd = pendingHeredocs[0]!;
-      let lineEnd = command.indexOf("\n", i);
-      if (lineEnd === -1) lineEnd = n;
-      const rawLine = command.slice(i, lineEnd);
-      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-      const candidate = hd.stripTabs ? line.replace(/^\t+/, "") : line;
-      if (foldTransport(candidate) === foldTransport(hd.delim)) {
-        out += command.slice(i, Math.min(lineEnd + 1, n));
-        i = lineEnd + 1;
-        pendingHeredocs.shift();
-        curTok = "";
-        clearTok();
-        // 同一行開的多個 heredoc：還在本體模式就接著吃下一個（標記行不是新指令）
-        cmdPosNext = pendingHeredocs.length === 0;
-        continue;
-      }
-      out += command.slice(i, Math.min(lineEnd + 1, n));
-      i = lineEnd + 1;
-      continue;
-    }
-    const ch = command[i];
-    if (ch === "\n" && inHeader) {
-      out += "\n";
-      i++;
-      inHeader = false;
-      curTok = "";
-      clearTok();
-      continue;
-    }
-    if (ch === "\\") {
-      // 反斜線 run：跳脫判定看 bash 看到的那份（transport 先縮一層，見
-      // foldTransport 註解）。奇數 → 下一個字元被跳脫（屬於同一個詞、不觸發
-      // 任何分支）；偶數 → 這串是字面反斜線，下一個字元照常處理（`\\$(` 在
-      // bash 是真的替換、`\\\\"` 是真的收尾引號）。
-      const run = backslashRun(command, i);
-      const odd = foldedRun(run) % 2 === 1;
-      const seg = command.slice(i, i + run);
-      out += seg;
-      curTok += seg; // 跳脫字元屬於當前詞（\> 不構成運算子）
-      i += run;
-      if (odd && i < n) {
-        if (command[i] === "$") escapedDollar.add(i); // \$：$ 是字面（見 escapedDollar）
-        out += command[i];
-        curTok += command[i];
-        i++;
-      }
-      continue;
-    }
-    if (ch === "'") {
-      // 引號不改變 word 身分（bash 先做 quote removal 才解析指令字）：獨立成詞
-      //（引號前 curTok 為空＝前一詞已結束）且在指令位置時，把去引號內容餵給
-      // token——不餵的話下一個詞會以指令位置誤觸套用（A=/c/x "bash" -c …＝靜默
-      // 誤修：實測兩種轉換狀態原生皆印 /c/x）。詞中引號（A="…"、ba"sh"）維持
-      // 隱形＝舊行為：值的引號是漏修臺的「引號開頭值」形，詞中組合的身分本來
-      // 就不可靠，不猜。
-      const feedTok = curTok === "" && cmdPosNext;
-      commitTok();
-      funcAwaitBody = false; // 引號詞不是函式本體
-      // ANSI-C 字串（`$'…'`）：`\'` 不結束、`\\` 才是字面（實測 `$'a\'b'` 印
-      // `a'b`、`$'a\\'` 收尾）——不認這個前綴就會在第一個 `'` 提前收尾，
-      // 把字串後半當命令掃描（實測 `echo $'x\' ; cmd //c ver'` 的資料被改成
-      // `cmd /c ver`＝資料改寫）。前綴 `$` 已進 curTok，不另外餵 token（ANSIC
-      // 指令字 `$'cmd' //c` 留在漏修臺）。
-      let end: number;
-      if (command[i - 1] === "$") {
-        end = i;
-        let p = i + 1;
-        while (p < n) {
-          if (command[p] === "\\") {
-            const run = backslashRun(command, p);
-            p += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
-            continue;
-          }
-          if (command[p] === "'") break;
-          p++;
-        }
-        end = p < n ? p : -1;
-      } else {
-        end = command.indexOf("'", i + 1);
-      }
-      if (end === -1) {
-        const seg = command.slice(i);
-        out += seg;
-        if (feedTok) { curTok += command.slice(i + 1); tokQuoted = true; }
-        break;
-      }
-      const seg = command.slice(i, end + 1);
-      out += seg;
-      if (feedTok) { curTok += command.slice(i + 1, end); tokQuoted = true; }
-      i = end + 1;
-      continue;
-    }
-    if (ch === '"') {
-      // 去引號內容餵 token 的規則同單引號分支（見上）；內容含 $()/反引號/跳脫
-      // 時不會命中任何閉集合＝與動態詞同類（安全方向）。
-      const feedTok = curTok === "" && cmdPosNext;
-      commitTok();
-      funcAwaitBody = false; // 引號詞不是函式本體
-      // 找關閉引號：$() 與反引號內會重新開啟引號語境，需跳過整個命令取代區域；
-      // 反斜線 run 的跳脫判定看 fold 後的奇偶（`\\\\"` → 字面反斜線＋真收尾、
-      // `\\\"` → 字面引號——與 bash 一致，見 foldTransport）。
-      let j = i + 1;
-      while (j < n && command[j] !== '"') {
-        if (command[j] === "\\") {
-          const run = backslashRun(command, j);
-          j += run + (foldedRun(run) % 2 === 1 ? 1 : 0);
-          continue;
-        }
-        if (command[j] === "$" && command[j + 1] === "(") {
-          const close = matchParen(command, j + 2);
-          if (close === -1) {
-            j = n;
-            break;
-          }
-          j = close + 1;
-          continue;
-        }
-        if (command[j] === "`") {
-          let p = j + 1;
-          while (p < n && command[p] !== "`") {
-            if (command[p] === "\\") p++;
-            p++;
-          }
-          j = p + 1;
-          continue;
-        }
-        j++;
-      }
-      if (j >= n) {
-        const seg = command.slice(i);
-        out += scanDq(seg); // 未閉合引號內的 $() 同樣會執行
-        if (feedTok) { curTok += command.slice(i + 1); tokQuoted = true; }
-        break;
-      }
-      const seg = command.slice(i, j + 1);
-      out += scanDq(seg);
-      if (feedTok) { curTok += command.slice(i + 1, j); tokQuoted = true; }
-      i = j + 1;
-      continue;
-    }
-    // here-string `<<<` 不是 heredoc：舊碼讓第二個 `<` 跟第三個 `<` 配成
-    // `<< "…"`（引號內容被當定界符）→ 整條指令的 `$(…)` 被當本體吞掉、
-    // 真替換漏修（實測 `cat <<< "$(cmd //c ver)"`：本機 banner、原生 version）。
-    if (ch === "<" && command[i + 1] === "<" && command[i + 2] !== "<" && command[i - 1] !== "<") {
-      commitTok();
-      funcAwaitBody = false; // heredoc 不是函式本體
-      heredoc.lastIndex = i;
-      const m = heredoc.exec(command);
-      if (m) {
-        const delim = m[4] ?? m[6] ?? m[7]!;
-        // `$'…'`／`$"…"` 的內容會被展開（`\t` 是真 tab），靜態算不準 → inert
-        if ((m[3] !== undefined || m[5] !== undefined) && delim.includes("\\")) {
-          return { command, cmdFlagFixed: false, envPathFixed: false };
-        }
-        pendingHeredocs.push({ delim, stripTabs: m[1] === "-" });
-        inHeader = true;
-        out += m[0];
-        i += m[0].length;
-        pendingEnv = []; // heredoc 重導向＝賦值沒接指令字（A=x <<EOF 是 standalone）→ 丟棄
-        continue; // 標記行同列的重導向照常掃描（cmd 旗標偵測仍需要）
-      }
-    }
-    if (ch === " " || ch === "\t" || ch === "\n") {
-      commitTok();
-      if (ch === "\n") {
-        cmdPosNext = true; // 新的一行：上一行的 cmd 不能授權本行的改寫
-        clearTok();
-        pendingEnv = []; // 新指令列＝賦值沒接指令字（standalone）→ 丟棄
-      }
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === "|" || ch === ";" || ch === "(") {
-      commitTok();
-      funcAwaitBody = false; // 分隔符或括號收掉了本體槽
-      // 只有 `;;` 會把 body 拉回樣式區；單一 `;` 只是 body 內的指令分隔
-      if (ch === ";" && command[i + 1] === ";" && caseRegion === "body") caseRegion = "pattern";
-      // 管線／指令結束＝前綴賦值沒接上指令字（standalone）→ 丟棄。`(` 不丟：
-      // 緊貼的 VAR=/c/x$(…) 是賦值值的動態組合（見函式頭註解）；A=x (…) 是
-      // syntax error，沒有需要保守的合法形。
-      if (ch === "|" || ch === ";") pendingEnv = [];
-      if (ch === "(") {
-        // cmdPosNext 此時是 commit 後的值：`count=$(` 會被 assignment 前綴保
-        // 留在 true，`$(` 則已被 commit 成一個普通 word → false（天然分流）
-        // prev 是未被 \$ 跳脫的 "$" 才算 $( 替換開頭；被跳脫的 $ 後接 "(" 在
-        // bash 是語法錯誤（字面 $），照群組括號處理
-        // 樣式區裡的 `(`（`case x in (a) …` 的選配包裹）是樣式的一部分，`)` 由
-        // 下面的 region 分支當樣式終止符處理（這個堆疊項不是它的括號）
-        const prev = command[i - 1] ?? "";
-        const kind =
-          caseRegion === "pattern"
-            ? "case"
-            : prev === "$" && !escapedDollar.has(i - 1)
-              ? "subst"
-              : /[A-Za-z0-9_]/.test(prev)
-                ? "func"
-                : prev === "<" || prev === ">"
-                  ? "procsubst"
-                  : "group";
-        parenStack.push({ kind, pos: cmdPosNext });
-      }
-      clearTok();
-      cmdPosNext = true; // 分隔符後是新的指令位置（含 $( 與反引號開頭）
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === "&") {
-      commitTok();
-      funcAwaitBody = false;
-      if (command[i - 1] !== ">" && command[i - 1] !== "<") {
-        clearTok();
-        cmdPosNext = true; // 2>&1 的 & 不是分隔符
-        pendingEnv = []; // 背景分離＝賦值沒接指令字（standalone）→ 丟棄
-      }
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === ")" || ch === ">" || ch === "<") {
-      commitTok();
-      let restoreTrue = false;
-      if (ch === ")") {
-        if (caseRegion === "pattern") {
-          // 樣式終止：沒有自己的 `(`，所以不能 pop 外層堆疊（會偷走 $( 的項）；
-          // 只收掉 `case x in (a) …` 那種選配的 "case" 包裹。重開命令位置並
-          // 進 body；`)` 後開新詞（`a)#c` 是註解，實測）
-          if (parenStack.length && parenStack[parenStack.length - 1]!.kind === "case") parenStack.pop();
-          cmdPosNext = true;
-          caseRegion = "body";
-          parenContinuesWord = false;
-        } else {
-          // 還原這對括號的結果（stack 空＝多餘的 `)`、語法錯誤，維持現況）：
-          //   func/case → 指令位置（函式定義的 body 是命令列表）
-          //   subst/procsubst → 開括號時的位置（賦值前綴→true，參數→false）
-          //   group → 不開命令位置（`( … ) word` 原生就是語法錯誤，不改死文字）
-          const fr = parenStack.pop();
-          if (fr === undefined || fr.kind === "group") {
-            // 多餘的 `)` 與群組／子殼收尾都不開指令位置（`( … ) word` 是語法
-            // 錯誤，實測 exit 2；多餘 `)` 同）——改寫死文字＝零效應
-            cmdPosNext = false;
-          } else if (fr.kind === "func") {
-            // 函式本體必須是複合指令：位置延後到下一詞（FUNC_BODY_STARTERS）
-            cmdPosNext = false;
-            funcAwaitBody = true;
-          } else if (fr.kind === "case") {
-            cmdPosNext = true;
-          } else {
-            cmdPosNext = fr.pos;
-          }
-          restoreTrue = fr !== undefined && (fr.kind === "func" || (fr.kind === "subst" && fr.pos === true));
-          // 詞是否延續到括號外：替換與程序替換收尾＝延續（`$(pwd)#z`、
-          // `<(true)#z` 的 # 是字面，實測）；群組／子殼／函式定義收尾開新詞
-          // （`(true)#c` 的 # 是註解，實測）。stack 空→維持舊值
-          parenContinuesWord = fr === undefined ? true : fr.kind === "subst" || fr.kind === "procsubst";
-        }
-      }
-      // 重導向目標由 bash 自己開檔（不經被關掉的 argv 轉換層），`)` 也結束該指令：
-      // 兩者都清掉指令上下文，否則下一個詞會被當旗標改寫成資料/路徑。
-      // 同時丟棄暫存賦值（A=x > log node 這種交錯形列為漏修：重導向後掃描器
-      // 已當參數區，見上「重導向之後不延續」）。例外：`$(` 關閉且還原到指令
-      // 位置＝緊貼形 A=/c/x$(…) 的值組合還沒收尾——賦值仍在等後面的真指令字
-      //（內建的 pwd/echo 等已不再觸發套用），這個 `)` 不丟，讓暫存流到指令字。
-      if (!restoreTrue) pendingEnv = [];
-      clearTok();
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === "`") {
-      // 同一個 ` 分支兼管開/關：開的時候指令位置從頭算（內容是會執行的指令），
-      // 關的時候還原外層該有的位置——`x=``y`` cmd` 這種「替換是賦值內容」
-      // 後面仍是指令位置（bash 真的跑 cmd）；`echo ``y`` cmd`、`FOO=bar ``y`` cmd`
-      // 的替換本身就是指令名，cmd 只是它的參數 → 不再是指令位置。
-      const inWord = curTok !== "";
-      commitTok();
-      funcAwaitBody = false; // 替換不是函式本體
-      if (!inBacktick) {
-        btPos.push(inWord && cmdPosNext);
-        inBacktick = true;
-        cmdPosNext = true;
-      } else {
-        inBacktick = false;
-        cmdPosNext = btPos.length ? btPos.pop()! : false;
-      }
-      clearTok();
-      out += ch;
-      i++;
-      continue;
-    }
-    // cmd 的雙斜線旗標：僅當 cmd 是一個已收尾的詞（curTok 空）且在指令位置。
-    // 緊貼形 cmd//c 不改（原先會插一個空格把它拆成「cmd + //c」）：bash 把
-    // cmd//c 當程式名，原生是 `bash: cmd//c: No such file or directory`、
-    // exit 127——兩種轉換狀態都一樣（實測）。改寫它不是修環境層，而是替模型
-    // 改錯字：gate ON 時反而把「大聲 127」變成 banner＋exit 0 的靜默失敗。
-    // 同一詞的引號拼法（"cmd"//c）同理不改（實測原生也是 127）
-    if (ch === "/" && command[i + 1] === "/") {
-      const atCmd =
-        curTok === "" &&
-        ((prevTokCmdPos && isCmdTok(prevTok, prevTokQuoted)) || (cmdFlagZone && prevTok.startsWith("/")));
-      if (atCmd && pathConvDisabled()) {
-        cmdFlag.lastIndex = i;
-        const m = cmdFlag.exec(command);
-        // `//alpha/beta` 是 UNC 形（MSYS 不會轉它，cmd 當它是無效 switch）——
-        // 四種組合（原生/本機 × 原形/改寫）實測全是互動 banner ⇒ 改寫零效應，
-        // 不做（`cmd //server/share` 就是這種；電池釘樁）。
-        if (m && command[i + m[0].length] !== "/") {
-          out += "/" + m[1];
-          i += m[0].length;
-          curTok = "/" + m[1];
-          cmdFlagFixed = true;
-          continue;
-        }
-      }
-      curTok += ch;
-      out += ch;
-      i++;
-      continue;
-    }
-    // bash 註解（# 在詞首——bash 只在詞首認註解）：註解讓前綴賦值收尾成
-    // standalone（`A=/c/x # c` 是 shell 變數賦值、值不進任何 envp，原生也
-    // 不轉換）→ 丟棄暫存；丟棄要在 # 這個詞自己 commit 之前（詞首 # 在指令
-    // 位置會被當指令字觸發套用）。詞中的 #（a#b）不是註解，照常掃描。
-    // 註解內容是死文字、到達不了任何程式——整段照原樣複製到行尾（同 heredoc
-    // 本體）。曾把註解內容照一般掃描：註解裡的 `(` 被分類成函式定義、重開
-    // 指令位置，`cmd //c ver # note (cmd //x)` 把死文字裡的 //x 也改寫了
-    // ＝零效應誤修（每項修復必須指名故障點，死文字沒有）。詞首判準照 bash
-    // lexer 的規則——輸入開頭或空白／運算子之後；引號／替換收尾後詞延續
-    // （實測 `"a"#b`、`$(pwd)#z` 的 # 是字面），樣式區 `)` 後開新詞（實測
-    // `a)#c` 是註解）。行尾的 \n 留給空白分支，讓下一行重開指令語境。
-    const atWordHead =
-      out === "" ||
-      " \t\n;|&(<>".includes(out[out.length - 1]!) ||
-      (out.endsWith(")") && !parenContinuesWord);
-    if (ch === "#" && curTok === "" && atWordHead) {
-      pendingEnv = [];
-      let lineEnd = command.indexOf("\n", i);
-      if (lineEnd === -1) lineEnd = n;
-      out += command.slice(i, lineEnd);
-      i = lineEnd;
-      continue;
-    }
-    curTok += ch;
-    out += ch;
-    i++;
-  }
-  // EOF：檔尾 token 沒有分隔符觸發 commit——真指令字落在檔尾時前綴賦值一樣
-  // 要套用（A=/c/x cmd 的 cmd 就是這種）。賦值（含空值）、語法關鍵字、
-  // 內建、純數字詞＝收尾 standalone → 丟棄；參數位置照舊不套用。
-  if (curTok && cmdPosNext && envpTrigger(curTok)) {
-    applyPendingEnv();
-  }
-  return { command: out, cmdFlagFixed, envPathFixed };
+function resultText(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const texts = content.filter((x) => x && typeof x === "object" && (x as any).type === "text" && typeof (x as any).text === "string").map((x) => (x as any).text as string);
+  return texts.length ? texts.join("\n") : null;
 }
 
 // ===== 使用統計 =====
@@ -1109,9 +227,7 @@ function scanBash(command: string): BashScanResult {
 // 為 key，同一機制的 variant 才合併**：
 //   path.tempMount   /tmp 這種 MSYS 掛載路徑（host 不套 MSYS 映射）
 //   path.tempVar     $TEMP／%TEMP% 這種變數（host 不展開）
-//   shell.cmdFlag    msys argv 旗標轉換被關 → //c|//k 原樣抵達（//c、//k、
-//                    多旗標、引號名、basename 路徑全算同一種）
-//   shell.envPath    msys envp 賦值值轉換被關（碟符值與 /tmp 值同一個機制）
+//   shell.cmdBanner  successful cmd interactive-mode banner detected after execution
 // 舊版的 path.temp 是兩個 temp 故障合在一起，已拆開（舊檔資料保留不動）。
 // pi 沒有 per-extension 儲存 API
 //（docs/extensions.md State 段）→ 用官方匯出的 getAgentDir()/
@@ -1241,62 +357,63 @@ function bumpFix(key: string): void {
   flushStats(); // 分子低頻：立即落盤
 }
 
-// 刻意不呼叫 ctx.ui.notify：那些提示是給人看的、對 agent 沒有作用（使用者指示
-// 移除；統計與改寫照舊）。宿主能力缺失的情形仍然整體 inert（probeShell 回 null
-// → 不改寫），只是不再往外丢訊息。
 
 export default function (pi: ExtensionAPI) {
-  // 故障點全部是 Windows 的（host 端路徑解析、MSYS 轉換層）：非 Windows 整個擴充
-  // 停用（那種機器上沒有 cmd.exe）
   if (process.platform !== "win32") return;
-  // 探測對象＝pi 自己配置的 shell（settings.shellPath）交給 getShellConfig 解
-  // 析（與 pi spawn bash 的決策同一個呼叫），這樣就不必「假設」pi 會 spawn 哪顆
-  // bash。
   setConfiguredShell(() => {
-    try {
-      const s = pi.getSettings?.();
-      return typeof s?.shellPath === "string" && s.shellPath ? s.shellPath : undefined;
-    } catch {
-      return undefined;
-    }
+    try { const s = pi.getSettings?.(); return typeof s?.shellPath === "string" && s.shellPath ? s.shellPath : undefined; }
+    catch { return undefined; }
   });
-  // session 結束：把分母 debounce 還沒寫出的部分補冲
   pi.on("session_shutdown", () => flushStats());
-
-  pi.on("tool_call", (event) => {
-    const name = event.toolName;
-
-    // write / edit / read / grep / find / ls：改寫 path 參數
-    //（grep/find/ls 同樣是 host 端解析（resolveToCwd），/tmp/$TEMP 也會出事，
-    //  但它們是唯讀工具，失敗型態是「找不到目錄」大聲報錯——修掉是純獲益）
-    if (name === "write" || name === "edit" || name === "read" || name === "grep" || name === "find" || name === "ls") {
-      bumpTool(name);
-      const input = event.input as { path?: string };
-      if (typeof input?.path === "string") {
-        const fix = rewritePathFix(input.path);
-        if (fix.value !== input.path) {
-          input.path = fix.value;
-          // kind 與值同源（rewritePathFix 只在 splitTempPath 命中時改值）——萬一
-          // 以後新增了不屬於 temp 族的改寫，會落在 path.other，不會混進別人的鍵
-          bumpFix(fix.kind ?? "path.other");
-        }
+  pi.on("before_agent_start", (event: any) => {
+    if (!pathConvDisabled()) return;
+    const hint =
+      "env-guard (Windows): write prefix-assignment path values in Windows form (VAR=C:/x - VAR=/c/x silently resolves to C:/c/x in native executables). Use single-slash flags for native executables (cmd /c, taskkill /IM).";
+    // 文件建議的通道：原地改 systemPromptOptions.promptGuidelines（集合可變；
+    // Pi 對 prompt 區段做 diff、只把變更以一則系統訊息補進對話＝快取友善）。
+    // 每個 run 重建 options → 每次 run 注入一條，不會跨 run 累積；marker 只防
+    // 同一 run 內鏈上 handlers 的重複。
+    const guidelines = event.systemPromptOptions?.promptGuidelines;
+    if (Array.isArray(guidelines)) {
+      if (!guidelines.some((g: unknown) => typeof g === "string" && g.includes(SYSTEM_HINT_MARKER))) {
+        guidelines.push(`${SYSTEM_HINT_MARKER} ${hint}`);
       }
       return;
     }
-
-    // bash：cmd //c 旗標修正
-    //（bash 內的 /tmp 經 MSYS 映射本來就正確，不需動）
-    if (name === "bash") {
-      bumpTool("bash");
-      const input = event.input as { command?: string };
-      if (typeof input?.command === "string") {
-        const r = rewriteBashCommand(input.command);
-        if (r.command !== input.command) {
-          input.command = r.command;
-        }
-        if (r.cmdFlagFixed) bumpFix("shell.cmdFlag");
-        if (r.envPathFixed) bumpFix("shell.envPath");
-      }
+    // 舊宿主沒有 structured options：退回回傳 patch（文件：回傳 systemPrompt
+    // 取代本 run 的完整提示）。原地改 event.systemPrompt 不在文件的 in-place
+    // 變異清單裡 → 必須回傳。
+    const prompt = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
+    if (prompt.includes(SYSTEM_HINT_MARKER)) return;
+    return { systemPrompt: prompt ? `${prompt}\n${SYSTEM_HINT_MARKER} ${hint}` : `${SYSTEM_HINT_MARKER} ${hint}` };
+  });
+  pi.on("tool_call", (event: any) => {
+    const name = event.toolName;
+    // bash 也計入分母：shell.cmdBanner 的命中率需要它（舊版行為，1900+ 筆歷史
+    // 連續性依賴同一口徑）；bash 指令本體不改寫，只計數。
+    if (name === "bash") { bumpTool("bash"); return; }
+    if (!["write", "edit", "read", "grep", "find", "ls"].includes(name)) return;
+    bumpTool(name);
+    const input = event.input as { path?: string } | undefined;
+    if (typeof input?.path === "string") {
+      const fix = rewritePathFix(input.path);
+      if (fix.value !== input.path) { input.path = fix.value; bumpFix(fix.kind ?? "path.other"); }
     }
+  });
+  pi.on("tool_result", (event: any) => {
+    if (event.toolName !== "bash") return;
+    const result = event.result ?? event;
+    if (result.isError === true || (result.structuredContent?.exit_code ?? 0) !== 0) return;
+    const text = resultText(result.content);
+    if (text === null || !detectCmdBanner(text)) return;
+    const advisory = { type: "text", text: pickCmdHint(pathConvDisabled()) };
+    // tool_result 的傳播機制是回傳 patch（middleware 鏈，文件明載；原地改
+    // content 不在 in-place 變異清單裡）。structuredContent 要原樣帶回——
+    // 文件語意：回傳 content 補丁而不回傳 structuredContent 會把後者丟棄。
+    const content = Array.isArray(result.content)
+      ? [...result.content, advisory]
+      : [{ type: "text", text: String(result.content ?? "") }, advisory];
+    bumpFix("shell.cmdBanner");
+    return { content, structuredContent: result.structuredContent };
   });
 }
