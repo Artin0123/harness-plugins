@@ -1,7 +1,7 @@
 {
 	"name": "harness-plugins-pi",
 	"version": "0.8.0",
-	"description": "pi extension for Windows temp-path rewriting and conservative cmd-banner detection.",
+	"description": "pi extensions: Windows temp-path rewriting, conservative cmd-banner detection, and native spawning for the powershell tool.",
 	"keywords": [
 		"pi-package",
 		"pi-extension"
@@ -10,7 +10,8 @@
 	"repository": "git+https://github.com/Artin0123/harness-plugins.git",
 	"pi": {
 		"extensions": [
-			"./env-guard"
+			"./env-guard",
+			"./native-powershell"
 		]
 	}
 }
