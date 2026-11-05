@@ -1,101 +1,121 @@
-# oc env-guard redesign 交接說明
+# oc env-guard redesign — 決策記錄
 
-對象：接手 **oc 版**（`oc-plugins/env-guard`）redesign 的代理。pi 版已於
-2026-11-04 完成同型 redesign（1303 → 420 行、48 項測試），本文件是過程中
-**驗證過的事實、判準與陷阱**的濃縮。oc 的 host 層與 pi 不同，
-每條結論都要在 oc 重新量測後才能採用（spec 開頭的原則：適用性在本 host 重新量過才留）。
+> **狀態：已實作**（oc-plugins/env-guard/index.ts redesign＋電池重寫，2026-11-05）。
+> 本文件回答兩件事：pi 的解法**為什麼**能終止那個無限 code review 迴圈（概念判準，
+> 不依賴 pi 環境即可裁決），以及 oc 依同理念調整後**實際做了什麼、為什麼與 pi 的三
+> 點不盡同**。交接期（redesign 前）的事實清單與陷阱記錄在 §5 保留。
 
-## 0. 必讀順序
+---
 
-1. `AGENTS.md`（repo 判準：原生執行優先、寧可漏修不可誤修、修復審查清單）
-2. `docs/spec.md` 的 oc 版各節＋「刻意不修與漏修的分界」＋「只能靠寫對的形」
-3. 本文件
-4. `pi-extensions/env-guard/index.ts` 與 `pi-extensions/tests/env-guard/index.mjs`
-   （參考實作，420 行；oc 版現況約 1300 行，為同一顆 lexer 的移植）
-5. 使用者的環境文件：
-   https://github.com/Artin0123/windows-setup/blob/main/docs/msys-no-pathconv.md
-   ——其機制主張（argv 轉換表、`//c` 病理、`MSYS2_ARG_CONV_EXCL` 語意）已全部實測驗證為真
+## 1. 判準：輸出側偵測為什麼能終止迴圈（而不是「這次夠了」）
 
-## 1. 已定案、不要重新訴訟的結論
+循環的病理：四天 25 個 commit、六個 misfix（`3c0e322`、`c445808`、`35a3f8b`、
+`1111a5d`、`79ad81b`、`c062b4f`），每次「改對 → 另一個 case 改錯 → 再修」都由同一個
+結構成本支付：**scanBash 在執行前猜 bash 語法的哪個位置會踩到環境故障**。bash 是開
+放集合，「夠了」是判斷、不是機制——下一個 reviewer 總能指名一個新 case，而新 case
+的可動作修法只有「動 lexer」。
 
-| 結論                                                                                                                                                                                                   | 證據出處                                                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MSYS_NO_PATHCONV=1`（bashrc）**保留**。轉換開啟會把模型最自然的拼法靜默弄壞（`cmd /c` → `C:/` → 互動 banner、exit 0 假成功）；關閉的失敗誠實、可自癒。排序：**關閉＋guard ＞ 開啟＋小修 ＞ 開啟不修** | spec pi 機制節＋使用者文件（含實測：`/a/b` 形資料無自然拼法）                                                                                                              |
-| 輸入側 bash lexer 是 review 不收斂的**結構性**根源                                                                                                                                                     | git log：6 天 5 個 misfix commit（cdf4d45、c062b4f、9010e01、668a1cb、…）；實際命中：cmdFlag 32 次／1912 次 bash 呼叫、envPath 7 次——維護面 600 行狀態機 vs 五天 39 次命中 |
-| 三層故障面厚度：pi↔git bash **薄**（修得完）；git bash↔native exe **厚**（開放集合，靜態不可修，治本在提示與自癒）；git bash↔WSL ≈ **零**                                                              | 兩態實測（spec 各節）                                                                                                                                                      |
-| 靜默失敗才值得機器修；大聲失敗讓它壞（模型看得到真原因、一輪自癒）                                                                                                                                     | AGENTS.md「分界」＋活體案例（MODULE_NOT_FOUND 一輪自癒結案）                                                                                                               |
+pi 代理的解拆成三條，每條都是機制而非承諾：
 
-## 2. 收斂機制（核心設計原則）
+1. **母體移除**：輸入側不再改寫指令字串。「誤修正確語法」這個失效類別在結構上
+   不存在——沒有改寫器，就沒有誤修器。六個 misfix 的母體就此一次消失。
+2. **開放集合改由輸出指紋接住**：新模式不再問「這串字會不會進互動模式」，而看
+   「事實上進了沒」——互動 banner 有閉集合指紋（首兩個非空行 `Microsoft Windows [
+   `＋`(c) Microsoft`；提示符行因 stdin 形態而異不入指紋；`cmd /c ver` 的單行正
+   常輸出不命中）。wrapper、引號 payload、`time -p`、heredoc 邊角、反斜線續行、
+   `coproc`、`$'cmd'`……所有漏修臺條目**同一時間結案**，因為偵測對象從語法位置
+   變成事實本身。
+3. **誤判代價有上界**：輸出側誤判的最壞結果是多一段 advisory 文字，指令原樣、
+   零執行破壞。誤修方向在這個位置不存在，review 的主要利器（「你把對的改壞了」）
+   失效。
 
-1. **輸入側改寫僅限閉集合**：欄位語意單一（`path` 欄位永遠是路徑）、形態可數
-   （temp 族三種語法 × 有限變數名）。開放集合（bash 語法、任意變數、外部程式的
-   參數結構）**禁止**進入輸入側——那是無窮 review 的入口。
-2. **靜默失敗 → 輸出側偵測＋advisory**：誤判代價＝多一段文字、零執行破壞；
-   漏判＝保守放行。這是唯一零誤修成本的修復位置。
-3. **開放集合的「寫對形」→ 系統提示**：一條規則覆蓋全部變體（提示是閉集合）。
-   例：前綴賦值寫 `VAR=C:/x`、native exe 旗標單斜線、路徑給原生 exe 用 Windows 形。
-4. **新增修復的三道門**：(a) 指名故障點＋兩態實測重現；(b) 確認閉集合；
-   (c) 誤判代價有上界。
-5. **舉證責任在提案方**：新 edge case 主張必須附 stats 命中或 live 重現，
-   否則不動。這是 review 能終結的機制——不是靠自律，是把舉證負擔倒轉。
+**裁定：同意，且機制成立。** 收斂不是靠自律喊停，而是靠三件事把「可以再交辦的議
+題」封死：(a) 想動 lexer 已無 lexer；(b) 新 case 的落點是閉集合 backstop，無分支
+可提；(c) 剩下的輸入側修復全部是「欄位語意被宿主 API 密封」的閉集合（誤修在結
+構上不可能）。替代的終止條件依然保留：任何新修復必須逐項過 AGENTS 的審查清單
+（指名故障點＋兩態實測＋閉集合＋誤判代價有界），舉證責任在提案方，以判準裁定而
+不是靠 flag、行數或「我覺得夠了」。
 
-## 3. oc 的分岔點——先查證、再設計
+**已知成本（如實記錄，不做為回頭的理由）：**
+- cmd 形從「輸入側一次過」變成「一次 banner 後一輪自癒」——少吃免費午餐、換到
+  知道真相。pi 提議的 20 行窄 fast-path（僅 `^cmd //c` 行首形）是可選優化；**本
+  設計不採**：任何輸入側改寫就是重建誤修母體，不為省一輪而重開它。
+- 指紋是本機實抓的閉集合；被截斷或指紋不完整的 banner 漏報、放行（保守方向）。
+- GBK 亂碼治療點仍在宿主解碼層（既有分界不變）。
 
-oc 的 surface 比 pi 廣（`path`／`glob`／`patch`／`workdir` vs pi 只有 `path`）：
+## 2. oc 宿主能力查證（v2.2.5 標籤源碼；`gh api repos/anomalyco/opencode/contents/<path>?ref=v2.2.5`）
 
-- **temp 前綴改寫（四個 surface）**：閉集合輸入側，redesign 後可保留——但每個
-  surface 要重驗落點（spec oc 實測記錄節有現成方法與判準）。
-- **關鍵未知 ①：oc 有沒有輸出側 hook？** pi 的 `tool_result` 可修改工具輸出
-  （middleware 鏈、partial patch）。oc 目前用的都是 before hook
-  （`execute.before`／`create.before`）。**先查 oc SDK 的 hook 清單**——若無
-  輸出側事件，cmd banner backstop 在 oc 做不了，替代方案：(a) 窄快路徑
-  cmdFlag 改寫（僅 `^cmd //c` 行首等極窄形），或 (b) 只靠系統提示。這是
-  redesign 的第一個決策點，查證前不要動手。
-- **關鍵未知 ②：oc 能否注入系統提示？**（pi 用 `before_agent_start` 的
-  `promptGuidelines`，快取友善）。查 oc 的 instructions／template override 能力。
-- **oc host 自帶「Portable shell scanner」預檢**（會擋部分 heredoc 形、
-  回傳≠原生）：spec oc 接線段有記錄。確認 redesign 後哪些形還會被 host 層攔
-  ——host 層的病不是插件能修的，記臺帳。
-- **transport 折疊**（指令字串成對 `\\` 折一層，git-bash 專有；oc 與 pi 同，
-  live 實測 2→1、4→2）：對輸出側偵測**無影響**；若保留任何輸入側改寫，掃描器
-  必須建模折疊（spec 有完整實測表與 `foldedRun` 模型記錄）。
+| 問句（交接文件 §3 的未知 ①②）                                 | 答案                                                                                                 |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| oc 有沒有輸出側 hook？                                        | **有**。`ctx.tool.hook("execute.after")`：事件含 `result: Tool.Result` **可變**（`packages/plugin/src/effect/tool.ts:29`）；宿主執行點 `packages/core/src/tool.ts:158–173` 在 trigger 後讀 mutate 過的 `afterEvent.result` 再返回——**改動直達模型**；`step.ts` 的 truncate 在 hook 之後跑，首部存活 |
+| shell 工具結果的形狀                                          | 工具名 `"shell"`（非 `bash`）；成功 path 的 `result`：`content:[{type:"text",text},…]`、`metadata:{truncated, exit?, timeout?, signal?, status?}`（`packages/core/src/tool/plugin/shell.ts`）。指紋只在 `status==="completed"`、`metadata.exit===0`、非 timeout/signal 時進入 |
+| oc 能否注入系統提示？                                         | **可以**。`ctx.session.hook("context")` 的 `event.system: SystemPart[]` 可就地 push；`SystemPart = {type:"text",text}`（chat-trim-context 已在本機實證同型接線）。`compaction`／`generate` 同型，一次註冊三個 |
+| 宿主已有層是否會攔？                                          | host 自帶的 Portable shell scanner 預檢不變（照 spec 老記錄；它擋的形兩側都到不了插件，記臺帳）         |
 
-## 4. 陷阱清單（pi 過程實踩、oc 重測時會再遇到）
+這兩個答案正是交接文件「查證前不要動手」的第一個決策點——輸出側方案在 oc 走得通，
+且宿主源碼層級的證據比插件的猜測強。
 
-- **BASH_ENV 探針陷阱**：bashrc 的 `MSYS_NO_PATHCONV` 經 `BASH_ENV` 對所有
-  子 bash 生效。單 `env -u MSYS_NO_PATHCONV` 是**假讀數**（子 bash 又從 bashrc
-  補上）；量 native 行為要 `env -u BASH_ENV -u MSYS_NO_PATHCONV`。
-- **探測對象 ≡ spawn 對象**：用 host 同一個 shell 決策路徑探測，不要自製
-  PATH 搜尋（解析順序與 host 不同會選到別顆 bash，結論漂移）。
-- **banner 指紋用實抓位元組，不要拼樣本**：指紋＝輸出前兩個非空行
-  （`Microsoft Windows [` ＋ `(c) Microsoft`）——ASCII 前綴跨語系／跨 code page
-  存活。提示符行 `X:\…>` 在管線 stdin 形態有、`/dev/null` stdin 形態**沒有**，
-  不能列入指紋。`cmd /c ver` 的正常輸出只有版本一行（無害形，勿誤報）。
+## 3. oc 的實際調整（≠照抄 pi 三點）
+
+| pi 的三點                                     | oc 的對應                                                                   | 宿主差異說明                                                                                                                       |
+| --------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 檔案工具 `path` temp 改寫（1 surface）        | **保留 oc 既有的四個 surface**：`path`／`glob` 前綴拆分／`patch` 指令行／`shell` `workdir` | 不是 pi 少了、是 pi 沒有這些工具。每個 surface 都已本機實測（README 表）。閉集合、欄位語意被 host API 密封，修復位置確定、需要零判斷       |
+| cmd banner 輸出側偵測＋advisory               | 新增 `execute.after` banner backstop＋`shell.cmdBanner` 統計鍵                | 接線不同：pi 回傳 patch、oc 就地改 `event.result`；偵測函式同型（指紋一致、ASCII advisory）。conversion 狀態取自該次 spawn 的 `create.before` probe（per-exe cache）；spawn 未經 create.before 時沿用初始值＝「轉換開啟」語義（提 `//c`，與 pi 的 `pathConvDisabled()` probe 失敗預設同） |
+| envp 輸入側掃描整座移除，改系統提示一行       | 同方向：`scanBash`／`matchParen`／`readHeredocHead`／`backslashRun`… 整套 lexer（~600 行）與對應 ~700 行電池**移除**；`ctx.session.hook("context"/"compaction"/"generate")` 在實測 `MSYS_NO_PATHCONV` 存在時注入純 ASCII 提示（前綴賦值寫 `VAR=C:/x`、native exe 旗標寫單斜線） | 提示通道不同：pi 走 `before_agent_start` 的 `promptGuidelines`、oc 走 session context hook；探測對象的等號題（「探測的 bash ≡ spawn 的 bash」）pi 用 `getShellConfig` 由構造保證、oc 由 `event.shell`＋`uname -s` 在 spawn 當場驗證——兩方向都已實測 |
+
+**oc 端新增、pi 端沒有的束制（redesign 落地檢查）**：宿主 Portable scanner 會擋掉
+部分 heredoc 形（回傳≠原生）——照老記錄留臺帳；背景命令（`status="running"`）的建
+議不貼（避免在背景流式通知上誤貼 advisory）。
+
+## 4. 落地記錄
+
+- `oc-plugins/env-guard/index.ts`：~660 行（含統計與探測），從 1594 行縮下；結構
+  見檔頭註解。cmd 形的輸入側完全移除：shell create.before 只做身分驗證＋workdir
+  改寫＋轉換探測快取（不再碰 `event.command`）。
+- `oc-plugins/tests/env-guard/index.mjs`：電池重寫。保留：temp 族全表面釘樁、
+  glob 分拆、patch 指令行、分類單一來源、shell 身分/探針語意、統計（分母/分子/
+  持久化/併發/畸形/壞 storage）、worker（無錨）、非 win32、packaging。新增：banner
+  指紋（病理上一行/三行/含空行/無版本行、無害形一行、`cmd /c ver`、背景結果）與
+  execute.after 的 contract（非 shell、非 completed、非 exit 0、idempotency）；系統提示 hint 的 marker／重複防疊／探測失敗不注入。刪除：scanBash 的全套
+  釘樁（heredoc 本體、case region、函式本體、註解、引號詞、`\$(` 資料……）——
+  沒有改寫器，這些測的不是行為而是死碼；等價的「還有沒有人改我的指令」釘樁改為
+  shell hook 對 `command` 永不變的單一斷言。
+- `docs/spec.md`：oc 版各節改寫（機制、接線、邊界臺帳、統計表、測試段）。
+- `README.md` oc 段同步。
+
+## 5. 保留的事實與陷阱（交接期清單，全部仍然有效）
+
+- **BASH_ENV 探針陷阱**：`MSYS_NO_PATHCONV` 經 `BASH_ENV` 對所有子 bash 生效；
+  量 native 行為要 `env -u MSYS_NO_PATHCONV -u BASH_ENV`（spec 有實錄）。
+- **探測對象 ≡ spawn 對象**：v2.2.5 上已本機量過 spawn 解析落點＝`findBash()`；
+  換機器/版本前重測，不合則 `exec.envPathHint` 整體停用（inert，不猜 PATH）。
+- **banner 指紋用實抓位元組**：指紋＝輸出前兩個非空行（`Microsoft Windows [` ＋
+  `(c) Microsoft`）；提示符行 `X:\…>` 在管線 stdin 形態有、`/dev/null` stdin 形態
+  沒有，不能列入指紋。`cmd /c ver` 的正常輸出只有版本一行（無害形，勿誤報）。
   GBK 亂碼經 UTF-8 解碼成 U+FFFD，ASCII 前綴不變。
-- **oc 安裝快照可能整批落後 master**：live 歸因前先比對 cache timestamp
-  與 `git log`，否則把「跑舊版模組」誤判成「新版修復無效」（spec 有實錄）。
-- **統計鍵**：移除的修復其歷史鍵保留不動（`adoptCounts` 吸收）；新鍵按
-  「surface × 故障機制」切；分母（`toolCalls`）口徑延續，否則與歷史資料斷鏈。
-- **零頻率形不新增分支**：508 條真實指令語料裡真要執行 cmd 的只有 2 條。
-- **行為修改必配回歸測試**：放 `oc-plugins/tests/`；gate 兩方向（轉換開／關
-  的機器）都要能跑同一份電池。
-- **輸出截斷**：pi 的 bash 輸出截尾（最後 N 行／N KB）會截掉 banner 首行
-  ——偵測不到就放行，保守方向，不要為此加輸入側邏輯。
+- **oc 安裝快照可能整批落後 master**：live 歸因前先比對 cache timestamp 與
+  `git log`，否則把「跑舊版模組」誤判成「新版修復無效」（spec 有實錄）。
+- **統計鍵**：移除的修復不新增鍵；`shell.cmdFlag`／`shell.envPath` 的歷史資料隨
+  install 檔保留（`adoptCounts` 照收）；新鍵按「surface × 故障機制」切；分母（`toolCalls`）
+  口徑延續，否則與歷史資料斷鏈。
+- **零頻率形不新增分支**（AGENTS 明文）；語料基線：508 條真實指令裡真要跑 cmd 的
+  只有 2 條。
+- **輸出截斷**：宿主在 hook 之後才截斷，且截尾的首部存活——偵測不到就放行（保守
+  方向），不為此加輸入側邏輯。
 
-## 5. 建議順序
+## 6. 殘留 live 驗證（計劃中、未啟動）
 
-1. 查證 §3 的兩個關鍵未知（hook／系統提示能力）——這決定設計形態
-2. 更新 `docs/spec.md` oc 段（先寫設計、再動碼）
-3. 實作＋測試電池（照 §2 三道門自審每一項）
-4. live 驗證：走 oc 實際呼叫管道做修前／修後對照；stats 與 pi 量測對照
-5. 清理 spec 中 oc 的舊掃描器臺帳（pi 的清理方式可參考：稽核段刪除＋
-   歷史指針註記＋git 備份；oc 段落中引用「pi 第二輪」等交叉參照的歷史內容
-   在 commit e5b415f 及其前的版本）
+- 一輪乾淨 oc 對話走實際呼叫管道：`cmd //c ver`（安裝新版後預期：banner 後附
+  advisory、`shell.cmdBanner` +1）；`A=/c/x node`（輸出側無法修——應由系統提示
+  導正，本輪只驗 hint 有注入、前綴值沒被改寫）；四個 temp surface 一輪冒煙。
+- 新電池＋packaging 全綠才算數；安裝後版本對照 cache snapshot（§5）。
+- 工具面：`experimental_image_generate` 的 `path`（本機沒有 image model，無從實
+  測）、`session_move.directory` 仍記臺帳不動。
 
-## 6. 紅線
+## 7. 紅線
 
 - **不動 pi 版**（`pi-extensions/`）；不動 cmdc 版
-- 不為零頻率形加分支；不列舉工具（AGENTS 明文）
+- 不為零頻率形加輸入側分支；不列舉工具（AGENTS 明文）
 - 臨時腳本／探測產物放系統暫存目錄、用完清掉
 - advisory／系統提示**純 ASCII**（非 ASCII 一旦被錯誤轉碼不可逆）
 - 驗證只用使用者指定的模型；換 provider（尤其付費）先取得同意

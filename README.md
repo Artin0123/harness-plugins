@@ -280,21 +280,23 @@ Mount/Var 鍵），可直接對照。
 ## env-guard (oc-plugins)
 
 `id: env.guard` — **只影響 Windows**（MSYS/MINGW bash）。OpenCode 的執行層與 cmdc /
-pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數）的路徑都壞，修在工具輸入
-與 shell 建立兩個邊界上。
-技術架構、邊界判準、接線與閘門、實測記錄：[`docs/spec.md`](docs/spec.md)。
+pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數）的路徑都壞。**指令字串
+一律不改寫**：輸入側只保留「欄位語意被宿主 API 密封」的四個
+閉集合 temp surface；cmd 互動模式改由**輸出側**偵測（banner backstop）、envp 賦值
+改由一行系統提示導正——為什麼（誤修經濟學、閉集合判準）見 redesign 決策記錄：
+[`docs/oc-env-guard-redesign.md`](docs/oc-env-guard-redesign.md)；技術架構：
+[`docs/spec.md`](docs/spec.md)。
 
 ### 修復範圍（每一列都在 v2.2.5 實測過）
 
 | 工具 / 欄位                         | 症狀（實測）                                                                                                                                                                                                                           | 做法                                                                                                                                                                          |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read` / `write` / `edit` 的 `path` | `$TEMP/x` 在專案下建字面 `$TEMP` 資料夾；`${TEMP}/x` 同樣字面；`/tmp/x` 找不到檔案                                                                                                                                                     | `/tmp`、`$TEMP`/`$TMP`/`$TMPDIR`、`${TEMP}`（大括號）、`%TEMP%`/`%TMP%` 開頭改寫成 bash 自己回報的 temp 錨點（`cygpath -w /tmp`）；`~` 由 host 自己展開成家目錄（實測，不動） |
-| `glob` / `grep` 的 `path`           | 同上（`$TEMP` 進不去真 temp）                                                                                                                                                                                                          | 同一個 `path` 改寫                                                                                                                                                            |
+| `read` / `write` / `edit` / `glob` / `grep` 的 `path` | `$TEMP/x` 在專案下建字面 `$TEMP` 資料夾；`${TEMP}/x` 同樣字面；`/tmp/x` 找不到檔案                                                                                                                                                     | `/tmp`、`$TEMP`/`$TMP`/`$TMPDIR`、`${TEMP}`（大括號）、`%TEMP%`/`%TMP%` 開頭改寫成 bash 自己回報的 temp 錨點（`cygpath -w /tmp`）；`~` 由 host 自己展開成家目錄（實測，不動） |
 | `glob` 的 `pattern` 內嵌路徑        | `pattern: "${TEMP}/*.txt"` 靜默回 0 筆（假陰性）                                                                                                                                                                                       | 只在**沒有另給 `path`** 時，把前綴 temp 目錄拆到 `path`、其餘留給 `pattern`；有給 `path` 就完全不動                                                                           |
 | `patch` 的 `patchText`              | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾                                                                                                                                                                              | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動。四種都實測過（含改名與刪除）        |
 | `shell` 的 `workdir`                | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp`                                                                                                                                                                   | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`）                                                                                                                           |
-| `shell` 的 `command`                | `BASH_ENV` 指到的 `.bashrc` 設了 `MSYS_NO_PATHCONV=1`，`cmd //c` 原樣抵達 cmd → 進互動模式（實測 stdin 關閉時：exit 0，輸出是 banner＋版權聲明＋提示符，第一行與 `ver` 幾乎同形；GBK 編碼，沒改寫時模型會把 banner 讀成 `ver` 的答案） | 只在**指令位置**把 `//flags` 改成 `/flags`：巢狀 `$( )`／反引號／雙引號、`&&`／`;`／`\|` 串接、獨立成詞的引號指令字（`"cmd" //c`——引號不改變 word 身分）都認；資料位置（`echo cmd //c`）、heredoc、單引號內容不動。緊貼形 `cmd//c` 不修（bash 當程式名、原生 127 大聲＝模型錯字） |
-| `shell` 的 `command`（賦值前綴）    | 同一個 `MSYS_NO_PATHCONV=1` 關掉 envp 轉換：`VAR=/c/foo node …` 的值原樣抵達，被 node 當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位、exit 0）                                                                                               | 只修**指令位置賦值＋後接真指令字**的靜態未引號整值：盤符形（字母通用，`/m`、`/q` 等皆經 mount 表）→ 大寫盤符＋正斜線、`/tmp` 形 → cygpath 錨點；套用只認真指令字——內建、bash/sh（msys→msys 邊界不轉）、引號內建（`A=/c/x "bash" -c`——去引號後是內建）、fd 前綴、空值賦值、standalone、引號值、清單值都不觸發；`env X=/c/... node` 的賦值參數會跨邊界、照樣修，exec/command/builtin 後的賦值形原生就錯、不修。standalone 賦值是 shell 變數（bash 端需要 POSIX 值）＋所有丟棄點（分隔符／背景 `&`／換行／重導向／heredoc／詞首 `#`／EOF）不動 |
+| `shell` 的**輸出**（banner backstop） | 任何讓 cmd 進了互動模式的指令寫法——`cmd //c`（`MSYS_NO_PATHCONV` 吃掉轉換時）、wrapper 後（`timeout 10 cmd //c`）、引號 payload（`bash -c 'cmd //c'`）、反斜線續行、`time -p`、算術位移……——輸出是 banner＋版權聲明＋提示符、**exit 0**：指令根本沒跑，模型會把 banner 讀成指令成功 | **執行後**（`execute.after`）檢查成功結果（exit 0、非 timeout/signal）的前兩個非空行：`Microsoft Windows [`＋`(c) Microsoft` 指紋命中 → 附加 `[env-guard]` advisory：指令從未執行、exit 0 不是成功，並按該次 spawn 實測的轉換狀態建議 `cmd /c` 或 `cmd //c` 的寫法。輸入側零改寫——誤判的最壞結果是多一段文字，零執行破壞；截斷或指紋不完整就放行 |
+| **系統提示**（envp／native 旗標導正） | `VAR=/c/foo node …` 的賦值值原樣抵達 native exe，被當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位、exit 0）；native 工具的單斜線旗標（`cmd /c`、`taskkill /IM`）則在轉換**開啟**的環境才會被改壞——兩側都是轉換層的問題，靜態修法是開放集合 | 實測 `MSYS_NO_PATHCONV` 存在時（gate ON），每輪模型請求注入一行純 ASCII 提示：前綴賦值的路徑值寫 Windows 形（`VAR=C:/x`）、native exe 用單斜線旗標（`cmd /c`、`taskkill /IM`）。探測失敗就不注入（inert） |
 
 **刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
 （OpenCode 工具層自己解析正確）、`nul` 重導向（bash 原生行為）、cmd 的非 ASCII 亂碼
@@ -302,36 +304,26 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 `"cmd"//c`——bash 把 `cmd//c` 當程式名，原生就是 `No such file or directory`／127；
 插空格把一個詞拆成兩個＝替模型改錯字，沒有環境故障點）、`exec`／`command`／`builtin`
 後的賦值形（`command X=/c/x node`——bash 把 `X=/c/x` 當指令名跑、原生就大聲失敗）、
-原生 exe 的 POSIX 路徑參數（`python /tmp/x.py`——大聲失敗、可用 `cygpath -w` 自癒）。
+原生 exe 的 POSIX 路徑參數（`python /tmp/x.py`——大聲失敗、可用 `cygpath -w` 自癒）、
+以及**所有要掃 bash 語法才知道修哪裡的形**——指令字串一律不改寫（輸入側改寫的
+取捨見 intro 與決策記錄）：
+真正進了互動 cmd 的由 banner backstop 事後接住；沒進去的都是工具回傳≡原生的
+大聲失敗（agent 看得到真原因）。完整臺帳（native 失敗與漏修兩類、逐條實測證據）
+見 spec〈刻意不修與漏修的分界〉。
 
 **只能靠「寫對」的形**（插件不修或不該修；唯一改善途徑是改寫法——完整表在
 spec〈只能靠「寫對」的形〉）：
 
 - 原生工具的旗標：**gate ON（`MSYS_NO_PATHCONV` 有設）時寫單斜線**
   `taskkill /IM x`；`//IM` 是給「轉換開啟」環境的寫法（實測本機 `//IM` 無效、
-  `/IM` 可用）。
-- `cmd` 的程式名直接寫 `cmd`（或全正斜線的 `/c/.../cmd.exe`）。Windows 路徑：
-  transport 先折一層、bash lexer 再去一層，所以 1–2 個反斜線的未引號
-  `C:\Windows\…` / `C:\\Windows\…` 都變成 `C:Windows…`（127，不修）；**3 個以上**（3/4 已實測）
-  才是真實路徑、插件會改寫旗標。pi 的 transport 折疊相同，但判準仍全刪（3/4 漏修）。
-  跨 host 一致就加引號（`"C:\Windows\…\cmd.exe"` 兩邊都認）或寫 POSIX 路徑。
-- 引號／ANSI-C 裡的反斜線也按同一折疊計：event 2 個 `\\` 到 bash 只剩一個
-  （`"\$(…)"` 是字面），**3 個以上**（3/4 已實測）才是「字面反斜線＋真替換」。oc 已按 folded
-  奇偶掃描；pi 仍用 event 成對（記錄為臺帳）。
+  `/IM` 可用）。banner advisory 會告訴你本環境該用 `cmd /c` 還是 `cmd //c`。
 - 給原生 exe 的路徑用 Windows 形式（`python C:/x.py`）或先 `cygpath -w`。
-- 不要把 `cmd //c` 放進外部 wrapper（`timeout`/`xargs`/`nice`）、`time -p`、
-  引號 payload（`bash -c '…'`）或反斜線續接；寫在指令位置。
 - envp 前綴值直接寫盤符形式（`A=C:/x`）；重導向／`env -u` 選項放到指令後面。
-- 子殼或 `fi`／`done`／`esac`／`}` 之後要接指令，請加 `;`／`&&`／換行
-  （直接接指令字是 bash 語法錯誤）；函式本體用 `f() { …; }` 形式（
-  `function f { …; }` 內的 `cmd //c` 目前漏修）。
-- cmd 輸出的 GBK 亂碼——治療點在宿主解碼層。指令字串裡成對反斜線被 transport
-  折一層是兩 host 共有的通道行為（oc live 2026-11-04 量到 2→1、4→2），bash lexer
-  再一層；oc 的程式名判準現在完整模擬這兩層，pi 仍全刪（3/4 個反斜線的真實路徑
-  漏修）。要保位元組請用 write 工具落檔或 `\134`。
-- heredoc 定界符：字母／中文開頭、`<<$'EOF'`／`<<$"EOF"`、一行多個 heredoc 都認；
-  含轉義的引號定界符（`<<$'E\tF'`、`<<"E\"F"`）整條指令原樣放行（inert，安全）。
-  `<<3`、`<<*X` 這種第一字是 ASCII 標點/數字的寫法仍是邊界（本體會被當指令掃描）。
+- 指令字串裡成對反斜線被 transport 折一層（oc live 2026-11-04 量到 2→1、4→2）
+  、bash lexer 再一層——插件不改指令字串，這個通道行為要自己記住：要保位元組
+  請用 write 工具落檔或 `\134`。
+- cmd 輸出的 GBK 亂碼——治療點在宿主解碼層（插件看不到原始位元組）；亂碼本身
+  是可見訊號，改用 bash 原生工具（`ls`/`grep`/`find`）即可。
 - host 自帶的 shell 預檢（「Portable shell scanner」）對 `cat <<*X` 一類 heredoc
   直接回 error——外掛 ON/OFF 都到不了插件（WSL bash 原生接受，回傳≠原生）；
   定界符用字母開頭可避免。
@@ -352,8 +344,11 @@ spec〈只能靠「寫對」的形〉）：
 | `glob.tempMount` / `glob.tempVar` | glob pattern 前綴：同一組機制 | 上列兩族 |
 | `patch.tempMount` / `patch.tempVar` | patch 指令行：同一組機制 | 上列兩族 |
 | `shell.workdir.tempMount` / `shell.workdir.tempVar` | shell `workdir`：同一組機制 | 上列兩族 |
-| `shell.cmdFlag` | msys argv 旗標轉換被關 | `//c`、`//k`、多旗標、引號名、basename 路徑 |
-| `shell.envPath` | msys envp 賦值值轉換被關 | 碟符值與 `/tmp` 值 |
+| `shell.cmdBanner` | cmd 互動 banner（輸出側偵測） | 單一故障點：成功輸出＋雙行 banner 指紋，一鍵 |
+
+**已退役的歷史鍵**：`shell.cmdFlag`（cmd `//c`→`/c` 輸入側改寫）與
+`shell.envPath`（envp 賦值值改寫）隨 2026-11-05 redesign 移除——舊統計檔裡的
+歷史計數由 `adoptCounts` 原樣保留、不改名；cmd 形的命中現在走 `shell.cmdBanner`。
 
 `path.other`／`patch.other`／`shell.workdir.other` 是可見的 fallback（glob split
 只回 temp 命中，沒有 `.other`）：未來新增了不屬於 temp 族的改寫，會落在對應的

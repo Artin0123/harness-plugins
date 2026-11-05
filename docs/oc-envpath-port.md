@@ -1,6 +1,12 @@
 # oc 版 envp 前綴賦值移植指南
 
-> **狀態：已實作**（oc-plugins/env-guard/index.ts + oc-plugins/tests/env-guard/
+> **狀態：歷史記錄（2026-11-05 redesign 起失效）**。本指南描述的 `shell.envPath`
+> 改寫已實作（0.1.6），後隨 oc env-guard redesign（`docs/oc-env-guard-redesign.md`）
+> **整體移除**（0.2.0 起）：輸入側 bash 掃描器刪除，envp 值正確寫法改由系統提示
+> 導正；歷史統計鍵由 `adoptCounts` 保留。文中引用的「現僅約束 oc 版」掃描器規則
+> 已全部隨掃描器失效；下方原狀態註記描述的是 redesign 前的落地。
+
+> **已實作**（redesign 前，2026-11-04：oc-plugins/env-guard/index.ts + oc-plugins/tests/env-guard/
 > index.mjs，電池全綠；pi 256、cmdc 175 重跑確認無跨 host 影響）。本指南保留為
 > 移植過程的事實基礎與陷阱記錄；第 0 步的驗證已在本機完成：oc 實際 bash =
 > `C:\Users\artin\scoop\apps\git\2.56.0\usr\bin\bash.exe`，與 `findBash()` 一致，
