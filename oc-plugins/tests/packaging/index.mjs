@@ -1,4 +1,4 @@
-// Packaging guard for the two OpenCode plugins.
+// Packaging guard for OpenCode plugins.
 //
 //   node oc-plugins/tests/packaging/index.mjs
 //
@@ -25,7 +25,7 @@ const check = (name, ok, detail) => { if (ok) pass++; else failures.push(`${name
 // a download the plugin does not need.
 const FORBIDDEN_DEP_FIELDS = ['dependencies', 'peerDependencies', 'optionalDependencies'];
 
-for (const name of ['env-guard', 'chat-trim-context']) {
+for (const name of ['chat-trim-context']) {
   const dir = join(root, name);
   const pkgPath = join(dir, 'package.json');
   const srcPath = join(dir, 'index.ts');

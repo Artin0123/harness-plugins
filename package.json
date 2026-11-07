@@ -1,19 +1,13 @@
 {
 	"name": "harness-plugins",
-	"version": "0.7.0",
+	"version": "0.8.0",
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "node cmdc-mods/tests/env-guard/index.mjs && node cmdc-mods/tests/system-prompt/index.mjs && node cmdc-mods/tests/disable-tools/index.mjs",
-		"test:pi": "node pi-extensions/tests/env-guard/index.mjs && node pi-extensions/tests/native-powershell/index.mjs",
-		"test:oc": "node oc-plugins/tests/env-guard/index.mjs && node oc-plugins/tests/packaging/index.mjs"
-	},
-	"commandcode": {
-		"mods": [
-			"./cmdc-mods/system-prompt/index.ts",
-			"./cmdc-mods/disable-tools/index.ts",
-			"./cmdc-mods/env-guard/index.ts"
-		]
+		"test": "npm run test:pi && npm run test:oc",
+		"test:pi": "node pi-extensions/tests/native-powershell/index.mjs",
+		"test:oc": "node oc-plugins/tests/packaging/index.mjs",
+		"test:archive": "node archive/cmdc-mods/tests/env-guard/index.mjs && node archive/cmdc-mods/tests/system-prompt/index.mjs && node archive/cmdc-mods/tests/disable-tools/index.mjs && node archive/pi-extensions/tests/env-guard/index.mjs && node archive/oc-plugins/tests/env-guard/index.mjs"
 	},
 	"pi": {
 		"extensions": [
