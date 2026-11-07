@@ -19,7 +19,7 @@
 // lexer that rewrote `cmd //c` and command-position envp values) is GONE --
 // its rewrite position was an open set (bash grammar), which made the
 // missed-fix/misfix trade structurally unsolvable (4 days, 6 misfix commits).
-// The remaining fixes are two classes:
+// The remaining fixes are one class:
 //   CLOSED-SET INPUT (rewrite position is sealed by the host's own API):
 //   1. paths the host resolves WITHOUT MSYS mapping -- file-tool `path`,
 //      `shell.cwd` (the spawn workdir), a `glob` pattern temp prefix, the
@@ -27,19 +27,6 @@
 //      ${...}), %TEMP%/%TMP% rewrite to the anchor the detected bash itself
 //      reports for /tmp (cygpath -w /tmp). The `path` field is always a path
 //      and never anything else, so these rewrites cannot break syntax.
-//   OUTPUT-SIDE (no rewrite at all -- a mis-detection can only add text):
-//   2. cmd interactive-mode banners: a successful `shell` tool result whose
-//      output starts with the two-line cmd banner fingerprint gets an ASCII
-//      advisory appended (exit 0 was a lie: the command never ran). Covers
-//      every shape that reaches interactive cmd -- wrapper, quoted payload,
-//      continuation, whatever -- with zero maintenance and zero risk of
-//      breaking the command string. The advised spelling follows the same
-//      spawn's MSYS_NO_PATHCONV probe.
-//   3. envp path values (formerly input-side scan): only a one-line ASCII
-//      system hint via ctx.session.hook("context"/...), injected ONLY when
-//      the NO_PATHCONV probe has measured the conversion layer as off. Text
-//      advice has no rewrite failure mode; line: "write VAR=C:/x, use
-//      single-slash native flags (cmd /c)".
 //
 // Not fixed (inventory against regression; per-item evidence in spec.md):
 //   NATIVE (return == native): C:\tmp in file tools; MSYS drive-letter paths
@@ -48,10 +35,8 @@
 //     tight spelling `cmd//c` (bash takes it as a program name, loud 127).
 //   MISSED (return != native, but every static rewrite is an open-set
 //     guess): //flags of other /-switch programs (robocopy hangs), cmd behind
-//     wrappers (covered by the banner backstop for cmd itself), POSIX path
-//     arguments of native programs, envp residual value shapes. The input
-//     string is never rewritten for any of these -- the banner backstop is
-//     the only catch-all, and it catches cmd only.
+//     wrappers, POSIX path arguments of native programs, envp residual value
+//     shapes. The input string is never rewritten for any of these.
 //   cmd's GBK mojibake is its own case: the repair lives in the host's
 //     decode layer -- out of scope; the mojibake is the visible signal.
 
@@ -195,14 +180,12 @@ export function realTempDir(): string | null {
   return tempAnchor;
 }
 
-// ---- shell identity + MSYS_NO_PATHCONV probe ------------------------------
+// ---- shell identity --------------------------------------------------------
 // The shell hook reports the executable the host is about to spawn. Only a
 // shell that verifiably answers `uname -s` with an MSYS prefix is ours; a
 // config value of bash/sh is resolved through the same detection as above,
 // anything else (cmd, powershell, pwsh, wsl.exe) is left alone. Results are
 // cached per executable so a hook never re-probes an already-known shell.
-
-const pathConvCache = new Map<string, boolean>();
 
 function shellCandidate(shell: string): string | null {
   if (!shell) return null;
@@ -215,116 +198,6 @@ function shellCandidate(shell: string): string | null {
 export function isMsysShell(shell: string): boolean {
   const cand = shellCandidate(shell);
   return cand !== null && verifyMsysBash(cand);
-}
-
-// Presence-based: MSYS_NO_PATHCONV disables conversion when set AT ALL
-// (measured: "1", "0", even the empty string), so the probe tests
-// ${VAR+x}, never the literal value. BASH_ENV carries the user's bashrc to
-// every child bash, so the child reports exactly what spawned commands see.
-export function pathConvDisabled(shell: string): boolean {
-  const cand = shellCandidate(shell);
-  if (!cand || !verifyMsysBash(cand)) return false;
-  const key = cand.toLowerCase();
-  let disabled = pathConvCache.get(key);
-  if (disabled === undefined) {
-    disabled = probeNoPathConv(cand);
-    pathConvCache.set(key, disabled);
-  }
-  return disabled;
-}
-
-function probeNoPathConv(bash: string): boolean {
-  try {
-    const p = spawnSync(bash, ["-c", 'printf %s "${MSYS_NO_PATHCONV+x}"'], {
-      timeout: 5000,
-      windowsHide: true,
-    });
-    return !p.error && p.stdout?.toString().trim() === "x";
-  } catch {
-    return false; // uncertainty resolves to "do not advise/rewrite"
-  }
-}
-
-// ---- output-side: cmd interactive-mode banner (the closed set) ------------
-// Fingerprint (measured on this machine, non-tty pipeline: banner + exit 0):
-//   the FIRST TWO NON-EMPTY lines of the output start with
-//   "Microsoft Windows [" and "(c) Microsoft". GBK mojibake decodes both
-//   ASCII prefixes intact. The `X:\cwd>` prompt line is NOT part of the
-//   fingerprint (present with pipe-stdin, absent with /dev/null stdin).
-//   `cmd /c ver`'s normal output (the bare version line alone) does NOT
-//   match, so the harmless form is never flagged.
-// Whole commands land here after they ran -- every shape that actually
-// started interactive cmd is covered with no grammar scanning at all; a
-// mis-detection can only add one advisory text (nothing is rewritten).
-// Note `cmd` with NO arguments is natively interactive in both conversion
-// states: the banner is then the true outcome, and the advisory is still
-// factually true (the intended payload never ran).
-
-const CMD_HINT_MARKER = "[env-guard]";
-const SYSTEM_HINT_MARKER = "[env-guard:windows-paths]";
-
-export function pickCmdHint(noConv: boolean): string {
-  return noConv
-    ? `${CMD_HINT_MARKER} cmd printed its interactive-mode banner; the command never ran (exit 0 is NOT success). In this environment write cmd /c <command>.`
-    : `${CMD_HINT_MARKER} cmd printed its interactive-mode banner; the command never ran (exit 0 is NOT success). In this environment write cmd //c <command>.`;
-}
-
-export function detectCmdBanner(text: string): boolean {
-  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
-  return lines.length >= 2 && lines[0]!.startsWith("Microsoft Windows [") && lines[1]!.startsWith("(c) Microsoft");
-}
-
-function resultText(content: unknown): string | null {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return null;
-  const texts = content
-    .filter((x) => !!x && typeof x === "object" && (x as any).type === "text" && typeof (x as any).text === "string")
-    .map((x) => (x as any).text as string);
-  return texts.length ? texts.join("\n") : null;
-}
-
-// ---- output-side: envp / native-flag system hint ---------------------------
-// Command-position prefix-assignment path values used to be rewritten by the
-// scanner; the repair is now one ASCII line of advice (a hint has no rewrite
-// failure mode):
-//   write VAR=C:/x  (VAR=/c/x is resolved as drive-relative C:\c\... by the
-//                    native exe, silent, exit 0)
-//   single-slash flags for native executables (cmd /c, taskkill /IM) --
-//   ON THIS MACHINE ONLY: with conversion enabled (no MSYS_NO_PATHCONV)
-//   //c IS the spelling that works and /c is what breaks, so the hint is
-//   injected only when the probe has measured the layer as off; uncertain
-//   -> no hint (fail-safe; the banner backstop still reports the truth).
-// Injected at ctx.session.hook("context") (+ "compaction"/"generate", the
-// three model-request paths; host rebuilds event.system per request, so the
-// identical text re-push per request is prompt-cache friendly; the marker
-// guards duplicates inside one event).
-
-interface EventLike {
-  system?: Array<{ type?: unknown; text?: unknown }>;
-}
-
-function sessionHint(): string {
-  return `${SYSTEM_HINT_MARKER} env-guard (Windows): write prefix-assignment path values in Windows form (VAR=C:/x - VAR=/c/x silently resolves to C:/c/x in native executables). Use single-slash flags for native executables (cmd /c, taskkill /IM).`;
-}
-
-// The conversion state is measured askew-free: the DETECTED bash (same exe
-// oc's v2.2.5 spawn resolves to -- measured) answers the presence probe.
-// The result is computed once; any failure/uncertainty returns false and the
-// hint is never pushed.
-let envpHintAllowed: boolean | undefined;
-
-export function envpHintGate(): boolean {
-  if (envpHintAllowed === undefined) {
-    const bash = findBash();
-    envpHintAllowed = !!bash && verifyMsysBash(bash) && probeNoPathConv(bash);
-  }
-  return envpHintAllowed;
-}
-
-function pushSystemHint(event: EventLike): void {
-  if (!Array.isArray(event.system)) return;
-  if (event.system.some((p) => p && typeof p === "object" && typeof p.text === "string" && (p.text as string).includes(SYSTEM_HINT_MARKER))) return;
-  try { event.system.push({ type: "text", text: sessionHint() }); } catch { /* hint must never fail a request */ }
 }
 
 // ---- temp forms (closed set): one list feeds every surface ----------------
@@ -431,7 +304,6 @@ export function splitTempPrefix(pattern: string): { dir: string; rest: string; m
 //   glob.tempMount / glob.tempVar
 //   patch.tempMount / patch.tempVar / patch.other
 //   shell.workdir.tempMount / shell.workdir.tempVar / shell.workdir.other
-//   shell.cmdBanner (output-side banner advisory; one key, no variants)
 // Historical keys (`shell.cmdFlag`, `shell.envPath`, `path.temp`, ...) are
 // never renamed: adoptCounts keeps whatever an existing store holds.
 // Storage: ctx.storage (the host's official plugin-scoped durable JSON,
@@ -450,8 +322,7 @@ type FixKey =
   | `patch.${TempMechanism}`
   | "patch.other"
   | `shell.workdir.${TempMechanism}`
-  | "shell.workdir.other"
-  | "shell.cmdBanner";
+  | "shell.workdir.other";
 
 interface Stats {
   schema: 1;
@@ -545,29 +416,12 @@ function bumpFix(key: FixKey): void {
 //     `path`, `patch.patchText` (paths live in its directive lines), and a
 //     `glob.pattern` whose temp prefix becomes `path`. The host resolves
 //     these paths itself (no MSYS mapping), so the rewrite belongs there.
-//   ctx.tool.hook("execute.after")   -> event.result for the `shell` tool:
-//     content is what the model sees (the host re-reads the mutated event
-//     after the hook). Banner advisory goes here; a thrown error in this
-//     hook is a host-level defect, so every branch is typeof-guarded and
-//     the text append is try-wrapped -- the advisory can add text and
-//     nothing else.
 //   ctx.shell.hook("create.before")  -> event.command / event.cwd;
 //     `command` is NEVER rewritten (no scanner any more); only `cwd` (the
-//     unresolved workdir) and the conversion-state bookkeeping for the
-//     advisory wording. `shell` names the executable it will spawn, so both
-//     the workdir rewrite and the probe are gated on that shell being a
-//     verified MSYS bash.
-//   ctx.session.hook("context"|"compaction"|"generate") -> event.system:
-//     the envp flag/Windows-value hint (see the hint section above).
+//     unresolved workdir). `shell` names the executable it will spawn, so
+//     the workdir rewrite is gated on that shell being a verified MSYS bash.
 
 const PATH_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
-const REQUEST_HOOKS = ["context", "compaction", "generate"] as const;
-
-// The conversion verdict of the shell that actually ran the command: set by
-// every verified spawn in create.before (cached per executable), read by the
-// banner advisory in execute.after. A single slot is enough: a shell call is
-// spawned right after its own create.before fires.
-let spawnConvOff = false;
 
 export default define({
   id: "env.guard",
@@ -601,12 +455,6 @@ export default define({
       stats = { schema: 1, since: new Date().toISOString(), toolCalls: {}, fixes: {} };
       statsBaseline = statsSnapshot();
       saveStats = null;
-    }
-
-    for (const name of REQUEST_HOOKS) {
-      await ctx.session.hook(name, (event) => {
-        if (envpHintGate()) pushSystemHint(event as EventLike);
-      });
     }
 
     await ctx.tool.hook("execute.before", (event) => {
@@ -649,33 +497,6 @@ export default define({
       }
     });
 
-    // Banner backstop: the only catch-all. Runs after the fact; a
-    // mis-detection can only append one advisory text part.
-    await ctx.tool.hook("execute.after", (event) => {
-      // Every branch outside the measured contract chooses the pre-plugin
-      // status quo: no change, no throw (a TypeError here is a host defect).
-      if (typeof event.tool !== "string" || event.tool.toLowerCase() !== "shell") return;
-      const ev = event as unknown as {
-        status?: unknown;
-        result?: { content?: unknown; metadata?: Record<string, unknown> } | null | undefined;
-      };
-      if (ev.status !== "completed" || !ev.result || typeof ev.result !== "object") return;
-      const meta = ev.result.metadata;
-      // The banner case is a SUCCESS result with exit 0 (measured). Anything
-      // else -- non-zero exit, timeout, signal -- is a real failure shape we
-      // must not annotate (and where a banner could also just mean stdout).
-      if (!meta || typeof meta !== "object" || meta.exit !== 0 || meta.timeout === true || typeof meta.signal === "string") return;
-      const text = resultText(ev.result.content);
-      if (!text || !detectCmdBanner(text)) return;
-      const content = Array.isArray(ev.result.content) ? ev.result.content : [{ type: "text", text }];
-      if (content.some((p) => !!p && typeof p === "object" && typeof (p as any).text === "string" && (p as any).text.includes(CMD_HINT_MARKER))) return;
-      const advisory = { type: "text", text: pickCmdHint(spawnConvOff) };
-      try {
-        ev.result = { ...ev.result, content: [...content, advisory] };
-      } catch { /* advisory must never fail the call */ }
-      bumpFix("shell.cmdBanner");
-    });
-
     await ctx.shell.hook("create.before", (event) => {
       // String contract guards: a non-string shell cannot be verified. No
       // host non-string has ever been measured on v2.2.5 -- defensive parity,
@@ -693,9 +514,6 @@ export default define({
           bumpFix(fix.mechanism ? `shell.workdir.${fix.mechanism}` : "shell.workdir.other");
         }
       }
-      // bookkeeping for the banner advisory's wording: this spawn's own
-      // conversion verdict (probe cached per executable)
-      spawnConvOff = pathConvDisabled(event.shell);
       // event.command is deliberately NOT touched: the input-side scanner
       // (cmdFlag/envp rewrites) was removed in the 2026-11-05 redesign --
       // docs/oc-env-guard-redesign.md.

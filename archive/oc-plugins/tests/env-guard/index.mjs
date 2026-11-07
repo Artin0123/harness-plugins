@@ -4,8 +4,7 @@
 //
 // Imports the plugin's TypeScript directly (type stripping, no build step)
 // and asserts: every closed-set temp-path guard on all four surfaces, the
-// output-side cmd-banner backstop, the envp system-hint gate, the hook
-// wiring, and the boundary cases that must NOT change anything.
+// hook wiring, and the boundary cases that must NOT change anything.
 // The input-side bash scanner was removed in the redesign: the shell hook's
 // `command` is pinned to NEVER be rewritten (single assertion covering the
 // whole former scanner surface).
@@ -156,29 +155,6 @@ check('P: temp anchor is a drive path equal to tmpdir()',
 if (bash) check('P: the detected bash is a verified MSYS shell', mod.isMsysShell(bash), bash);
 check('P: a non-shell executable is not MSYS', mod.isMsysShell(process.execPath) === false, process.execPath);
 
-// --- probe expansion semantics: MSYS_NO_PATHCONV is presence-based
-// (measured: "0", "" and "yes" all disable conversion, so the probe tests
-// set-at-all via ${VAR+x}, never the literal value) ---
-if (bash) {
-  const probeOut = (mutate) => {
-    const env = { ...process.env, BASH_ENV: '' };
-    mutate(env);
-    const r = spawnSync(bash, ['-c', 'printf %s "${MSYS_NO_PATHCONV+x}"'], {
-      env, timeout: 5000, windowsHide: true,
-    });
-    return r.stdout?.toString() ?? '';
-  };
-  check('P: probe x-expansion: unset is empty', probeOut((e) => { delete e.MSYS_NO_PATHCONV; }) === '', 'probe unset');
-  check('P: probe x-expansion: set-empty is x', probeOut((e) => { e.MSYS_NO_PATHCONV = ''; }) === 'x', 'probe set-empty');
-  check('P: probe x-expansion: set-0 is x', probeOut((e) => { e.MSYS_NO_PATHCONV = '0'; }) === 'x', 'probe set-0');
-  check('P: probe x-expansion: set-1 is x', probeOut((e) => { e.MSYS_NO_PATHCONV = '1'; }) === 'x', 'probe set-1');
-}
-
-// The battery pins BOTH gate directions on machine config, as before:
-// this machine's bashrc sets MSYS_NO_PATHCONV -> gateOn true.
-const gateOn = bash ? mod.pathConvDisabled(bash) : false;
-check('P: pathConvDisabled verdict is stable', (typeof gateOn) === 'boolean', String(gateOn));
-
 // --- no measured anchor -> inert (worker process, scrubbed environment) ---
 const noAnchor = JSON.parse(
   spawnSync(process.execPath, [selfPath, '--noanchor'], {
@@ -206,7 +182,6 @@ let unixHooks = 0;
 const linuxCtx = {
   tool: { hook: () => { unixHooks++; return Promise.resolve({ dispose: async () => {} }); } },
   shell: { hook: () => { unixHooks++; return Promise.resolve({ dispose: async () => {} }); } },
-  session: { hook: () => { unixHooks++; return Promise.resolve({ dispose: async () => {} }); } },
 };
 try {
   Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
@@ -221,25 +196,20 @@ check('P: non-win32 leaves the glob pattern alone', unixSplit === null, JSON.str
 check('P: non-win32 registers no hooks', unixHooks === 0, String(unixHooks));
 
 // ===========================================================================
-// hook wiring (fake ctx): three domains -- tool.execute.before (temp paths),
-// tool.execute.after (banner backstop), shell.create.before (workdir ONLY:
-// the redesign removes every command rewrite), session hooks (hint)
+// hook wiring (fake ctx): two domains -- tool.execute.before (temp paths),
+// shell.create.before (workdir ONLY: the redesign removes every command
+// rewrite)
 // ===========================================================================
 const hooks = {};
 const fakeCtx = {
   tool: { hook: (name, cb) => { (hooks['tool:' + name] ??= []).push(cb); return Promise.resolve({ dispose: async () => {} }); } },
   shell: { hook: (name, cb) => { (hooks['shell:' + name] ??= []).push(cb); return Promise.resolve({ dispose: async () => {} }); } },
-  session: { hook: (name, cb) => { (hooks['session:' + name] ??= []).push(cb); return Promise.resolve({ dispose: async () => {} }); } },
 };
 await mod.default.setup(fakeCtx);
 const toolBefore = hooks['tool:execute.before']?.[0];
-const toolAfter = hooks['tool:execute.after']?.[0];
 const shellBefore = hooks['shell:create.before']?.[0];
-const sessionCtx = hooks['session:context']?.[0];
 check('H: setup registers all hook names',
-  !!toolBefore && !!toolAfter && !!shellBefore &&
-  !!sessionCtx === true && !!(hooks['session:compaction']?.[0]) && !!(hooks['session:generate']?.[0]),
-  Object.keys(hooks).join(','));
+  !!toolBefore && !!shellBefore, Object.keys(hooks).join(','));
 
 // --- tool execute.before (temp paths) ---
 const evNoTool = { input: { path: '/tmp/x' } };
@@ -310,116 +280,6 @@ try { shellBefore(hxS); } catch { hxThrew = true; }
 check('H: numeric shell -> no throw, no bump, command untouched',
   !hxThrew && hxS.command === 'cmd //c ver' && hxS.cwd === '', JSON.stringify({ hxThrew, command: hxS.command }));
 
-// --- tool execute.after: cmd banner backstop ------------------------------
-// The fingerprint is measured on this machine (non-tty pipeline: banner +
-// exit 0). The advisory only appends a text part; nothing else may change.
-const BANNER = 'Microsoft Windows [Version 10.0.19045.7725]\n(c) Microsoft Corporation. All rights reserved.\n\nC:\\Proj>';
-const shellEv = (content, meta, tool = 'shell', status = 'completed') =>
-  ({ tool, status, result: { content, metadata: meta } });
-
-const b1 = shellEv([{ type: 'text', text: BANNER }], { exit: 0, truncated: false });
-toolAfter(b1);
-const b1parts = b1.result.content;
-check('A: banner detected -> advisory appended after the output',
-  b1parts.length === 2 && b1parts[1].text.includes('[env-guard] cmd') && b1parts[0].text === BANNER,
-  JSON.stringify(b1parts));
-check('A: advisory text is pure ASCII', /^[\x20-\x7E]*$/.test(b1parts[1].text), JSON.stringify(b1parts[1].text));
-
-// the advice reflects the spawn's own probe verdict (this machine: measured
-// OFF -> "cmd /c"; on a conversion-ON machine "//c")
-const wantSpelling = gateOn ? 'cmd /c <command>' : 'cmd //c <command>';
-check(`A: advisory spelling follows the spawn probe (${wantSpelling})`,
-  b1parts[1].text.includes(`write ${wantSpelling}`), JSON.stringify(b1parts[1].text));
-
-// fingerprint variants
-check('A: fingerprint: blank leading lines still match',
-  mod.detectCmdBanner('\n\n' + BANNER + 'more'), 'blank-prefixed banner');
-check('A: fingerprint: CRLF matches',
-  mod.detectCmdBanner('Microsoft Windows [10.0]\r\n(c) Microsoft Corp.\r\nC:\\>'), 'crlf banner');
-check('A: fingerprint: title bar tail after the banner line still matches',
-  mod.detectCmdBanner(BANNER.replace('10.0.19045.7725]', '10.0.19045.7725] - [other window]')), 'title tail');
-check('A: harmless single-line ver output not flagged',
-  mod.detectCmdBanner('Microsoft Windows [Version 10.0.19045.7725]') === false, 'single line');
-check('A: missing (c) line not flagged',
-  mod.detectCmdBanner('Microsoft Windows [10.0]\nsomething else') === false, 'no second line');
-check('A: GBK mojibake keeps the ASCII prefixes (fingerprint holds)',
-  mod.detectCmdBanner('Microsoft Windows [\ufffd\u672c\ufffd 10.0.19045.7725]\ufffd\n(c) Microsoft\ufffd\u53f8\ufffd\nC:\\>'), 'mojibake banner');
-
-const b2 = shellEv([{ type: 'text', text: BANNER }], { exit: 1, truncated: false });
-toolAfter(b2);
-check('A: non-zero exit -> untouched (real failure shape)',
-  b2.result.content.length === 1, JSON.stringify(b2.result));
-const b3 = shellEv([{ type: 'text', text: BANNER }], { timeout: true, exit: 0 });
-toolAfter(b3);
-check('A: timed-out result -> untouched', b3.result.content.length === 1, JSON.stringify(b3.result));
-const b4 = shellEv([{ type: 'text', text: BANNER }], { exit: 0, signal: 'SIGKILL' });
-toolAfter(b4);
-check('A: killed result -> untouched', b4.result.content.length === 1, JSON.stringify(b4.result));
-const b5 = shellEv([{ type: 'text', text: BANNER }], undefined, 'shell', 'error');
-toolAfter(b5);
-check('A: status error -> untouched', b5.result.content.length === 1, JSON.stringify(b5.result));
-const b6 = shellEv([{ type: 'text', text: BANNER }], undefined);
-toolAfter(b6);
-check('A: missing metadata -> untouched (contract guard)', b6.result.content.length === 1, JSON.stringify(b6.result));
-const b7 = shellEv([{ type: 'text', text: BANNER }], { exit: 0 }, 'read');
-toolAfter(b7);
-check('A: non-shell tool -> untouched', b7.result.content.length === 1, JSON.stringify(b7.result));
-const b8 = { tool: 42, status: 'completed', result: { content: [{ type: 'text', text: BANNER }], metadata: { exit: 0 } } };
-let b8throw = false;
-try { toolAfter(b8); } catch { b8throw = true; }
-check('A: missing tool name -> no throw, untouched',
-  !b8throw && b8.result.content.length === 1, JSON.stringify({ b8throw, content: b8.result.content.length }));
-const b9 = { status: 'completed', result: { content: [{ type: 'text', text: BANNER }], metadata: { exit: 0 } } };
-let b9throw = false;
-try { toolAfter(b9); } catch { b9throw = true; }
-check('A: no result shape -> no throw, untouched',
-  !b9throw && b9.result.content.length === 1, JSON.stringify({ b9throw, content: b9.result.content.length }));
-const b10 = shellEv([{ type: 'text', text: BANNER }, { type: 'text', text: '[env-guard] cmd already advised' }], { exit: 0 });
-toolAfter(b10);
-check('A: an existing [env-guard] part is not duplicated',
-  b10.result.content.length === 2, JSON.stringify(b10.result.content));
-const b11 = shellEv(BANNER /* plain string content */, { exit: 0 });
-toolAfter(b11);
-check('A: string content shape gets the advisory too',
-  b11.result.content.length === 2 && b11.result.content[1].type === 'text' && b11.result.content[0].text === BANNER,
-  JSON.stringify(b11.result.content));
-const b12 = shellEv([{ type: 'text', text: 'normal output' }], { exit: 0 });
-toolAfter(b12);
-check('A: normal output -> no change (the only allowed mutation is the advisory)',
-  b12.result.content.length === 1 &&
-  b12.result.content[0].text === 'normal output' &&
-  b12.result.metadata === b12.result.metadata, // reference unchanged: cheapest whole-object check
-  JSON.stringify(b12.result));
-
-// --- session hint ---------------------------------------------------------
-// Gated on the measured conversion state of the detected bash. On this
-// machine (MSYS_NO_PATHCONV set) the hint IS injected; on a conversion-ON
-// machine (or where the probe fails) it must not appear.
-const SYSTEM_HINT = '[env-guard:windows-paths]';
-const sysEv = { system: [{ type: 'text', text: 'existing part' }] };
-let hintThrew = false;
-try { sessionCtx(sysEv); } catch { hintThrew = true; }
-const parts = sysEv.system;
-if (gateOn) {
-  check('H: hint injected into system (gate ON machine)',
-    !hintThrew && parts.length === 2 && parts[1].text.includes(SYSTEM_HINT),
-    JSON.stringify(hintThrew || parts));
-  check('H: hint text is pure ASCII', /^[\x20-\x7E]*$/.test(parts[1].text), JSON.stringify(parts[1].text));
-} else {
-  check('H: no hint on a conversion-ON machine', parts.length === 1, JSON.stringify(parts));
-}
-{
-  const dupEv = { system: [{ type: 'text', text: SYSTEM_HINT + ' already present' }] };
-  let dupThrew = false;
-  try { sessionCtx(dupEv); } catch { dupThrew = true; }
-  check('H: marker prevents a duplicate hint in the same event',
-    !dupThrew && dupEv.system.length === 1, JSON.stringify(dupEv.system));
-}
-const noSysEv = { other: true };
-let noSysThrew = false;
-try { sessionCtx(noSysEv); } catch { noSysThrew = true; }
-check('H: session hook tolerates an event without system', !noSysThrew, String(noSysThrew));
-
 // ===========================================================================
 // usage telemetry: denominators post-gate, numerators per fix key
 // ===========================================================================
@@ -430,7 +290,6 @@ const mkStatsCtx = (saved, broken = false) => {
   const ctx = {
     tool: { hook: (name, cb) => { h['tool:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     shell: { hook: (name, cb) => { h['shell:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
-    session: { hook: (name, cb) => { h['session:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     storage: {
       get: async () => { if (broken) throw new Error('db down'); return current; },
       set: async (k, v) => { await new Promise((r) => setTimeout(r, 5)); if (broken) throw new Error('db down'); savedSets.push(v); current = v; },
@@ -443,8 +302,7 @@ const A = mkStatsCtx(undefined);
 const cleanupA = await mod.default.setup(A.ctx);
 const tA = A.h['tool:execute.before'];
 const sA = A.h['shell:create.before'];
-const aA = A.h['tool:execute.after'];
-check('S: setup registers all hooks', !!tA && !!sA && !!aA, Object.keys(A.h).join(','));
+check('S: setup registers all hooks', !!tA && !!sA, Object.keys(A.h).join(','));
 
 await tA({ tool: 'read', input: { path: '/tmp/x' } });
 await tA({ tool: 'read', input: { path: '$TEMP/x' } });
@@ -458,8 +316,6 @@ await sA({ shell: bash, cwd: '/tmp/sub', command: 'echo hi' }); // MSYS shell: b
 await sA({ shell: process.execPath, cwd: '/tmp/sub', command: 'cmd //c ver' }); // non-MSYS shell: skipped
 await sA({ shell: bash, cwd: '/tmp/sub', command: 'cmd //c ver' }); // command verbatim, denominator only
 await sA({ shell: bash, cwd: '$TEMP/sub', command: 'echo hi' }); // var-mechanism workdir
-await aA(shellEv([{ type: 'text', text: BANNER }], { exit: 0 })); // banner numerator
-await aA(shellEv([{ type: 'text', text: 'normal' }], { exit: 0 })); // no numerator
 
 const snapA = mod.statsSnapshot();
 check('S: denominators (read 3, glob 2, patch 2, bash 3)',
@@ -476,7 +332,6 @@ check('S: patch.tempMount numerator', snapA.fixes['patch.tempMount'] === 1, JSON
 check('S: shell.workdir.tempMount numerator (one per MSYS shell event)',
   snapA.fixes['shell.workdir.tempMount'] === 2, JSON.stringify(snapA.fixes));
 check('S: shell.workdir.tempVar numerator', snapA.fixes['shell.workdir.tempVar'] === 1, JSON.stringify(snapA.fixes));
-check('S: cmdBanner numerator', snapA.fixes['shell.cmdBanner'] === 1, JSON.stringify(snapA.fixes));
 check('S: commands are never rewritten -> no cmdFlag/envPath numerators any more',
   snapA.fixes['shell.cmdFlag'] === undefined && snapA.fixes['shell.envPath'] === undefined,
   JSON.stringify(snapA.fixes));
@@ -487,8 +342,7 @@ const persisted = savedSets[savedSets.length - 1] ?? null;
 check('S: persisted value matches the snapshot',
   persisted && persisted.schema === 1 &&
   persisted.toolCalls.read === snapA.toolCalls.read &&
-  persisted.fixes['path.tempMount'] === snapA.fixes['path.tempMount'] &&
-  persisted.fixes['shell.cmdBanner'] === 1,
+  persisted.fixes['path.tempMount'] === snapA.fixes['path.tempMount'],
   JSON.stringify(persisted));
 
 // reload adopts what was persisted (history survives a restart)
@@ -509,7 +363,6 @@ check('S: second run adds on top (read-modify-write)',
 const Z = mkStatsCtx(undefined);
 const cleanupZ = await mod.default.setup(Z.ctx);
 await Z.h['tool:execute.before']({ tool: 'read', input: { path: 'plain.txt' } });
-await Z.h['tool:execute.after'](shellEv([{ type: 'text', text: 'output' }], { exit: 0 }));
 await Z.h['shell:create.before']({ shell: bash, cwd: 'C:\\tmp', command: 'echo hi' });
 const snapZ = mod.statsSnapshot();
 check('S: no rewrite -> no numerator (only tool calls)',
@@ -555,7 +408,6 @@ const mkSharedCtx = () => {
   const ctx = {
     tool: { hook: (name, cb) => { h['tool:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     shell: { hook: (name, cb) => { h['shell:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
-    session: { hook: (name, cb) => { h['session:' + name] = cb; return Promise.resolve({ dispose: async () => {} }); } },
     storage: {
       get: async () => sharedStore.value,
       set: async (k, v) => { sharedStore.value = v; },
