@@ -281,9 +281,12 @@ Mount/Var 鍵），可直接對照。
 
 `id: env.guard` — **只影響 Windows**（MSYS/MINGW bash）。OpenCode 的執行層與 cmdc /
 pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數）的路徑都壞。**指令字串
-一律不改寫**：輸入側只保留「欄位語意被宿主 API 密封」的四個
-閉集合 temp surface；cmd 互動模式改由**輸出側**偵測（banner backstop）、envp 賦值
-改由一行系統提示導正——為什麼（誤修經濟學、閉集合判準）見 redesign 決策記錄：
+一律不改寫**：修復只保留「欄位語意被宿主 API 密封」的四個閉集合 temp surface。
+redesign（2026-11-05）落地時曾加兩個提示面（cmd banner 的輸出側 advisory、envp
+的系統提示），**2026-11-07 一併移除**：純靠 AI 判斷、跟從才生效的文字提示有機率
+失效、無法機械驗證，不在修復範圍；cmd banner 提示由 `docs/bash-vs-pwsh.md` §6.2
+的 bashrc `cmd()` 函式取代（argv 層機械改寫；函式尚未部署本機，部署前 banner 形
+是漏修臺）。取捨見 redesign 決策記錄：
 [`docs/oc-env-guard-redesign.md`](docs/oc-env-guard-redesign.md)；技術架構：
 [`docs/spec.md`](docs/spec.md)。
 
@@ -295,8 +298,6 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 | `glob` 的 `pattern` 內嵌路徑        | `pattern: "${TEMP}/*.txt"` 靜默回 0 筆（假陰性）                                                                                                                                                                                       | 只在**沒有另給 `path`** 時，把前綴 temp 目錄拆到 `path`、其餘留給 `pattern`；有給 `path` 就完全不動                                                                           |
 | `patch` 的 `patchText`              | `*** Add File: ${TEMP}/x` 在專案下建字面 `${TEMP}` 資料夾                                                                                                                                                                              | 只改寫 `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:` 這四種指令行；patch 內容（` `、`+`、`-` 開頭）一字不動。四種都實測過（含改名與刪除）        |
 | `shell` 的 `workdir`                | `workdir: /tmp` 直接失敗：`Working directory does not exist: C:\tmp`                                                                                                                                                                   | 同一個改寫（hook 收到的是未解析的原值 `event.cwd`）                                                                                                                           |
-| `shell` 的**輸出**（banner backstop） | 任何讓 cmd 進了互動模式的指令寫法——`cmd //c`（`MSYS_NO_PATHCONV` 吃掉轉換時）、wrapper 後（`timeout 10 cmd //c`）、引號 payload（`bash -c 'cmd //c'`）、反斜線續行、`time -p`、算術位移……——輸出是 banner＋版權聲明＋提示符、**exit 0**：指令根本沒跑，模型會把 banner 讀成指令成功 | **執行後**（`execute.after`）檢查成功結果（exit 0、非 timeout/signal）的前兩個非空行：`Microsoft Windows [`＋`(c) Microsoft` 指紋命中 → 附加 `[env-guard]` advisory：指令從未執行、exit 0 不是成功，並按該次 spawn 實測的轉換狀態建議 `cmd /c` 或 `cmd //c` 的寫法。輸入側零改寫——誤判的最壞結果是多一段文字，零執行破壞；截斷或指紋不完整就放行 |
-| **系統提示**（envp／native 旗標導正） | `VAR=/c/foo node …` 的賦值值原樣抵達 native exe，被當磁碟相對路徑解析成 `C:\c\foo`（靜默錯位、exit 0）；native 工具的單斜線旗標（`cmd /c`、`taskkill /IM`）則在轉換**開啟**的環境才會被改壞——兩側都是轉換層的問題，靜態修法是開放集合 | 實測 `MSYS_NO_PATHCONV` 存在時（gate ON），每輪模型請求注入一行純 ASCII 提示：前綴賦值的路徑值寫 Windows 形（`VAR=C:/x`）、native exe 用單斜線旗標（`cmd /c`、`taskkill /IM`）。探測失敗就不注入（inert） |
 
 **刻意不修**：`C:\tmp`（合法 Windows 路徑，原生寫入本來就成功）、`/c/...` 盤符路徑
 （OpenCode 工具層自己解析正確）、`nul` 重導向（bash 原生行為）、cmd 的非 ASCII 亂碼
@@ -307,16 +308,16 @@ pi 不同——凡是 host 自己解析（不經 MSYS 映射、不展開變數�
 原生 exe 的 POSIX 路徑參數（`python /tmp/x.py`——大聲失敗、可用 `cygpath -w` 自癒）、
 以及**所有要掃 bash 語法才知道修哪裡的形**——指令字串一律不改寫（輸入側改寫的
 取捨見 intro 與決策記錄）：
-真正進了互動 cmd 的由 banner backstop 事後接住；沒進去的都是工具回傳≡原生的
-大聲失敗（agent 看得到真原因）。完整臺帳（native 失敗與漏修兩類、逐條實測證據）
-見 spec〈刻意不修與漏修的分界〉。
+沒進互動模式的都是工具回傳≡原生的大聲失敗（agent 看得到真原因）；真進互動
+cmd 的 banner 形在 bashrc `cmd()` 函式部署前是漏修臺。完整臺帳（native 失敗與
+漏修兩類、逐條實測證據）見 spec〈刻意不修與漏修的分界〉。
 
 **只能靠「寫對」的形**（插件不修或不該修；唯一改善途徑是改寫法——完整表在
 spec〈只能靠「寫對」的形〉）：
 
 - 原生工具的旗標：**gate ON（`MSYS_NO_PATHCONV` 有設）時寫單斜線**
   `taskkill /IM x`；`//IM` 是給「轉換開啟」環境的寫法（實測本機 `//IM` 無效、
-  `/IM` 可用）。banner advisory 會告訴你本環境該用 `cmd /c` 還是 `cmd //c`。
+  `/IM` 可用）。
 - 給原生 exe 的路徑用 Windows 形式（`python C:/x.py`）或先 `cygpath -w`。
 - envp 前綴值直接寫盤符形式（`A=C:/x`）；重導向／`env -u` 選項放到指令後面。
 - 指令字串裡成對反斜線被 transport 折一層（oc live 2026-11-04 量到 2→1、4→2）
@@ -344,11 +345,11 @@ spec〈只能靠「寫對」的形〉）：
 | `glob.tempMount` / `glob.tempVar` | glob pattern 前綴：同一組機制 | 上列兩族 |
 | `patch.tempMount` / `patch.tempVar` | patch 指令行：同一組機制 | 上列兩族 |
 | `shell.workdir.tempMount` / `shell.workdir.tempVar` | shell `workdir`：同一組機制 | 上列兩族 |
-| `shell.cmdBanner` | cmd 互動 banner（輸出側偵測） | 單一故障點：成功輸出＋雙行 banner 指紋，一鍵 |
 
 **已退役的歷史鍵**：`shell.cmdFlag`（cmd `//c`→`/c` 輸入側改寫）與
 `shell.envPath`（envp 賦值值改寫）隨 2026-11-05 redesign 移除——舊統計檔裡的
-歷史計數由 `adoptCounts` 原樣保留、不改名；cmd 形的命中現在走 `shell.cmdBanner`。
+歷史計數由 `adoptCounts` 原樣保留、不改名；`shell.cmdBanner` 隨 2026-11-07 的
+提示面移除而停產（cmd 形由 bashrc `cmd()` 函式取代，部署前是漏修臺）。
 
 `path.other`／`patch.other`／`shell.workdir.other` 是可見的 fallback（glob split
 只回 temp 命中，沒有 `.other`）：未來新增了不屬於 temp 族的改寫，會落在對應的

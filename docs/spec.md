@@ -5,8 +5,10 @@
 （原生執行優先、修復審查清單、驗證紀律）見 [`AGENTS.md`](../AGENTS.md)，此處不重複。
 
 三個 host 各自實作：cmdc（封存）保留同源的輸入側 bash 掃描器；pi 與 oc 都已
-**整體移除指令字串的輸入側掃描改寫**，改為輸出側偵測——理由見 pi 版的
-〈redesign 2026-11-04〉小節與 `docs/oc-env-guard-redesign.md`；現行機制：
+**整體移除指令字串的輸入側掃描改寫**——理由見 pi 版的
+〈redesign 2026-11-04〉小節與 `docs/oc-env-guard-redesign.md`；oc 在 2026-11-07
+進一步移除兩個提示面（cmd banner advisory、envp 系統提示詞），理由與取代方案見
+`docs/oc-env-guard-redesign.md`〈2026-11-07：提示面移除〉。現行機制：
 pi 見〈pi 版：機制〉、oc 見〈oc 版：接線與閘門〉。但**每一條修復的「適用性」是在本 host 重新量過才留**：同一顆 bash 在不同 host 的
 執行層下，同一個病理可能存在、也可能被 host 自己的層攔掉（例：`/c/...` 在 pi
 由 host 自己的解析層正規化、在 OpenCode 由工具層處理；`nul` 重導向是 bash 原生
@@ -84,12 +86,13 @@ pi bash 結果形狀（實讀 `dist/core/tools/bash.js`）：`content:[{type:"te
 **刻意不修（原生行為或模型自身錯誤，讓它壞）：**
 
 > pi 與 oc 都已移除輸入側掃描（理由見 pi 版 redesign 小節；oc 的調整見
-> `docs/oc-env-guard-redesign.md`）。**下列條目只記 bash 原生行為與 host 實測**
-> ——條目只記 bash 原生行為與 host 實測。cmd 形的現行處置＝輸出側
-> banner backstop：凡實際進入互動 banner 的形（wrapper／payload／續行／
-> 重導向前綴／time／算術等邊界形）一律不改寫輸入、命中即附加 advisory；
-> 輸出被截斷或指紋不完整則漏過；cmd 以外的 native exe 旗標與 envp 賦值不在
-> 覆蓋範圍（oc 以一行系統提示導正 envp 值寫法，見 README）。
+> `docs/oc-env-guard-redesign.md`）。**下列條目只記 bash 原生行為與 host 實測**。
+> cmd 形：pi 的現行處置＝輸出側 banner backstop（凡實際進入互動 banner 的形
+> ——wrapper／payload／續行／重導向前綴／time／算術等邊界形——不改寫輸入、
+> 命中即附加 advisory；輸出被截斷或指紋不完整則漏過）；oc 已把這個提示面
+> 移除（2026-11-07，純靠 AI 跟從的文字修復不在考慮範圍，理由與取代方案見
+> redesign 文件）。cmd 以外的 native exe 旗標與 envp 賦值兩 host 都屬漏修臺
+> （pi 曾以一行系統提示補貼 envp 值寫法；oc 不採用任何提示面）。
 
 - `C:\tmp`——原生寫入會成功。
 - **MSYS 盤符路徑 `/c/...`**——pi 的檔案工具解析層內建 `normalizeWindowsShellPath`
@@ -118,14 +121,16 @@ pi bash 結果形狀（實讀 `dist/core/tools/bash.js`）：`content:[{type:"te
   exit 127，兩種轉換狀態下逐位元相同（實測）。所以沒有環境故障點——改寫它
   不是修環境層，而是插一個空格把一個詞拆成兩個＝替模型改錯字。附帶量測更正：
   banner 是**轉換開啟**時 `/c` 被轉成 `C:/` 的病理；轉換關閉（gate ON）下
-  `cmd /c ver` 實測就是直接跑 `ver`——兩個失效形態不會同時發生，所以
-  backstop 偵測的是 banner、建議的是 gate ON 時的 `/c` 寫法（見 redesign 小節）。
+  `cmd /c ver` 實測就是直接跑 `ver`——兩個失效形態不會同時發生，所以 pi 的
+  backstop 偵測的是 banner、建議的是 gate ON 時的 `/c` 寫法（見 redesign 小節
+  ；oc 提示面已移除，2026-11-07）。
 - exec/command/builtin 後的賦值形（`command X=/c/x node`、`exec X=/c/x …`、
   `builtin X=/c/x …`）——這些詞後接的是參數：bash 把 `X=/c/x` 當指令名跑、
   原生就大聲失敗（實測 127／127／1、兩種轉換狀態同訊息）＝回傳≡原生，不修
   。`env X=/c/x node` 不同：env 是 POSIX 外部程式，X= 參數跨
   msys→native 邊界（實測原生在轉換開啟時轉 `C:/x`）——轉換關閉（gate ON）時
-  值原樣抵達＝靜默錯位，屬漏修臺，由系統提示教 `VAR=C:/x` 寫法（不修輸入）。
+  值原樣抵達＝靜默錯位，屬漏修臺，值寫法只能由 agent 自己寫對 `VAR=C:/x`
+  （pi 曾以系統提示補貼；oc 不採用——純靠 AI 跟從的修復有機率失效，2026-11-07 移除）。
 - **引號詞裡的偽賦值形（`A=/c/x "B=/c/y" node`）**——bash 的賦值前綴判定在
   quote removal 之前，引號詞是**指令字**不是前綴（實測 `B=/c/y: No such file
   or directory`、127）＝原生失敗，不修。
@@ -183,8 +188,9 @@ pi bash 結果形狀（實讀 `dist/core/tools/bash.js`）：`content:[{type:"te
 每列的「實測」都是在這台機器上兩種轉換狀態各跑一次得到的；bash 原生行為與 host
 實測仍然有效。現行外掛不再改寫指令字串（理由見 redesign 小節）：輸入側改寫只剩
 四個閉集合 temp surface（`path`／`glob` 前綴／`patch` 指令行／shell `workdir`
-，欄位語意被宿主 API 密封），cmd 形由 banner backstop 接住——表中「插件該怎麼
-寫」欄因此是 agent 唯一能動的改良途徑，比以前更重要。
+，欄位語意被宿主 API 密封）；提示面（banner advisory／系統提示詞）oc 已於
+2026-11-07 移除、pi 仍在——表中「插件該怎麼寫」欄因此是 agent 唯一能動的
+改良途徑，比以前更重要。
 
 **A. 刻意不修（回傳≡原生：原生就壞，或 host 已經處理）**
 
@@ -217,7 +223,7 @@ pi bash 結果形狀（實讀 `dist/core/tools/bash.js`）：`content:[{type:"te
 | envp 殘餘值形：引號值 `A="/c/x"`、根相對 `A=/usr/x`、清單 `A=/c/x:/d/y`、含 `\` 的值、動態頭 `A=$(echo /c/x)`、緊貼 `VAR=/c$(…)`、`env -u V X=/c/…`、`A=/c/x 2>&1 cmd` | 整值或參數語意靜態看不到（詳見〈envp 殘餘形〉） | 值直接寫盤符形式 `A=C:/x`；重導向／選項放到指令後面 |
 | 函式名與其他 msys 程式（`A=/c/x git …`、`A=/c/x f`）的混合邊界 | 開放集合；原生「讀值」與「spawn 後代」兩側行為相反 | 需要轉換就直接寫 `C:/…` |
 | `function f { … cmd //c …; }`（`function` 名稱槽後的本體） | 指令字串不重寫（redesign 判準）；未來若重開輸入側改寫，名稱槽與本體的判定要完整函式文法＝開放集合 | 用 `f() { …; }` 形式 |
-| ANSI-C 指令字：`$'cmd' //c ver` | `$'...'` 的內容要 ANSI-C 解碼後才是指令名（`$'cmd'` → cmd，實測 native 跑 ver、轉換關閉＝banner）——改寫位置需完整解碼語意才能精確判定，不重寫；真進互動模式的由 banner 偵測接住 | 直接寫 `cmd //c …` |
+| ANSI-C 指令字：`$'cmd' //c ver` | `$'...'` 的內容要 ANSI-C 解碼後才是指令名（`$'cmd'` → cmd，實測 native 跑 ver、轉換關閉＝banner）——改寫位置需完整解碼語意才能精確判定，不重寫；真進互動模式的 pi 由 banner 偵測接住（oc 提示面已移除） | 直接寫 `cmd //c …` |
 | `coproc cmd //c ver` | `cmd` 落在 coproc 的參數位置；且 Windows 上 coproc 的管道行為本身也不穩定（實測錯誤訊息亂碼且與 native 不同）——為零頻率保留字加掃描狀態不值得 | 不要把 coproc 與 cmd 混用 |
 | 重導向**前綴**後的 cmd：`> log cmd //c ver` | 這是合法 bash（重導向可前置，`cmd` 真的執行）；實測轉換關閉＝banner、native 跑 ver。靜態修法要追「本 simple command 是否已有指令字」（`echo x > log cmd //c` 的 cmd 是 echo 的參數）＝開放集合 | 重導向寫在指令後面：`cmd //c ver > log` |
 | 重導向**前綴**後的 envp 賦值：`> log A=/c/x node` | 同上；實測 native 值轉成 `C:/x`（寫進 log 的 `process.env.A`），插件不改寫＝落回 `C:\c\x` 的靜默錯位 | 重導向寫在後面：`A=/c/x node > log` |
@@ -237,14 +243,15 @@ pi bash 結果形狀（實讀 `dist/core/tools/bash.js`）：`content:[{type:"te
   注入 `chcp 65001` 實測非確定性（同命令有時 UTF-8 有時仍 GBK）且會把內建訊息
   切英文；治本在 host 的解碼層（權限外）——如實記錄並回報，不在自己的層打補丁
   ；亂碼本身是可見訊號，模型可自矯正（改用 bash 原生工具）。
-- **envp 前綴賦值的插件改寫不存在**（redesign，理由與替代見 redesign 小節）：
-  值寫法由一行系統提示導正（gate ON 時注入 `VAR=C:/x`、native exe 單斜線旗標）；
-  殘餘形仍屬漏修臺（下條）。
+- **envp 前綴賦值的插件改寫不存在**（redesign；oc 連系統提示也於 2026-11-07
+  移除——純靠 AI 跟從的修復有機率失效，理由見 redesign 文件）：值寫法只能由
+  agent 自己寫對（`VAR=C:/x`、native exe 單斜線旗標）；pi 仍以一行系統提示
+  補貼；殘餘形仍屬漏修臺（下條）。
 - **envp 殘餘形**（插件不改寫）——根相對路徑值、引號開頭值、清單值
   、含 `\` 的值、`export X=/c/…`（內建、argv 位置）、env 的選項交錯形（
   `env -u V X=/c/… node`——`-u` 之後的詞在參數位置；不帶選項的 `env X=/c/… node`
   同在邊界上：env 是 POSIX 外部程式、X= 參數跨 msys→native 邊界，實測原生
-  轉換 `C:/x`，gate ON 下值原地抵達＝靜默錯位，教由系統提示處理）、重導向交錯形
+  轉換 `C:/x`，gate ON 下值原地抵達＝靜默錯位，agent 該自己寫 `A=C:/x`）、重導向交錯形
   （`A=/c/x > log node`）、緊貼形靜態前綴止於盤符（`VAR=/c$(…)`）、
   **動態值頭**（`A=$(echo /c/x) node`、
   ``A=`echo /c/x` node``——實測：原生（轉換開）`node` 收到 `C:/x`、本機（轉換
@@ -351,12 +358,22 @@ redesign 把問題拆成兩件事：
    結構上不存在——沒有改寫器，就沒有誤修器。pi 提議的窄 fast-path（僅行首
    `cmd //c` 一種輸入側改寫）**刻意不採**：它省的是一輪自癒，買回的是整個
    誤修類別。
-2. **開放集合改由輸出指紋接住**：cmd 互動 banner 是閉集合指紋（成功結果的前兩
-   個非空行），wrapper／引號 payload／續行／`time -p`／heredoc 邊角等所有語法
-   邊界形**同一時間結案**——偵測對象從「語法位置會不會踩雷」變成「事實上踩了
-   沒」。誤判的失效模式是多一段 advisory 文字、零執行破壞；review 的主要利器
-   （「你把對的改壞了」）在這個位置不存在。envp 前綴值改由 gate ON 時的一行
-   系統提示導正——文字建議沒有改寫失效模式。
+2. **開放集合不靠改寫、也不靠提示**：輸入側對語法邊界形（wrapper／引號
+   payload／續行／`time -p`／heredoc 邊角等）一律不修。redesign 當時曾把校準
+   落在兩個提示面上（cmd 互動 banner 的 `execute.after` advisory、gate ON 時
+   的一行 envp 系統提示），**這兩個提示面於 2026-11-07 整體移除**，理由如下。
+
+### 2026-11-07：提示面移除的理由
+
+- **純靠 AI 判斷、跟從才生效的修復不在考慮範圍**：系統提示詞引導、把建議文字
+  附加在終端輸出之後，效果依賴模型自覺跟從——模型可以不理會、可以漏看，效果
+  有機率失效、無法機械驗證。這類修復不是機制而是承諾，與通用判準「每項修復
+  對應具體故障點、且有可驗證的機制」相抵，一律移除，也禁止重加。
+- **cmd banner 提示由 `docs/bash-vs-pwsh.md` §6.2 的 bashrc `cmd()` 函式取代**：
+  該函式在同一個 argv 層做機械改寫（按 `MSYS_NO_PATHCONV` 存在與否定向，
+  `=1` 側 `//c`→`/c`、`=0` 側 `/c`→`//c`），閉集合規則、機制可驗證；函式
+  程式碼目前**尚未實際寫進本機 bashrc**，本記錄先按「已取代」處理——部署前
+  banner 形是漏修臺。
 
 留下的輸入側修復只剩「欄位語意被宿主 API 密封」的閉集合 temp surface
 （`path`／`glob` 前綴／`patch` 指令行／shell `workdir`）：`path` 永遠是路徑、
@@ -368,41 +385,26 @@ heredoc 規則、兩輪 live 對照）已隨之從本文件移除，證據在 gi
 
 ## oc 版：接線與閘門
 
-插件現在掛四個 hook，指令字串（`event.command`）一律不碰：
+插件現在掛兩個 hook，指令字串（`event.command`）一律不碰：
 
 - 路徑類（輸入側、閉集合）：`ctx.tool.hook("execute.before")` 改 `event.input`
   （`path`／`patchText` 的指令行／`glob` 的 `pattern` 前綴）——input 可就地改動、
   改動直達執行（v2.2.5 實測兩處改寫都落到 spawn 的指令行）。
-- **指令類（只讀）**：`ctx.shell.hook("create.before")` 做三件事：①身分
+- **指令類（只讀）**：`ctx.shell.hook("create.before")` 做兩件事：①身分
   驗證——`event.shell` 過 typeof 守門後以 `uname -s` 驗 MSYS 身分（按執行檔
   快取；v2.2.5 實測**無**非字串事件，typeof 是契約一致化：該 hook 拋 TypeError
   會弄壞 spawn 本身，契約外的分支一律選「外掛不存在時的原狀」）；②`event.cwd`
-  （未解析的 workdir 原值）的 temp 改寫；③該次 spawn 的轉換狀態探測＋快取，
-  供 banner advisory 措辭用。`event.command` **不改寫**——電池有一條單一斷言
-  釘著「hook 對 command 永不變」。
-- **輸出類（banner backstop）**：`ctx.tool.hook("execute.after")`——只對工具
-  `"shell"`、`status==="completed"`、`metadata.exit===0`、非 timeout／signal
-  的結果檢查 cmd 互動 banner 指紋（首兩個非空行 `Microsoft Windows [`＋
-  `(c) Microsoft`；提示符行不入指紋、`cmd /c ver` 單行不命中），命中就在
-  `result.content` 附加 `[env-guard]` advisory（宿主在 hook 後讀 mutate 過的
-  event 再返回——改動直達模型，`packages/core/src/tool.ts:158–173`；truncate
-  在 hook 之後跑，首部存活）。措辭用該次 spawn 從 `create.before` 探測到的
-  轉換狀態（gate ON → `cmd /c`、轉換開 → `cmd //c`）；spawn 未經
-  create.before 的狀態值沿用「轉換開啟」語義（提 `//c`，與 pi 的 probe 失敗
-  預設同）。輸出截斷或指紋不完整 → 放行。
-- **系統提示類（envp／native 旗標導正）**：`ctx.session.hook("context"／
-  "compaction"／"generate")` 在實測 `MSYS_NO_PATHCONV` 存在時 push 一行純
-  ASCII 提示（前綴賦值寫 `VAR=C:/x`、native exe 用單斜線旗標）。host 每次重建
-  `event.system`，逐請求重 push 是 prompt-cache 友善；marker 防同一 event 內
-  重疊。探測＝驗證過的 MSYS bash（`findBash()`，v2.2.5 實測 spawn 落點相同），
-  一次計算、失敗即永不注入（inert，不猜）。
+  （未解析的 workdir 原值）的 temp 改寫。`event.command` **不改寫**——電池有
+  一條單一斷言釘著「hook 對 command 永不變」。
+- **提示類 hook 已於 2026-11-07 全部移除並不再註冊**：`tool.execute.after`
+  （banner advisory）與 `ctx.session.hook("context"／"compaction"／
+  "generate")`（系統提示）都刪了——`MSYS_NO_PATHCONV` 探測與 per-shell
+  快取（只服務這兩個面的措辭／注入）隨之刪除。理由見前節〈2026-11-07：
+  提示面移除的理由〉。
 - temp 錨點問 bash 本身（`cygpath -w /tmp`）：`os.tmpdir()` 不是權威——本機對
   native 子行程 MSYS 已把 TEMP 轉成 Windows 路徑（實測），但定義 `/tmp` 的是
   shell 工具的 bash；`os.tmpdir()` 只在是真盤符路徑時當 fallback，無錨點 →
   改寫整體 inert（不猜 AppData 佈局）。
-- `MSYS_NO_PATHCONV` 探測（presence-based：`0`／空字串也算停用，實測——探測
-  驗「有設」（`${VAR+x}`）而非 `=1`；按 shell 快取）決定兩件事：banner
-  advisory 的措辭與系統提示的注入。
 - **閘門機制的精確版**（2026-11-03 停用外掛後重測）：`MSYS_NO_PATHCONV` 決定的
   不是「argv 一層、envp 另一層」的差異——它是**按次 spawn 查環境**：只要被
   spawn 的子行程環境裡帶著它（任意值，空字串也算），msys 對那次 spawn 的
@@ -430,9 +432,9 @@ heredoc 規則、兩輪 live 對照）已隨之從本文件移除，證據在 gi
 - `PATCH_PATH_LINE` 的 `[^\r\n]+?` 會抓到路徑行的行尾空白（實測：`*** Add File:
   /tmp/ws.txt ` 的路徑值帶尾隨空白）——host 解析會 trim、兩端收斂（審查時對照
   過），無需修。
-- 插件唯一就地改動的工具事件是 `event.input`／`event.cwd` 的欄位值與
-  `result.content` 的附加 text part，每個分支都 typeof 守門、附加動作
-  try-wrapped（`event.tool` 缺欄曾直接 TypeError 的問題已補守門，電池有釘）。
+- 插件唯一就地改動的工具事件是 `event.input`／`event.cwd` 的欄位值
+  （`result.content` 的附加 text part 隨提示面移除，2026-11-07），每個分支
+  都 typeof 守門（`event.tool` 缺欄曾直接 TypeError 的問題已補守門，電池有釘）。
 - 工具覆蓋面（v2.2.5，官方 v2 文件＋本機二進位交叉核對）：host 端解析路徑的
   內建工具＝read/write/edit/glob/grep（path）＋patch（patchText）＋shell
   （workdir），無 `list`/`ls` 工具。官方文件另列實驗性 `experimental_image_generate`
@@ -450,17 +452,18 @@ heredoc 規則、兩輪 live 對照）已隨之從本文件移除，證據在 gi
    （檔案工具 `path`、`patch` 指令行、`glob` 前綴、shell `workdir`）——`path`
    永遠是路徑、不會是別的東西，這些改寫在結構上不可能誤傷語法。這是 redesign
    後唯一的輸入側修復對象。
-2. **轉換層弄壞、但修復位置在 bash 語法裡 → 不改輸入，判定移到輸出／指示層**：
-   cmd 互動 banner 是閉集合輸出指紋 → `execute.after` backstop；envp 賦值 /
-   native exe 旗標的正確寫法 → 一行系統提示（gate ON 時注入）。指令字串裡的
-   關鍵字、分隔符、引號、`$( )`、`time/exec/command/env/builtin` 等語法位置
-   **一律不再掃描**——同樣的故障、但靜態修法是開放集合（見 redesign 小節）。
+2. **轉換層弄壞、但修復位置在 bash 語法裡 → 不改輸入、也不設提示補貼**：指令
+   字串裡的關鍵字、分隔符、引號、`$( )`、`time/exec/command/env/builtin` 等語法
+   位置**一律不再掃描**——同樣的故障、但靜態修法是開放集合（見 redesign 小節）
+   ；redesign 落地時曾把校準移到輸出／指示層（banner backstop、系統提示），
+   **2026-11-07 起這兩個提示補貼也一併移除**——純靠 AI 判斷、跟從才生效的
+   修復有機率失效，不在考慮範圍。
 3. **外部程式的 argv 佈局 → 不修**：`timeout 10 cmd //c`、`nice`、`xargs cmd //c`、
    `sudo cmd //c`。要修就得逐一建模「哪個參數才是被執行的指令」——那正是
-   AGENTS.md 禁止的「列舉所有可能工具」。這類形若真的進了互動 cmd，banner
-   backstop 會接住（cmd 本身）；cmd 以外仍留臺帳。
+   AGENTS.md 禁止的「列舉所有可能工具」。cmd 形在 bashrc `cmd()` 函式
+   （`docs/bash-vs-pwsh.md` §6.2，尚未部署本機）之后仍是漏修臺；cmd 以外留臺帳。
 4. **要執行才知道的 → 不修**：`$C //c`、alias、`eval`、`${TEMP:-/tmp}/x`——靜態
-   邊界外。cmd 形若進互動模式同樣由 backstop 接住；其餘 loud 原生失敗。
+   邊界外。其餘 loud 原生失敗。
 5. **有機頻率為零的語法 → 已由既有機制自然涵蓋的才加分支**：redesign 後語法
    位置零分支，這條判準只約束未來提案。
 
@@ -472,8 +475,8 @@ heredoc 規則、兩輪 live 對照）已隨之從本文件移除，證據在 gi
 `//`，其中只有 **2 條是真的要執行 cmd**——1 條在指令起始、1 條躲在外部包裝器
 `timeout 10` 後面；其餘 18 條都是資料（`echo cmd //c ver` 對照、heredoc／commit
 message／JSON 內文）。**有機出現次數**：引號指令名 0、變數指令名 0、全路徑
-`cmd.exe` 0——redesign 後這些形都不再有語法分支：真進互動 cmd 的由 backstop 接住
-，其餘是 loud 原生失敗。
+`cmd.exe` 0——redesign 後這些形都不再有語法分支：真進互動 cmd 的由 bashrc
+`cmd()` 函式處理（部署前是漏修臺），其餘 loud 原生失敗。
 
 **測量歸屬**：檔案工具 `/c/...` 的原生解析測於 v2.2.1，v2.2.5 只重測了 shell
 `workdir`；其餘每一列都在 v2.2.5 上重跑過。
@@ -494,11 +497,10 @@ message／JSON 內文）。**有機出現次數**：引號指令名 0、變數�
 | `glob.tempMount` / `glob.tempVar`                              | oc：glob pattern 前綴拆分                          | 同上兩族；前綴只能落在其中一族（沒有 `.other`，glob split 只回 temp 命中） |
 | `patch.tempMount` / `patch.tempVar` / `patch.other`            | oc：patch 指令行改寫                               | 同上；一次 patch 可同時 +1 兩個機制 |
 | `shell.workdir.tempMount` / `shell.workdir.tempVar` / `shell.workdir.other` | oc：shell `workdir` 改寫              | 同上 |
-| `shell.cmdBanner`                                              | 輸出側 cmd 互動 banner 偵測（pi 2026-11-04、oc 2026-11-05） | 單一故障點（成功輸出＋雙行 banner 指紋）：無 variant 合併問題 |
 
 `shell.cmdFlag`／`shell.envPath` 曾屬輸入側掃描器（redesign 移除；理由見 oc
-redesign 小節），舊統計檔歷史計數由 `adoptCounts` 保留；cmd 形與 envp 值的現行
-處置（`shell.cmdBanner`、系統提示）分別見〈oc 版：接線與閘門〉。**統計與改寫同
+redesign 小節），舊統計檔歷史計數由 `adoptCounts` 保留；`shell.cmdBanner`
+鍵隨提示面移除（2026-11-07），oc 版不再產生（pi 版同名鍵仍在）。**統計與改寫同
 源**：每個 key 與一段實際的改寫／偵測程式碼一一對應（觸發點＝該段程式碼）——
 統計能拆到「機制」粒度，是因為改寫端就照機制拆；拆不掉的地方不造新鍵。
 
@@ -516,7 +518,7 @@ redesign 小節），舊統計檔歷史計數由 `adoptCounts` 保留；cmd 形�
 
 **計數單位是「呼叫」不是「出現次數」**：分子以「一次工具呼叫／一次命中」為單位
 ——同一個 patch 內多個指令行只 +1 次掃描（每命中機制各 +1）。分母不受影響（本
-來就是呼叫次數）。`shell.cmdBanner` 在 banner 命中時對該則結果 +1。
+來就是呼叫次數）。
 
 - **分母** `toolCalls[tool]`：清單內工具每次呼叫 +1。gate 的邊界（2026-11-04
   重測、redesign 復核後）：非 win32 或 PATH 等找不著驗證過的 MSYS bash →
@@ -532,8 +534,8 @@ redesign 小節），舊統計檔歷史計數由 `adoptCounts` 保留；cmd 形�
   `pattern:"${TEMP}/*.txt"` → `glob.tempVar`——同一次 read/glob 的分母也各
   +1；非 MSYS shell、非清單工具不計）。這驗證了「同一機制合併、不同機制分開」
   在真實 host 的寫入路徑上成立，不只是 fake-ctx 電池。實測當時 cmdFlag／
-  envPath 尚在；redesign 後的新鍵 `shell.cmdBanner` 待 live 重驗
-  （`docs/oc-env-guard-redesign.md` §6）。
+  envPath 尚在；其後新增的 `shell.cmdBanner` 未及 live 重驗即隨提示面移除
+  （2026-11-07），現無待驗項。
 
 ### 儲存（各走官方機制）
 
@@ -587,9 +589,9 @@ redesign 小節），舊統計檔歷史計數由 `adoptCounts` 保留；cmd 形�
 ## oc 版：實測記錄（v2.2.5，一次乾淨對話；2026-11-03／04 量，外掛 0.1.6）
 
 > 量測當時外掛仍是掃描器版：`cmd //c` 諸列記錄的是**當時**輸入側改寫
-> 後的 spawn 行為，redesign 後 `cmd //c` 原樣抵達 bash、進互動模式時由
-> banner backstop 附加 advisory（live 重驗計畫：`docs/oc-env-guard-redesign.md`
-> §6）。temp／workdir 諸列行為不變（改寫位置與錨點未動）。
+> 後的 spawn 行為；現行版本 `cmd //c` 原樣抵達 bash、進互動模式（exit 0 靜默
+> ），banner advisory 已於 2026-11-07 移除（處置見 redesign 文件新節）。temp／
+> workdir 諸列行為不變（改寫位置與錨點未動）。
 
 模型的原始輸入（外掛在 `execute.before` 之前記到的原值）與最終落點：
 
@@ -676,16 +678,15 @@ import（`getAgentDir`）換成 stub、從系統暫存目錄的拋棄式副本�
 各自跑獨立 process（module 級快取會釘死情境）。
 
 涵蓋（env-guard）：每一條修復與刻意不修（釘死防回歸）、hook 接線（含 shell
-hook 的 typeof 契約守門——無實測故障點、釘的是契約）、banner 指紋（病理形
-一行／三行／含空行／無版本行、無害形 `cmd /c ver` 單行、背景結果）與
-`execute.after` 契約（非 shell、非 completed、非 exit 0、idempotency）、系統
-提示的 marker／重複防疊／探測失敗不注入、gate 的兩個方向（轉換開／關的機器
-都能跑同一份電池）、統計的分母 gate、各 fix key、persisted 往返與
-read-modify-write、畸形資料、壞 storage 韌性、並發 server 的 delta 合併／
-幂等 flush／合併後仍會遞增（2026-11-03 H6 修的釘樁，兩份拋棄式 module 副本
-共用一個 fake store 模擬兩進程）、pi 首寫不雙計（2026-11-04：全新 process＋
-空 agent 目錄的 worker）。輸入側移除由「`event.command` 永不變」單一斷言釘住
-——沒有改寫器就沒有「改歪」可逐形釘樁，一條斷言守的是整個誤修類別。
+hook 的 typeof 契約守門——無實測故障點、釘的是契約）、統計的分母 gate、各
+fix key、persisted 往返與 read-modify-write、畸形資料、壞 storage 韌性、並發
+server 的 delta 合併／幂等 flush／合併後仍會遞增（2026-11-03 H6 修的釘樁，兩份
+拋棄式 module 副本共用一個 fake store 模擬兩進程）、pi 首寫不雙計（2026-11-04
+：全新 process＋空 agent 目錄的 worker）。banner 指紋／`execute.after` 契約／
+系統提示 marker／probe 語意的電池段已連同源程式一起移除（2026-11-07 提示面
+移除，電池現 110 條）。輸入側移除由「`event.command` 永不變」單一斷言釘住
+——沒有改寫器就沒有「改歪」可逐形釘樁，一條斷言守的是整個誤修類別；提示面
+移除同理，接線斷言只釘「仍註冊的兩個 hook」。
 
 執行方式見 README 的〈開發〉。
 
