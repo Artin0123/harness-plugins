@@ -4,9 +4,7 @@
 
 ---
 
-## 核心架構演進：全面轉向 PWSH
-
-> **專案重大轉向**：Windows 環境下**已全面改用 PowerShell (pwsh)，不再使用 Bash (git-bash)**。
+## 核心架構演進：Windows 環境優先使用 PWSH
 
 ### 為什麼不用 Bash？
 先前本專案曾針對各 Harness 維護複雜的 `env-guard`，試圖修復 Git Bash / MSYS 在 Windows 執行層下的環境轉換病理（如 `MSYS_NO_PATHCONV` 引起的路徑破壞、`/tmp` 錨點錯位、`cmd //c` 互動橫幅偽裝等）。
@@ -25,22 +23,13 @@
 ### native-powershell (pi-extensions)
 
 - **解決問題**：pi 內建的 powershell 工具在 Windows 上硬編碼注入引數（`-NoProfile`, `-NonInteractive`, `-ExecutionPolicy Bypass`），並強行在前綴插入 UTF-8 設定指令碼。這導致進程內省（例如 `(Get-Process -Id $PID).CommandLine`）看到被污染的引數，且使用者自訂的 profile 無法載入。
-- **作法**：覆蓋同名 `powershell` 工具，使用原生 `{pwsh} -Command <command>` 乾淨執行，完全不帶多餘參數。
-- **轉碼邊界（Transcoding）**：若探測到子行程宣告非 65001 輸出（如 Windows PowerShell 5.1 OEM Big5/GBK），在輸出管道以 `TextDecoder` 串流解碼並轉碼為 UTF-8 Buffer，避免 pi 的 `OutputAccumulator` 發生解碼錯誤。
-- **樹狀行程終止**：逾時或中止時呼叫 `taskkill.exe /F /T /PID` 乾淨刪除子進程樹。
+- **作法**：覆蓋同名 `powershell` 工具，以 `{pwsh} -NonInteractive -Command <command>` 執行；指令文字逐字透傳，不注入 `-NoProfile`、`-ExecutionPolicy Bypass`，也不前置任何 UTF-8 設定指令碼。不帶 Bypass 使機器原則（如 RemoteSigned）恢復效力，單次逃生口為 `$env:PSExecutionPolicyPreference='Bypass'`（動態重讀，不出現在命令列上）。保留 `-NonInteractive` 使主機提示 fail-fast：缺它時 `Get-Credential` 會開出真實桌面對話框並讓工具呼叫無界掛住（實測 >8 秒才被強殺；帶旗標約 540ms 內拒絕）。逾時或中止時比照內建語義以 `taskkill /F /T` 終止整個行程樹。
 
 ### chat-trim-context (oc-plugins)
 
 - **解決問題**：OpenCode 在 `chat` 模式下每次請求會帶入冗長的環境資訊（`<env>` 段落）與 worktree marker，浪費 context 空間。
 - **作法**：掛載 `context`、`compaction`、`generate` 鉤子，在發送前將 `<env>` 區塊與 worktree 雜訊清理乾淨。
 - **零依賴**：完全不依賴 `@opencode/plugin` 執行期套件，安裝目錄維持在 12 KB 左右。
-
-### 封存模組 (Archived)
-
-已全數移至 [`archive/`](archive/README.md)（歷史技術規格存檔於 [`docs/archive/spec-old.md`](docs/archive/spec-old.md)）：
-- `archive/cmdc-mods/`：Command Code 專用模組（`env-guard`, `system-prompt`, `disable-tools`）。因 Host 停止維護且全面轉用 PWSH 而封存。
-- `archive/pi-extensions/env-guard/`：pi 的 Bash temp 路徑與 cmd banner 偵測擴充。
-- `archive/oc-plugins/env-guard/`：OpenCode 的 Bash 閉集合 temp surface 修復插件。
 
 ---
 
@@ -59,6 +48,7 @@ pi install git:github.com/Artin0123/harness-plugins
 cp -r pi-extensions/native-powershell ~/.pi/agent/extensions/
 ```
 
+- 編碼前提：在實際解析出的 shell 之 $PROFILE 部署 `[console]::InputEncoding = [console]::OutputEncoding = UTF8`（pwsh 7 在 PATH 時為 `Documents\PowerShell\`；無 pwsh 時為 `Documents\WindowsPowerShell\`），否則非 ASCII 輸出為亂碼。
 - 確認載入：`pi list`
 - 移除：`pi remove git:github.com/Artin0123/harness-plugins`
 - 單次工作階段不載入擴充：`pi --no-extensions`
@@ -86,7 +76,7 @@ cp -r oc-plugins/chat-trim-context ~/.config/opencode/plugins/
 npm test
 
 # 分別執行各 Host 現行測試
-npm run test:pi      # pi-extensions/tests/native-powershell (15/15 checks passed)
+npm run test:pi      # pi-extensions/tests/native-powershell (14/14 checks passed)
 npm run test:oc      # oc-plugins/tests/packaging (11/11 checks passed)
 ```
 

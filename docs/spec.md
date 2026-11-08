@@ -43,14 +43,22 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 
 ### 修復機制
 1. **同名工具覆蓋**：以 `pi.registerTool(createPowerShellTool(process.cwd(), { operations }))` 覆蓋內建的 `powershell` 工具。
-2. **原生乾淨 Spawn**：直接以 `shell`（依序 probe 出的 `pwsh` 或 `powershell`）搭配 `["-Command", command]` 執行，完全不注入任何 `-NoProfile`、`-NonInteractive` 或前置指令碼。
-3. **編碼邊界轉碼（Transcoding Boundary）**：
-   - 探測目標 shell 的輸出字碼頁：`[Console]::OutputEncoding.CodePage`（快取結果）。
-   - 若為 `65001`（現代 pwsh 預設），直接 raw pass-through。
-   - 若為非 65001（例如 Windows PowerShell 5.1 繁體中文預設 950 / Big5 或簡體 936 / GBK），以 `TextDecoder` 進行 chunk-by-chunk 串流解碼，並重新編碼為 UTF-8 Buffer 傳遞給 pi 的 `OutputAccumulator`。
-   - 僅修復轉碼邊界（因為 pi 的解碼器只接受 BufferSource，字串會拋 TypeError），不更動指令文字與命令語意。
-4. **樹狀行程終止（Tree Kill）**：
-   - 當收到 abort 訊號或逾時（`timeout`）時，透過 `taskkill.exe /F /T /PID <child.pid>` 確保整個進程樹（包含 PowerShell 啟動的子進程）徹底清理，避免殘留孤兒進程。
+   - 為何必須整顆自帶 exec：pi 的 operations 介面是全有全無，工具只接受整顆自訂 `operations`；`spawnHook` 雖可改寫 `{command, cwd, env}`，但前綴注入發生在其下游的 `ops.exec` 內部，暴露不到；共用的 exec 引擎 `createLocalShellOperations` 非公開匯出。
+   - 連帶重實作的內建語義：cwd 存在性檢查、abort/逾時經 `taskkill.exe /F /T` 終止進程樹、訊號退出碼 `128+n`、env 轉發。這些是整組替換的對等義務，不是新增功能。
+2. **Spawn 形式**：以 probe 出的 `shell` 搭配 `["-NonInteractive", "-Command", command]` 執行，指令文字逐字透傳。各引數的取捨均經實測：
+   - **捨棄 `-NoProfile`**：`$PROFILE` 是編碼修復點，同時承載使用者的環境變數等需求（部署要求見「部署前提」）。
+   - **捨棄 `-ExecutionPolicy Bypass`**：機器原則（如 RemoteSigned）恢復效力。帶 Zone.Identifier 的腳本由 pi 預設的可執行變為 `SecurityError` 拒絕；單次逃生口 `$env:PSExecutionPolicyPreference='Bypass'` 為動態重讀（同一通指令內前置即生效），不出現在命令列上。
+   - **保留 `-NonInteractive`**：主機提示必須 fail-fast。缺它時：`Get-Credential` 開出真實桌面憑證對話框，工具呼叫無界掛住（實測 >8s 才被強殺；帶旗標約 540ms 拒絕）；`Read-Host` 靜默回空並續跑（stdin 為 ignore，EOF 被視為空行）；`PromptForChoice` 退化為底層 `MethodInvocationException`。
+   - **保留 `-Command` 參數傳輸**：stdin 傳輸（`pwsh -Command -`）雖能讓 CommandLine 零指令文本且 exit code 透傳，但跨行區塊被靜默吞掉（無輸出、exit 0），屬靜默失敗，不可採用。
+
+### 部署前提
+
+- **編碼修復點（$PROFILE）**：headless spawn 每次取得一顆全新隱藏 console（`CREATE_NO_WINDOW`），輸出字碼頁為系統 OEM 值（zh-CN 機器實測 936 / GBK）。A/B 實證：載入 profile → `[Console]::OutputEncoding.CodePage` 為 65001；`-NoProfile` → 936，同一句中文以 GBK 位元組輸出，在 pi 的 UTF-8 擷取層解碼為亂碼。
+- **部署決策**：模組不做 in-code 修復，`$PROFILE` 是唯一修復通道。部署只需單一處：getPowerShellConfig 的解析是決定論的（pwsh.exe 在 PATH 就選 7），profile 跟著實際解析結果走；具體部署行見 README 安裝指南。
+
+### 已知差異
+
+- **child pid 追蹤**：內建 exec 將每個 child pid 記入 `trackDetachedChildPid`，宿主在 SIGTERM/SIGHUP/崩潰清理時經 `killTrackedDetachedChildren` 批次擊殺。該登記簿與共用 exec 引擎同為 `utils/shell.js` 內部狀態（套件入口僅公開匯出 `getPowerShellConfig` / `getShellConfig`），mod 無法掛入；自建訊號處理則有雙重處理風險，依「寧可漏修，絕不誤修」不補。後果：pi 於指令執行中被訊號終止時，mod 啟動的行程樹不會被宿主清理（abort/逾時路徑不受影響，由 mod 自行 taskkill，taskkill 本身已補上 `detached: true` 以活過宿主死亡）。
 
 ---
 
@@ -86,11 +94,13 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 
 ## 現行模組測試
 - **`pi-extensions/tests/native-powershell/index.mjs`**：
-  驗證 pi powershell 工具的原生 spawn 行為（15 項檢查全綠）。
-  - 參數內省：確保 `(Get-Process -Id $PID).CommandLine` 只包含原生 `-Command`，絕無 host 注入的 `-NoProfile`、`-NonInteractive` 等雜訊。
-  - 離開碼透傳：確保 exit code（如 exit 2）原樣回傳。
-  - 轉碼邊界：Big5 / IBM437 串流轉碼為 UTF-8 Buffer，包含跨 chunk 切割與尾端截斷補字元（`\uFFFD`）驗證。
+  驗證 pi powershell 工具的原生 spawn 行為（14 項檢查全綠）。
+  - 參數內省：`(Get-Process -Id $PID).CommandLine` 呈現為 `-NonInteractive -Command <指令>`；無 host 注入的 `-NoProfile`、`-ExecutionPolicy`、UTF-8 前置碼，且與直接 spawn 的結果一致。
+  - 離開碼透傳：`exit 2` 原樣回傳。
+  - 非 ASCII 透傳：先探測 child 的 `[Console]::OutputEncoding.CodePage`；部署前提達成時驗 `漢字` 以 UTF-8 正確解碼，前提缺席時標記 SKIPPED 並註明 mod 逐字透傳不受影響（該項是部署前提探測，不是 mod 行為驗收）。
+  - 提示 fail-fast：`PromptForChoice`、`Get-Credential`、`Read-Host` 在 `-NonInteractive` 下快速拋錯而非掛住（每項含 10 秒防護且失敗彼此隔離）。
   - 超時與中止：逾時與 AbortSignal 觸發時執行 `taskkill` 樹狀終止。
+  - 原始碼不變式：無轉碼層機制；`$PROFILE` 部署要求與 `-NonInteractive` 保留理由均在檔頭如實記載。
 - **`oc-plugins/tests/packaging/index.mjs`**：
   OpenCode 插件的打包與零依賴體積防護檢查（11 項檢查全綠）。
   - 確保無 `dependencies` / `peerDependencies` / `optionalDependencies` 欄位（避免 npm 自動下載數百 MB 模組）。

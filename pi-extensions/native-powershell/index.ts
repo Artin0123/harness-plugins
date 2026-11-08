@@ -1,20 +1,17 @@
-// native-powershell — restore native PowerShell spawning for pi.
+// native-powershell — native PowerShell spawning for pi.
 // Failure point: the host hardcodes POWERSHELL_ARGS (-NoProfile, -NonInteractive,
-// -ExecutionPolicy Bypass) and prepends a UTF-8 command, so introspection such as
-// (Get-Process -Id $PID).CommandLine sees injected arguments and command text.
+// -ExecutionPolicy Bypass) and prepends a UTF-8 command, polluting introspection
+// such as (Get-Process -Id $PID).CommandLine and blocking user profiles.
 // Fix: override the built-in powershell tool by name and spawn exactly
-// {pwsh} -Command <command>, preserving the command verbatim with no extra args
-// or prefix. No encoding rewrite in-code: pi's capture layer decodes pipe bytes as
-// UTF-8, so output from a shell reporting a non-65001 code page would arrive garbled.
-// The single repair point is $PROFILE: every machine running this mod MUST deploy
-//   [console]::InputEncoding = [console]::OutputEncoding = [System.Text.Encoding]::UTF8
-// in its PowerShell profile — for both pwsh 7 (Documents\PowerShell\) and Windows
-// PowerShell 5.1 (Documents\WindowsPowerShell\). On headless spawns without a
-// console, the code page falls back to the system OEM page, so this cannot be relied
-// on from inherited console state alone; the profile line is the authoritative fix.
-// Without it the output decodes as mojibake; that is a known, accepted gap — the
-// in-code transcode layer was deliberately removed to keep this mod a verbatim
-// passthrough.
+//   {pwsh} -NonInteractive -Command <command>   (command text verbatim)
+// - -NoProfile and -ExecutionPolicy Bypass are dropped; no UTF-8 prefix injected.
+// - Encoding relies on the deployed $PROFILE (of the shell this mod resolves:
+//   pwsh 7 when present, else Windows PowerShell 5.1) carrying
+//   [console]::InputEncoding = [console]::OutputEncoding = UTF8; without it
+//   non-ASCII output is mojibake.
+// - -NonInteractive is kept so host prompts fail fast: without it Get-Credential
+//   opens a desktop dialog and hangs the tool call.
+// Rationale and measured evidence: docs/spec.md.
 
 import { createPowerShellTool, getPowerShellConfig } from "@earendil-works/pi-coding-agent";
 import { access as fsAccess } from "node:fs/promises";
@@ -27,7 +24,7 @@ const shellPath = (() => { try { return getPowerShellConfig().shell; } catch { r
 function killTree(pid: number | undefined): void {
   if (!pid) return;
   const exe = process.env.SystemRoot ? `${process.env.SystemRoot}\\System32\\taskkill.exe` : "taskkill.exe";
-  try { const child = spawn(exe, ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }); child.once("error", () => {}); } catch { /* best-effort tree kill */ }
+  try { const child = spawn(exe, ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", detached: true, windowsHide: true }); child.once("error", () => {}); } catch { /* best-effort tree kill */ }
 }
 
 export function createNativePowerShellOperations(shell: string) {
@@ -38,7 +35,7 @@ export function createNativePowerShellOperations(shell: string) {
     if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) throw new Error(`Invalid timeout: ${timeout}`);
     return await new Promise<{ exitCode: number }>((resolve, reject) => {
       let child;
-      try { child = spawn(shell, ["-Command", command], { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); }
+      try { child = spawn(shell, ["-NonInteractive", "-Command", command], { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); }
       catch (e) { reject(e); return; }
       const streams = [child.stdout, child.stderr];
       streams.forEach(stream => stream.on("data", (b: Buffer) => onData?.(b)));
