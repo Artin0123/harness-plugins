@@ -20,6 +20,7 @@
 ### 3. `pi-extensions/env-guard` (pi)
 - **封存狀態**：pi 已改由現行的 `pi-extensions/native-powershell` 提供原生 PWSH 執行，原有 Bash 下的 temp 路徑改寫與 cmd banner 偵測退役。
 - **技術精華**：記錄了探測 `cygpath -w /tmp` 錨點、識別互動式 cmd.exe Banner 指紋以及跨 process PID 的持久化統計機制。
+- **複測記錄（轉 PWSH 後）**：實測目前本地 pi 的 `resolveToCwd`，確認 temp 故障點仍在且非 bash 限定：`/tmp` 被解析成 `C:\tmp`；`$TEMP`／`$env:TEMP`／`%TEMP%` 不會被展開，而是原樣當成路徑的一部分，在專案根目錄底下建成以這些字串為名的資料夾（env-guard 原本的比對規則沒涵蓋 pwsh 常用的 `$env:TEMP` 寫法）。決定不復活這項修復：變數形式建出的資料夾就在專案內，掃 diff 就能發現，也不會破壞任何東西；`/tmp` 雖落在專案外的 `C:\tmp`，但 PWSH 語境下極少出現。至於 PWSH 下 `cmd //c` 的偽成功（banner + exit 0），屬模型語法錯誤而非環境轉換層破壞，依原生執行優先不介入；MSYS_NO_PATHCONV 探測天生依賴 bash，本環境不適用。
 
 ---
 
