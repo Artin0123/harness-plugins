@@ -40,35 +40,15 @@ try {
     const ac = new AbortController(); const abortPromise = run('Start-Sleep -Sec 30', { signal: ac.signal }); setTimeout(() => ac.abort(), 300);
     let abortMessage = ''; try { await Promise.race([abortPromise, new Promise((_, reject) => setTimeout(() => reject(new Error('test guard timeout')), 15000))]); } catch (e) { abortMessage = e.message; }
     check('abort rejects after aborting child tree', abortMessage === 'aborted');
-    check('output encoding probe detects UTF-8', await live.probeOutputCodePage(found) === 65001);
   } else {
-    for (const label of ['spawn introspection contains only native command arguments', 'native spawn introspection matches direct pwsh', 'exit code preserves PowerShell exit 2', 'pwsh 7 Unicode output is UTF-8', 'timeout rejects with timeout:1', 'abort rejects after aborting child tree', 'output encoding probe detects UTF-8']) check(`${label} (skip: no Windows pwsh)`, true);
+    for (const label of ['spawn introspection contains only native command arguments', 'native spawn introspection matches direct pwsh', 'exit code preserves PowerShell exit 2', 'pwsh 7 Unicode output is UTF-8', 'timeout rejects with timeout:1', 'abort rejects after aborting child tree']) check(`${label} (skip: no Windows pwsh)`, true);
   }
-  check('code page labels map Big5 and IBM437, unknown is null', mod.codePageLabel(950) === 'big5' && mod.codePageLabel(437) === 'ibm437' && mod.codePageLabel(99999) === null);
-  // Transcode stage regression: pi's OutputAccumulator owns its own UTF-8 decoder
-  // and passes data to TextDecoder.decode, which throws on plain strings (TypeError:
-  // must be ArrayBuffer/View). The stage must therefore deliver re-encoded UTF-8
-  // Buffers. Covered on all machines: the live pwsh path itself never reaches this
-  // branch here (pwsh 7 reports 65001), so this is the only coverage of it.
-  const hanziBig5 = Buffer.from([0xba, 0x7e, 0xa6, 0x72]);
-  const reference = new TextDecoder('big5').decode(hanziBig5);
-  check('transcode reference decodes big5 bytes', reference === '漢字');
-  const chunk = mod.transcodeChunk([new TextDecoder('big5'), new TextDecoder('big5')], 0, hanziBig5);
-  check('transcode stage yields UTF-8 Buffer (not a raw string)', Buffer.isBuffer(chunk) && chunk.toString('utf8') === reference);
-  const passthrough = mod.transcodeChunk(null, 0, hanziBig5);
-  check('passthrough stage leaves bytes untouched', Buffer.isBuffer(passthrough) && passthrough.equals(hanziBig5));
-  const splitDecoder = new TextDecoder('big5');
-  const pair = [splitDecoder, new TextDecoder('big5')];
-  const p1 = mod.transcodeChunk(pair, 0, hanziBig5.subarray(0, 1));
-  const p2 = mod.transcodeChunk(pair, 0, hanziBig5.subarray(1));
-  const p3 = mod.transcodeChunk(pair, 0, Buffer.alloc(0), true);
-  check('streaming split across chunk boundaries reconstructs full text',
-    !p1.length && Buffer.concat([p2, p3]).toString('utf8') === reference);
-  const loneDecoder = new TextDecoder('big5');
-  const lonePair = [loneDecoder, new TextDecoder('big5')];
-  const l1 = mod.transcodeChunk(lonePair, 0, hanziBig5.subarray(0, 1));
-  const l2 = mod.transcodeChunk(lonePair, 0, Buffer.alloc(0), true);
-  check('tail flush emits replacement char for truncated lead byte', !l1.length && l2.toString('utf8') === '\uFFFD');
+  // Transcode layer removal regression: this mod must stay a verbatim passthrough.
+  // Encoding correction lives in $PROFILE ([console]::InputEncoding/OutputEncoding =
+  // UTF8), so the source must contain no decoder/probe machinery and must document
+  // the profile prerequisite.
+  check('transcode layer removed from source', !/transcodeChunk|TextDecoder|probeOutputCodePage|codePageLabel/.test(src));
+  check('profile UTF-8 prerequisite documented in source', src.includes('[console]::InputEncoding') && src.includes('$PROFILE'));
 } catch (e) { check('test suite setup', false, String(e?.stack ?? e)); }
 finally { rmSync(scratch, { recursive: true, force: true }); }
 let failed = 0;
