@@ -6,24 +6,11 @@
 
 ---
 
-## 架構演進：全面轉向 PWSH 與 Bash 修復層封存
+## 架構現狀
 
-專案在 Windows 環境下**已經全面轉向使用原生 PowerShell（PWSH），不再使用 Bash（Git Bash / MSYS）**。
+Windows 環境全面轉向原生 PowerShell（PWSH），捨棄 Bash 環境修復層。轉向的理由、實測數據與封存原因都記在 [`README.md`](../README.md) 與 [`docs/bash-vs-pwsh.md`](bash-vs-pwsh.md)，此處不重複。
 
-### 轉向理由與實測依據（詳見 [`docs/bash-vs-pwsh.md`](bash-vs-pwsh.md)）
-
-先前專案針對各 Harness 開發了複雜的 `env-guard` 修復層，試圖修復 Git Bash / MSYS 在 Windows 執行層下的環境轉換問題。但經過完整的評測計分與實證：
-1. **可靠度差距巨大（PWSH −3.0 vs Bash −9.0 ~ −9.5）**：
-   - PWSH 的常見問題多半在語法剖析階段即拋出清晰明確的錯誤（ParserError），Agent 收到後能精準自癒。
-   - Bash 在 Windows 下存在大量**靜默失敗**（如 `exit 0` 的偽成功）與**額外傷害**（如 `> nul` 建立真實檔案、未加引號反斜線路徑建立怪檔、巢狀引號錯亂），這些純屬 Bash 剖析器行為，外掛與 `.bashrc` 在維持正確語法的前提下根本無法修復。
-2. **`MSYS_NO_PATHCONV` 兩難與開放集合陷阱**：
-   - 不設轉換（`=0`）會改壞 `/owner/repo` 這類資料參數；關閉轉換（`=1`）則破壞 POSIX 路徑與環境變數前綴。外掛若在輸入側以 Lexer 改寫指令字串，必須窮舉所有 Wrapper 與語法邊界，屬於開放集合；誤修代價遠大於漏修（維護代價實質為負無限）。
-3. **治本解決方案**：
-   - 遵從《[AGENTS.md](../AGENTS.md)》的「治本不治標」與「原生執行優先」原則，全面切換至 Windows 原生支援的 PWSH，徹底廢棄脆弱的 Bash 環境修復層。
-
-因此，架構劃分為：
-- **現行模組（Active）**：專注於 PWSH 原生支援與乾淨執行（`pi-extensions/native-powershell`）、以及 OpenCode 的對話情境清理（`oc-plugins/chat-trim-context`）與 pwsh-profile-shim（規劃中，見 [`docs/PLAN.md`](PLAN.md)）。
-- **封存模組（Archived）**：舊有的 `cmdc-mods` 全系列、以及 pi 和 oc 的 `env-guard` 全數移入 [`archive/`](../archive/README.md)；其完整的歷史技術規格與病理分析已封存至 [`docs/archive/spec-old.md`](archive/spec-old.md)。
+本文件 §1–§3 即現行全部三個模組；退役與封存模組（`cmdc-mods` 全系列、pi 與 oc 的 `env-guard`、`pwsh-profile-shim`）記載在 [`archive/README.md`](../archive/README.md)，歷史規格書見 [`docs/archive/spec-old.md`](archive/spec-old.md)。
 
 ---
 
@@ -36,25 +23,31 @@
 - **測試**：[`pi-extensions/tests/native-powershell/index.mjs`](../pi-extensions/tests/native-powershell/index.mjs)
 
 ### 故障點分析
+
 pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數：
 - 寫死 `POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]`。
 - 在傳入指令前強行插入 `try { [Console]::OutputEncoding = ... }` 等 UTF-8 設定指令碼。
-- **副作用**：進程內省（例如 `(Get-Process -Id $PID).CommandLine`）看到的是被污染的參數與雜訊字串，阻礙了 Agent 進行精確的行程自我檢查，且使用者自訂的 PowerShell Profile 被強行抹除。
+- **副作用**：查看行程啟動參數的地方（例如 `(Get-Process -Id $PID).CommandLine`）看到的是被污染的參數與雜訊字串，Agent 無法精確確認自己送出的命令是以什麼形式被執行的；使用者自訂的 PowerShell Profile 也被強行抹除。
 
 ### 修復機制
-1. **同名工具覆蓋**：以 `pi.registerTool(createPowerShellTool(process.cwd(), { operations }))` 覆蓋內建的 `powershell` 工具。
-   - 為何必須整顆自帶 exec：pi 的 operations 介面是全有全無，工具只接受整顆自訂 `operations`；`spawnHook` 雖可改寫 `{command, cwd, env}`，但前綴注入發生在其下游的 `ops.exec` 內部，暴露不到；共用的 exec 引擎 `createLocalShellOperations` 非公開匯出。
-   - 連帶重實作的內建語義：cwd 存在性檢查、abort/逾時經 `taskkill.exe /F /T` 終止進程樹、訊號退出碼 `128+n`、env 轉發。這些是整組替換的對等義務，不是新增功能。
-2. **Spawn 形式**：以 probe 出的 `shell` 搭配 `["-NonInteractive", "-Command", command]` 執行，指令文字逐字透傳。各引數的取捨均經實測：
-   - **捨棄 `-NoProfile`**：`$PROFILE` 是編碼修復點，同時承載使用者的環境變數等需求（部署要求見「部署前提」）。
-   - **捨棄 `-ExecutionPolicy Bypass`**：機器原則（如 RemoteSigned）恢復效力。帶 Zone.Identifier 的腳本由 pi 預設的可執行變為 `SecurityError` 拒絕；單次逃生口 `$env:PSExecutionPolicyPreference='Bypass'` 為動態重讀（同一通指令內前置即生效），不出現在命令列上。
-   - **保留 `-NonInteractive`**：主機提示必須 fail-fast。缺它時：`Get-Credential` 開出真實桌面憑證對話框，工具呼叫無界掛住（實測 >8s 才被強殺；帶旗標約 540ms 拒絕）；`Read-Host` 靜默回空並續跑（stdin 為 ignore，EOF 被視為空行）；`PromptForChoice` 退化為底層 `MethodInvocationException`。
-   - **保留 `-Command` 參數傳輸**：stdin 傳輸（`pwsh -Command -`）雖能讓 CommandLine 零指令文本且 exit code 透傳，但跨行區塊被靜默吞掉（無輸出、exit 0），屬靜默失敗，不可採用。
+
+內建的 powershell 工具把「不載 profile、繞過機器的執行原則、自己幫命令設編碼」寫死在內部，沒有任何設定可以關。修復用的是 pi 允許的路線：**註冊同名工具覆蓋內建版**（`pi.registerTool(createPowerShellTool(...))`）。註冊之後，pi 呼叫 powershell 工具時執行的就是模組自己的實作，內建版完全不會被呼叫；pwsh 行程也改由模組自己的 exec 引擎啟動，啟動參數與命令內容都由模組決定，pi 不再往裡面加東西。
+
+不採用較小的掛點 `spawnHook`，因為它的能力範圍不含啟動參數：pi 提供給工具的 `spawnHook` 只允許修改命令文字、工作目錄與環境變數三樣東西；`-NoProfile` 這一類啟動參數是由 pi 內部 exec 引擎組出來的，組參數的程式碼不對插件開放，`spawnHook` 改不了它。
+
+覆蓋之後內建版不再執行，它原本對使用者有價值的行為要由模組自己實作：工作目錄不存在時報錯；逾時或被取消時用 `taskkill /F /T` 結束 pwsh 與其全部子行程。與 oc 版的差別在於：oc 的插件面只有 `shell.create.before` hook，僅允許修改命令文字，改不到啟動參數，所以 oc 版只能把 profile 載入碼接在命令前面（見 §3）；pi 版直接控制啟動參數本身。不加任何其他功能。
+
+實際送給 pwsh 的形式是 `pwsh -NonInteractive -Command <命令>`，命令文字逐字透傳——關鍵就在那兩個「不送」：
+
+- **不送 `-NoProfile`**：這是修復點本身。pwsh 每次啟動會自動載入個人層的 profile 腳本，使用者的 UTF-8 編碼與環境（PATH 補 git、python 虛擬環境）就佈署在這裡；去掉這個參數，這層個人設定才會在 pi 的命令裡生效（profile 的佈署方式見「部署前提」）。
+- **不送 `-ExecutionPolicy Bypass`**：讓機器自己的執行原則（例如本機腳本須簽章）照常生效——這也是個可以實測的效果差異：同一個帶封印記錄（Zone.Identifier）的腳本，內建工具照跑，修復後的工具被原則以 `SecurityError` 拒絕。真的需要繞過某一次，就在那道命令前先行 `$env:PSExecutionPolicyPreference='Bypass'`，pwsh 讀到即生效，不會出現在啟動參數上。
+- **保留 `-NonInteractive`**：少了它，命令要求輸入帳號密碼時會跳出一個真的視窗，把整次呼叫卡到被外部強制收掉（實測帶它約 540ms 內拒絕、不帶掛過 8 秒），所以必須保留。
+- **命令經 `-Command` 送入，不走 stdin**：把命令送進 pwsh 有兩種方式——作為 `-Command` 的參數值，或 spawn 後從 stdin 餵入。模組用前者；stdin 餵法雖然能讓命令文字不出現在行程命令列上、啟動參數更乾淨，但多行命令會被靜默吞掉（無輸出、exit 0 假成功），不能用。
 
 ### 部署前提
 
 - **編碼修復點（$PROFILE）**：headless spawn 每次取得一顆全新隱藏 console（`CREATE_NO_WINDOW`），輸出字碼頁為系統 OEM 值（zh-CN 機器實測 936 / GBK）。A/B 實證：載入 profile → `[Console]::OutputEncoding.CodePage` 為 65001；`-NoProfile` → 936，同一句中文以 GBK 位元組輸出，在 pi 的 UTF-8 擷取層解碼為亂碼。
-- **部署決策**：模組不做 in-code 修復，`$PROFILE` 是唯一修復通道。部署只需單一處：getPowerShellConfig 的解析是決定論的（pwsh.exe 在 PATH 就選 7），profile 跟著實際解析結果走；具體部署行見 README 安裝指南。
+- **部署決策**：模組不做 in-code 編碼修復——自己再往命令前塞編碼碼，就會重演內建工具那套污染（這正是本模組要修掉的東西）；在「命令零注入」的約束下，`$PROFILE` 是僅剩的修復通道。具體部署步驟見 README 安裝指南。
 
 ### 已知差異
 
@@ -81,10 +74,13 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 
 ---
 
-## 3. pwsh-profile-shim (規劃中)
+## 3. pwsh-profile-loader (oc-plugins)
 
-- **目標**：讓 OpenCode shell 工具在 spawn pwsh/powershell 時載入使用者 PowerShell Profile，同時保持掃描器（permission 資源提取、語法判定）為 PowerShell 模式。
-- **技術計畫書**：[`docs/PLAN.md`](PLAN.md)
+- **目標**：OpenCode shell 工具 spawn pwsh/powershell 時載入使用者 PowerShell profile；掃描與 permission 判定在改寫之前以原始命令完成，不受影響。
+- **機制**：`shell.create.before` hook 在命令前插入固定前綴——照 pwsh 原生順序（AllUsersAllHosts → AllUsersCurrentHost → CurrentUserAllHosts → `$PROFILE`）逐檔確認存在後載入；任一檔失敗用 `Write-Error` 把 pwsh 原生的錯誤訊息印出來（catch 裡先保存 `$ErrorActionPreference`、輸出後還原，所以錯誤不會終止命令），不阻擋原命令；前綴帶防重複檢查，命令裡已有載入碼時不會再加一次。改寫一定會生效的證據（v2.2.6 實測）：宿主在 hook 執行完之後才讀取 `event.command`，hook 改過的內容就是實際執行的內容。
+- **Inert 條件**：非 pwsh/powershell shell、命令非字串或空、shell 值無路徑分隔符、OpenCode 缺 hook 表面——整體停用、不註冊、不報錯。
+- **成本**：每次命令 +0–1 毫秒（794 字符前綴解析＋3 個存在守衛）＋ 執行使用者 profile 內容的時間（本機 ~90 毫秒，由 profile 內容決定）。系統上無部署物、無編譯。
+- **技術記錄**：[`docs/archive/PLAN.md`](archive/PLAN.md)（決策與量測日誌、計畫推演歷史）；測試 `oc-plugins/tests/pwsh-profile-loader/`（20 項）。
 
 ---
 
@@ -93,39 +89,22 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 測試與插件資料夾分離——插件資料夾保持只含交付物，手動安裝（`cp -r` 插件資料夾）不會把測試帶進安裝目錄。
 
 ## 現行模組測試
-- **`pi-extensions/tests/native-powershell/index.mjs`**：
-  驗證 pi powershell 工具的原生 spawn 行為（14 項檢查全綠）。
-  - 參數內省：`(Get-Process -Id $PID).CommandLine` 呈現為 `-NonInteractive -Command <指令>`；無 host 注入的 `-NoProfile`、`-ExecutionPolicy`、UTF-8 前置碼，且與直接 spawn 的結果一致。
-  - 離開碼透傳：`exit 2` 原樣回傳。
-  - 非 ASCII 透傳：先探測 child 的 `[Console]::OutputEncoding.CodePage`；部署前提達成時驗 `漢字` 以 UTF-8 正確解碼，前提缺席時標記 SKIPPED 並註明 mod 逐字透傳不受影響（該項是部署前提探測，不是 mod 行為驗收）。
-  - 提示 fail-fast：`PromptForChoice`、`Get-Credential`、`Read-Host` 在 `-NonInteractive` 下快速拋錯而非掛住（每項含 10 秒防護且失敗彼此隔離）。
-  - 超時與中止：逾時與 AbortSignal 觸發時執行 `taskkill` 樹狀終止。
-  - 原始碼不變式：無轉碼層機制；`$PROFILE` 部署要求與 `-NonInteractive` 保留理由均在檔頭如實記載。
-- **`oc-plugins/tests/packaging/index.mjs`**：
-  OpenCode 插件的打包與零依賴體積防護檢查（11 項檢查全綠）。
-  - 確保無 `dependencies` / `peerDependencies` / `optionalDependencies` 欄位（避免 npm 自動下載數百 MB 模組）。
-  - 確保無 `@opencode/plugin` 的 runtime import（以本地 identity define shim 取代）。
-  - 確保 default export 具備 `{ id, setup }` 正確形狀。
+
+- **`pi-extensions/tests/native-powershell/index.mjs`**（14 項檢查）：測試直接執行真的 pwsh，看它實際怎麼被啟動、怎麼結束，不檢查源碼裡寫了什麼。確認的內容：pwsh 收到的啟動參數是 `-NonInteractive -Command`，沒有 `-NoProfile`、`-ExecutionPolicy` 和 UTF-8 前置碼，而且與手動直接執行 pwsh 的結果一致；命令的離開碼原樣回傳；逾時或被取消時整棵行程樹被結束；命令要求輸入（`PromptForChoice`、`Get-Credential`、`Read-Host`）時立刻拋錯結束，不會卡住等待。中文編碼那一項會先看環境裡的 profile 部署好了沒：沒部署時標記 SKIPPED 而不是判定失敗——它檢查的是環境前提，不是 mod 本身（mod 只透傳輸出，不碰編碼）。
+- **`oc-plugins/tests/packaging/index.mjs`**（22 項檢查）：發布前檢查 package.json 與插件檔案的完整性。package.json 部分：插件不宣告任何依賴欄位（npm 安裝插件時不會自動下載大量模組）、`main` 指向的檔案確實存在、名稱以 `opencode-` 開頭。插件程式碼部分：不 import `@opencode/plugin`——宿主套件提供的 `define` 函式其實只是把傳入的插件原樣回傳（用來標註型別），插件在檔案裡自己宣告一個一模一樣的就夠了，不必為了它依賴宿主套件；匯出的插件物件要有 `id` 和 `setup`。插件程式碼這幾項 loader 測試也會查到（它把插件真的 import 進來執行，缺了任何一項 import 就會失敗）；package.json 的部分只有 packaging 會查。
+- **`oc-plugins/tests/pwsh-profile-loader/index.mjs`**（20 項檢查）：測試只看插件實際執行的輸出，不看源碼寫了什麼。分兩層：第一層把插件真的載入進來、跑一次 hook，看它改寫了什麼——pwsh/powershell 的命令要加前綴、bash 不動、命令不是字串或空白不動、命令裡已經有載入碼時不會再加一次、四個 profile 檔逐一確認後載入且哪個出錯就用 pwsh 原生的錯誤格式報出來、OpenCode 沒有這個 hook 時整個插件不動作；第二層拿改寫出來的前綴真的去執行 pwsh，證明前綴確實載入 profile 且不干擾原命令——「確實載入」的證據是把環境裡的 git 移除後由 profile 加回來；另外確認離開碼原樣回傳、profile 全不存在時前綴什麼也不做、profile 出錯時錯誤照 pwsh 原生格式出現在 stderr 且命令照常執行、profile 裡定義的變數和函式命令都取用得到。
 
 執行現行測試：
 ```bash
-npm test          # 執行 pi 與 oc 現行測試
-npm run test:pi   # 僅執行 pi native-powershell 測試
-npm run test:oc   # 僅執行 oc packaging 測試
+npm run test:pi   # pi-extensions native-powershell（14 項）
+npm run test:oc   # oc 插件 packaging 檢查（22 項）＋ pwsh-profile-loader 測試（20 項）
 ```
+
+執行環境：Node.js ≥ 22.6（測試與插件都以 Node 內建的 TypeScript 型別剝離功能直接執行，不需編譯）。
 
 ## 封存模組測試 (Archive)
-封存的測試套件置於 `archive/<host>/tests/`，歷史測試斷言與防回歸機制維持完整可用：
-- `archive/cmdc-mods/tests/env-guard/index.mjs`（175 項）
-- `archive/cmdc-mods/tests/system-prompt/index.mjs`（8 項）
-- `archive/cmdc-mods/tests/disable-tools/index.mjs`（9 項）
-- `archive/pi-extensions/tests/env-guard/index.mjs`（48 項）
-- `archive/oc-plugins/tests/env-guard/index.mjs`（110 項）
 
-執行封存測試：
-```bash
-npm run test:archive
-```
+封存的測試套件（五套回歸測試＋退役方案 pwsh-profile-shim 的 11 項測試）與其 node 直跑執行方式，記載在 [`archive/README.md`](../archive/README.md)。
 
 ---
 

@@ -1,8 +1,10 @@
 {
 	"name": "harness-plugins-opencode",
-	"version": "0.6.5",
-	"description": "OpenCode v2 plugin 版：chat-trim-context（送出模型請求前清理系統提示）。",
-	"keywords": ["opencode-plugin"],
+	"version": "1.0.0",
+	"description": "OpenCode v2 plugins: chat-trim-context（送出模型請求前清理系統提示）、pwsh-profile-loader（shell spawn 前置 profile 載入）。",
+	"keywords": [
+		"opencode-plugin"
+	],
 	"type": "module",
 	"repository": "git+https://github.com/Artin0123/harness-plugins.git"
 }

@@ -1,6 +1,6 @@
-# 計畫：③′ plugin + 靜態 shim — 讓 opencode shell 載入 PowerShell profile
+# 讓 opencode shell 載入 PowerShell profile — 實作記錄（pwsh-profile-loader）
 
-> 狀態：計畫書（未執行）。依據：2026-11-06 labs 實測（lab-plugin-shim 三項全綠，~615ms，詳見對話紀錄）。
+> 狀態：已實作（2026-11-09）。現行技術規格見 [`docs/spec.md`](../spec.md) §3；本文件為該模組的計畫推演（§0–8，歷史）與決策/量測日誌（§9）。
 
 ## 0. 目標與非目標
 
@@ -108,3 +108,21 @@ lab 資產可複用：`lab/mockserver.mjs`、`lab/lab-plugin-shim/*`（已是 �
 - T1–T6 全綠；T7 在升級模擬後仍全綠。
 - `Get-Process pwsh | ...` 顯示 opencode 的 shell spawn 已無 `-NoProfile`（profile 由 shim 轉發的真 pwsh 載入）。
 
+---
+
+## 9. 決策與量測日誌（2026-11-09）
+
+現行做法與行為規格的唯一來源是 [`docs/spec.md`](../spec.md) §3；本節只記「何時做了什麼決定、量到了什麼數」，不重複機制。
+
+- 第一版（C# 替身 exe）：插件把 shell 指向自編譯的替行程式，由它剔除 `-NoProfile` 後轉交真 pwsh。已停用——每呼叫多 ~17 毫秒的雙行程開銷，且依賴機器上的編譯鏈（鏈條某一環不在時，修復無聲消失）。成品與 11 項測試封存於 `archive/oc-plugins/pwsh-profile-shim/`，退役理由與技術精華見 `archive/README.md`。
+- 決定性契約證據（v2.2.6 二進位拆解）：spawner 在插件 hook 之後才讀取命令文字——這使「純 hook 改寫命令」路線成立，取代替身方案。
+- 前綴 v1 → v2：單檔載入改為照原生順序的四檔守衛鏈；+3 毫秒（299 → 302ms，同批中位數）。
+- 前綴 v2 → v3 → v4：profile 讀取失敗由「靜默吞掉」改為 stderr 顯現；v3 曾採自訂錯誤格式（前綴 534 → 1379 字符），依「原生優先」判準再改為 v4 原生直通（原始錯誤記錄交回 pwsh 自家錯誤引擎原樣輸出；前綴 794 字符，成本 +0–1ms）。
+- 量測總帳（本機 2026-11-09）：`pwsh -NoProfile` 基線 ~224ms；執行使用者 profile 內容的時間 ~72–94ms（由 profile 內容決定）；前綴守衛開銷 +0–1ms。
+- 平台實測（v2.2.6，真實安裝流程）：全域 `~/.config/opencode/plugins/` 會被發現並載入；專案 `.opencode/plugins/` 有被載入但 `plugin list` 不顯示（顯示怪癖）；專案 `.opencode/plugin/` 單一檔案不載入。
+- 安裝/更新效能（2026-11-09）：`#master` 每次連網解析分支（冷 ~1.3 秒）；`#<sha>::path:` 免連網（~0.1 秒）但升級要手動換 SHA；兩者啟動速度相同。`~/.cache/opencode/npm/` 快取只累積不清理，堆多了可整個目錄刪除。
+- 待辦：真實會話 E2E——推上 GitHub 後經官方 `plugin add` 安裝，在真實聊天會話驗證命令改寫。
+
+---
+
+本文件到此為止；更早的 §1–8 為計畫階段原始推演，保留原文供查考。

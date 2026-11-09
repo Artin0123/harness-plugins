@@ -1,6 +1,6 @@
 {
 	"name": "harness-plugins-pi",
-	"version": "0.8.0",
+	"version": "1.0.0",
 	"description": "pi extensions: restore native PowerShell spawning for the powershell tool.",
 	"keywords": [
 		"pi-package",
