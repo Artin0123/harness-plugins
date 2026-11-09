@@ -9,7 +9,7 @@ Coding Agent 的環境修復插件合集。Windows 上以原生 PowerShell 為�
 ### native-powershell（pi 擴充）
 
 - **解決的問題**：pi 內建的 `powershell` 工具固定用 `-NoProfile -ExecutionPolicy Bypass` 啟動 PowerShell，所以你的 `$PROFILE` 從來沒被載入，機器的腳本執行原則也被繞過。裝了這個模組之後，兩件事回到一般終端機的樣子：profile 會載入，執行原則照機器設定。除了這兩個旗標，其餘行為與內建工具相同，包含命令前面那段 UTF-8 設定、逾時與取消的判定、離開碼、錯誤訊息與輸出內容。
-- **代價**：每次呼叫多約 100 毫秒，用來載入你的 `$PROFILE`。profile 印出的內容與錯誤訊息會出現在工具輸出裡，profile 越慢，每次呼叫越慢。
+- **代價**：每次呼叫多出載入你的 `$PROFILE` 的時間。這段時間完全由你自己的 profile 決定，與模組無關：空 profile 幾乎不花時間，裝了 oh-my-posh 或大量模組的 profile 可能多出好幾百毫秒。本機的 profile 實測讓每次呼叫從 341 毫秒變成 443 毫秒（各三次的中位數，差 102 毫秒），別的機器不會是同一個數字。profile 印出的內容與錯誤訊息也會出現在工具輸出裡。
 - **限制**：pi 本體被強制終止時（不是逾時、也不是取消），模組啟動的行程樹不會被 pi 清理。pi 內建工具原本會登記子行程 pid 供本體清理，登記簿不對插件開放。另外，模組將內建版的三個常數與一段命令前綴複製了一份，pi 升級後這些複本不會自動更新；升級 pi 之後跑 `npm run test:pi`，測試會拿已安裝的 pi 逐項比對並回報差異。
 - **需求**：Windows 上的 PowerShell 7 或 Windows PowerShell 5.1、pi ≥ 0.84.3，而且 `powershell` 工具必須在啟用清單裡。
 
@@ -22,7 +22,7 @@ Coding Agent 的環境修復插件合集。Windows 上以原生 PowerShell 為�
 ### pwsh-profile-loader（OpenCode 插件）
 
 - **解決的問題**：OpenCode 執行 shell 命令時固定加上 `-NoProfile`，所以平常開啟 pwsh 終端會自動完成的事（UTF-8 編碼、PATH 補上 git、python 虛擬環境自動啟用）在 OpenCode 的命令裡不會發生。裝了之後這些設定會生效，命令本身逐字不變。
-- **代價**：每道命令開頭多一段 794 字元的載入程式碼，加上執行 profile 的時間（本機約 90 毫秒）。profile 印出的內容會出現在工具輸出裡。
+- **代價**：每道命令開頭多一段 794 字元的載入程式碼，加上執行 profile 的時間（由你的 profile 內容決定）。profile 印出的內容會出現在工具輸出裡。
 - **需求**：OpenCode ≥ 2.2.5。
 
 ## 安裝
