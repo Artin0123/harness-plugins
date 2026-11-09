@@ -24,14 +24,14 @@ Windows 環境全面轉向原生 PowerShell（PWSH），捨棄 Bash 環境修復
 
 ### 故障點分析
 
-pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數：
+pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數（無任何設定可關）：
 - 寫死 `POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]`。
 - 在傳入指令前強行插入 `try { [Console]::OutputEncoding = ... }` 等 UTF-8 設定指令碼。
 - **副作用**：查看行程啟動參數的地方（例如 `(Get-Process -Id $PID).CommandLine`）看到的是被污染的參數與雜訊字串，Agent 無法精確確認自己送出的命令是以什麼形式被執行的；使用者自訂的 PowerShell Profile 也被強行抹除。
 
-### 修復機制
+### 機制
 
-內建的 powershell 工具把「不載 profile、繞過機器的執行原則、自己幫命令設編碼」寫死在內部，沒有任何設定可以關。修復用的是 pi 允許的路線：**註冊同名工具覆蓋內建版**（`pi.registerTool(createPowerShellTool(...))`）。註冊之後，pi 呼叫 powershell 工具時執行的就是模組自己的實作，內建版完全不會被呼叫；pwsh 行程也改由模組自己的 exec 引擎啟動，啟動參數與命令內容都由模組決定，pi 不再往裡面加東西。
+修復用的是 pi 允許的路線：**註冊同名工具覆蓋內建版**（`pi.registerTool(createPowerShellTool(...))`）。註冊之後，pi 呼叫 powershell 工具時執行的就是模組自己的實作，內建版完全不會被呼叫；pwsh 行程也改由模組自己的 exec 引擎啟動，啟動參數與命令內容都由模組決定，pi 不再往裡面加東西。
 
 不採用較小的掛點 `spawnHook`，因為它的能力範圍不含啟動參數：pi 提供給工具的 `spawnHook` 只允許修改命令文字、工作目錄與環境變數三樣東西；`-NoProfile` 這一類啟動參數是由 pi 內部 exec 引擎組出來的，組參數的程式碼不對插件開放，`spawnHook` 改不了它。
 
@@ -62,25 +62,34 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 - **測試**：[`oc-plugins/tests/packaging/index.mjs`](../oc-plugins/tests/packaging/index.mjs)
 
 ### 機制
-掛載 `ctx.session.hook` 的三個時機點：
-- `context`
-- `compaction`
-- `generate`
 
-在發送請求前執行文字清理：
-1. 移除 `<env>...</env>` 環境資訊區塊。
-2. 移除包含 worktree marker（`tools.opencode.session_move`）的段落，降低上下文雜訊並節省 Token。
-3. 遵循 OpenCode 插件零依賴（Zero Dependencies）原則，安裝體積維持在 12 KB 左右。
+掛在 `ctx.session.hook` 的 `context`、`compaction`、`generate` 三個時機點，只處理 `chat` agent 的請求。實際效果：模型收到的系統提示不含環境描述——以「Here is some useful information about the environment you are running in:」或「The environment you are running in is now:」開頭的段落被移除；提示其餘部分逐字不變（第一個區塊與非文字區塊一律原樣保留）。
 
 ---
 
 ## 3. pwsh-profile-loader (oc-plugins)
 
-- **目標**：OpenCode shell 工具 spawn pwsh/powershell 時載入使用者 PowerShell profile；掃描與 permission 判定在改寫之前以原始命令完成，不受影響。
-- **機制**：`shell.create.before` hook 在命令前插入固定前綴——照 pwsh 原生順序（AllUsersAllHosts → AllUsersCurrentHost → CurrentUserAllHosts → `$PROFILE`）逐檔確認存在後載入；任一檔失敗用 `Write-Error` 把 pwsh 原生的錯誤訊息印出來（catch 裡先保存 `$ErrorActionPreference`、輸出後還原，所以錯誤不會終止命令），不阻擋原命令；前綴帶防重複檢查，命令裡已有載入碼時不會再加一次。改寫一定會生效的證據（v2.2.6 實測）：宿主在 hook 執行完之後才讀取 `event.command`，hook 改過的內容就是實際執行的內容。
-- **Inert 條件**：非 pwsh/powershell shell、命令非字串或空、shell 值無路徑分隔符、OpenCode 缺 hook 表面——整體停用、不註冊、不報錯。
-- **成本**：每次命令 +0–1 毫秒（794 字符前綴解析＋3 個存在守衛）＋ 執行使用者 profile 內容的時間（本機 ~90 毫秒，由 profile 內容決定）。系統上無部署物、無編譯。
-- **技術記錄**：[`docs/archive/PLAN.md`](archive/PLAN.md)（決策與量測日誌、計畫推演歷史）；測試 `oc-plugins/tests/pwsh-profile-loader/`（20 項）。
+- **目標**：讓 OpenCode shell 工具 spawn pwsh/powershell 時載入使用者的 PowerShell profile，個人設定與直接開終端一致。
+- **原始碼**：[`oc-plugins/pwsh-profile-loader/index.ts`](../oc-plugins/pwsh-profile-loader/index.ts)
+- **測試**：[`oc-plugins/tests/pwsh-profile-loader/index.mjs`](../oc-plugins/tests/pwsh-profile-loader/index.mjs)
+- **技術記錄**：[`docs/archive/PLAN.md`](archive/PLAN.md)（決策與量測日誌、計畫推演歷史）。
+
+### 機制
+
+- OpenCode 執行 pwsh/powershell 命令時，照 pwsh 原生順序（AllUsersAllHosts → AllUsersCurrentHost → CurrentUserAllHosts → `$PROFILE`）先載入四個 profile 檔，之後才執行原命令；實作上是 `shell.create.before` hook 在命令前插入固定前綴（794 字符）。
+- 插件唯一新增的行為就是載入使用者自己的 profile——與手動移除 `-NoProfile` 會載入的內容相同，命令其餘部分逐字不變。
+- profile 出錯不影響命令：錯誤照 pwsh 原生格式出現在輸出裡，原命令照常執行。
+- 同一道命令重複送達不會疊加前綴；profile 全不存在時前綴什麼也不做。
+- 掃描與 permission 判定在改寫之前以原始命令完成，不受影響。
+- 改寫一定生效（v2.2.6 實測）：宿主在 hook 執行完之後才讀取 `event.command`，hook 改過的內容就是實際執行的內容。
+
+### Inert 條件
+
+非 pwsh/powershell shell、命令非字串或空、shell 值無路徑分隔符、OpenCode 缺 hook 表面——整體停用、不註冊、不報錯。
+
+### 成本
+
+每次命令 +0–1 毫秒（794 字符前綴解析＋3 個存在守衛）＋ 執行使用者 profile 內容的時間（本機 ~90 毫秒，由 profile 內容決定）。系統上無部署物、無編譯。
 
 ---
 
@@ -91,7 +100,7 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 ## 現行模組測試
 
 - **`pi-extensions/tests/native-powershell/index.mjs`**（14 項檢查）：測試直接執行真的 pwsh，看它實際怎麼被啟動、怎麼結束，不檢查源碼裡寫了什麼。確認的內容：pwsh 收到的啟動參數是 `-NonInteractive -Command`，沒有 `-NoProfile`、`-ExecutionPolicy` 和 UTF-8 前置碼，而且與手動直接執行 pwsh 的結果一致；命令的離開碼原樣回傳；逾時或被取消時整棵行程樹被結束；命令要求輸入（`PromptForChoice`、`Get-Credential`、`Read-Host`）時立刻拋錯結束，不會卡住等待。中文編碼那一項會先看環境裡的 profile 部署好了沒：沒部署時標記 SKIPPED 而不是判定失敗——它檢查的是環境前提，不是 mod 本身（mod 只透傳輸出，不碰編碼）。
-- **`oc-plugins/tests/packaging/index.mjs`**（22 項檢查）：發布前檢查 package.json 與插件檔案的完整性。package.json 部分：插件不宣告任何依賴欄位（npm 安裝插件時不會自動下載大量模組）、`main` 指向的檔案確實存在、名稱以 `opencode-` 開頭。插件程式碼部分：不 import `@opencode/plugin`——宿主套件提供的 `define` 函式其實只是把傳入的插件原樣回傳（用來標註型別），插件在檔案裡自己宣告一個一模一樣的就夠了，不必為了它依賴宿主套件；匯出的插件物件要有 `id` 和 `setup`。插件程式碼這幾項 loader 測試也會查到（它把插件真的 import 進來執行，缺了任何一項 import 就會失敗）；package.json 的部分只有 packaging 會查。
+- **`oc-plugins/tests/packaging/index.mjs`**（22 項檢查）：發布前檢查 package.json 與插件檔案的完整性。package.json 部分：插件不宣告任何依賴欄位（npm 安裝插件時不會自動下載大量模組）、`main` 指向的檔案確實存在、名稱以 `opencode-` 開頭。插件程式碼部分：不 import `@opencode/plugin`。兩個插件唯一用到的宿主介面只有 `define` 一個函式，而它實際上只是把傳入的插件原樣回傳（順便標註型別），所以在插件檔案裡自己宣告一個一模一樣的就夠了。真的去 import 的話，npm 安裝插件時會連宿主套件整串一起抓（實測一次安裝多下載 273 個套件、168 MB）；改為本地宣告後，每次安裝只多插件本身 1 個套件、42 KB。匯出的插件物件要有 `id` 和 `setup`。插件程式碼這幾項 loader 測試也會查到（它把插件真的 import 進來執行，缺了任何一項 import 就會失敗）；package.json 的部分只有 packaging 會查。
 - **`oc-plugins/tests/pwsh-profile-loader/index.mjs`**（20 項檢查）：測試只看插件實際執行的輸出，不看源碼寫了什麼。分兩層：第一層把插件真的載入進來、跑一次 hook，看它改寫了什麼——pwsh/powershell 的命令要加前綴、bash 不動、命令不是字串或空白不動、命令裡已經有載入碼時不會再加一次、四個 profile 檔逐一確認後載入且哪個出錯就用 pwsh 原生的錯誤格式報出來、OpenCode 沒有這個 hook 時整個插件不動作；第二層拿改寫出來的前綴真的去執行 pwsh，證明前綴確實載入 profile 且不干擾原命令——「確實載入」的證據是把環境裡的 git 移除後由 profile 加回來；另外確認離開碼原樣回傳、profile 全不存在時前綴什麼也不做、profile 出錯時錯誤照 pwsh 原生格式出現在 stderr 且命令照常執行、profile 裡定義的變數和函式命令都取用得到。
 
 執行現行測試：

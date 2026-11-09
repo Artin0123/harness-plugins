@@ -1,6 +1,3 @@
-// `define` is identity (`export function define(plugin) { return plugin }`, read from the
-// installed 2.2.5 tarball). Importing @opencode/plugin instead makes it a runtime
-// dependency, and npm auto-installs peers: 273 packages / 168 MB per install.
 const define = <T>(plugin: T): T => plugin
 
 const ENV_PARAGRAPHS = [
