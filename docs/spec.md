@@ -59,11 +59,11 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 
 - **目標**：針對 OpenCode 的 `chat` agent，在每次送出模型請求前清理系統提示中的多餘資訊。
 - **原始碼**：[`oc-plugins/chat-trim-context/index.ts`](../oc-plugins/chat-trim-context/index.ts)
-- **測試**：[`oc-plugins/tests/packaging/index.mjs`](../oc-plugins/tests/packaging/index.mjs)
+- **測試**：[`oc-plugins/tests/packaging/index.mjs`](../oc-plugins/tests/packaging/index.mjs)、[`oc-plugins/tests/chat-trim-context/index.mjs`](../oc-plugins/tests/chat-trim-context/index.mjs)
 
 ### 機制
 
-掛在 `ctx.session.hook` 的 `context`、`compaction`、`generate` 三個時機點，只處理 `chat` agent 的請求。實際效果：模型收到的系統提示不含環境描述——以「Here is some useful information about the environment you are running in:」或「The environment you are running in is now:」開頭的段落被移除；提示其餘部分逐字不變（第一個區塊與非文字區塊一律原樣保留）。
+插件在啟動時向 OpenCode 註冊 `context`、`compaction`、`generate` 三個時機點的 hook，只處理 `chat` agent 的請求。實際效果：模型收到的系統提示不含環境描述——以「Here is some useful information about the environment you are running in:」或「The environment you are running in is now:」開頭的段落被移除；提示其餘部分逐字不變（第一個區塊與非文字區塊一律原樣保留）。第一個區塊之所以一律保留：v2.2.6 中它是宿主自己寫入的模型身份描述，環境段落固定在其後的區塊——這個豁免依據的是 v2.2.6 的實際佈局，宿主改版時需重新確認。改寫方式是把 `event.system` 整個重新指派；宿主在 hook 執行完之後才讀取事件欄位（v2.2.6 binary 佐證），因此重新指派會生效。插件啟動時若宿主沒有提供 `ctx.session.hook` 這個註冊函式，就整個不註冊、不報錯、不動作。
 
 ---
 
@@ -80,16 +80,19 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 - 插件唯一新增的行為就是載入使用者自己的 profile——與手動移除 `-NoProfile` 會載入的內容相同，命令其餘部分逐字不變。
 - profile 出錯不影響命令：錯誤照 pwsh 原生格式出現在輸出裡，原命令照常執行。
 - 同一道命令重複送達不會疊加前綴；profile 全不存在時前綴什麼也不做。
+- shell 值無路徑分隔符時不介入（其餘停用情形見測試條目）。
 - 掃描與 permission 判定在改寫之前以原始命令完成，不受影響。
 - 改寫一定生效（v2.2.6 實測）：宿主在 hook 執行完之後才讀取 `event.command`，hook 改過的內容就是實際執行的內容。
 
-### Inert 條件
-
-非 pwsh/powershell shell、命令非字串或空、shell 值無路徑分隔符、OpenCode 缺 hook 表面——整體停用、不註冊、不報錯。
 
 ### 成本
 
 每次命令 +0–1 毫秒（794 字符前綴解析＋3 個存在守衛）＋ 執行使用者 profile 內容的時間（本機 ~90 毫秒，由 profile 內容決定）。系統上無部署物、無編譯。
+
+### 已知差異
+
+- **profile 內 `exit` 會在原命令之前終止整個 pwsh**：前綴的 `catch` 只攔例外（`throw`），攔不到 `exit`——與手動開終端載入 profile 的原生語意一致，刻意不修。
+- **profile 的 stdout 輸出會進入每條命令的工具輸出**：profile 印出的內容（如 oh-my-posh 初始化訊息）會出現在每一次 shell 工具結果裡，須與目標指令自身的輸出分辨——同為原生行為，保留。
 
 ---
 
@@ -101,12 +104,13 @@ pi 內建的 `createPowerShellTool` 在 Windows 上會強行注入預設引數�
 
 - **`pi-extensions/tests/native-powershell/index.mjs`**（14 項檢查）：測試直接執行真的 pwsh，看它實際怎麼被啟動、怎麼結束，不檢查源碼裡寫了什麼。確認的內容：pwsh 收到的啟動參數是 `-NonInteractive -Command`，沒有 `-NoProfile`、`-ExecutionPolicy` 和 UTF-8 前置碼，而且與手動直接執行 pwsh 的結果一致；命令的離開碼原樣回傳；逾時或被取消時整棵行程樹被結束；命令要求輸入（`PromptForChoice`、`Get-Credential`、`Read-Host`）時立刻拋錯結束，不會卡住等待。中文編碼那一項會先看環境裡的 profile 部署好了沒：沒部署時標記 SKIPPED 而不是判定失敗——它檢查的是環境前提，不是 mod 本身（mod 只透傳輸出，不碰編碼）。
 - **`oc-plugins/tests/packaging/index.mjs`**（22 項檢查）：發布前檢查 package.json 與插件檔案的完整性。package.json 部分：插件不宣告任何依賴欄位（npm 安裝插件時不會自動下載大量模組）、`main` 指向的檔案確實存在、名稱以 `opencode-` 開頭。插件程式碼部分：不 import `@opencode/plugin`。兩個插件唯一用到的宿主介面只有 `define` 一個函式，而它實際上只是把傳入的插件原樣回傳（順便標註型別），所以在插件檔案裡自己宣告一個一模一樣的就夠了。真的去 import 的話，npm 安裝插件時會連宿主套件整串一起抓（實測一次安裝多下載 273 個套件、168 MB）；改為本地宣告後，每次安裝只多插件本身 1 個套件、42 KB。匯出的插件物件要有 `id` 和 `setup`。插件程式碼這幾項 loader 測試也會查到（它把插件真的 import 進來執行，缺了任何一項 import 就會失敗）；package.json 的部分只有 packaging 會查。
+- **`oc-plugins/tests/chat-trim-context/index.mjs`**（30 項檢查）：測試不經過 OpenCode，直接以 Node 載入插件原始碼執行 setup()。傳入的插件環境只會把 setup 註冊的 hook 函式記下來，並確認三個時機點（`context`、`compaction`、`generate`）都註冊了；宿主若根本沒有提供這個註冊函式，setup() 也要正常返回、不註冊任何 hook。接著直接呼叫記下的三個 hook 函式（各跑一次同一組檢查），傳入預先準備好的系統提示內容、比對插件改寫後的結果：以兩句環境開頭組成的段落——無論獨佔一個區塊、夾在其他段落中間，或後面只剩空白——都會被移除；其餘段落逐字不變；第一個區塊與非文字區塊一律原樣保留；非 `chat` agent 完全不碰；不含環境段落的系統提示逐字不變。兩句環境開頭字串本身也在檢查之列：測試會逐字比對插件源碼，一字之差就失敗——宿主日後修改這兩句時，測試會提醒重新確認。
 - **`oc-plugins/tests/pwsh-profile-loader/index.mjs`**（20 項檢查）：測試只看插件實際執行的輸出，不看源碼寫了什麼。分兩層：第一層把插件真的載入進來、跑一次 hook，看它改寫了什麼——pwsh/powershell 的命令要加前綴、bash 不動、命令不是字串或空白不動、命令裡已經有載入碼時不會再加一次、四個 profile 檔逐一確認後載入且哪個出錯就用 pwsh 原生的錯誤格式報出來、OpenCode 沒有這個 hook 時整個插件不動作；第二層拿改寫出來的前綴真的去執行 pwsh，證明前綴確實載入 profile 且不干擾原命令——「確實載入」的證據是把環境裡的 git 移除後由 profile 加回來；另外確認離開碼原樣回傳、profile 全不存在時前綴什麼也不做、profile 出錯時錯誤照 pwsh 原生格式出現在 stderr 且命令照常執行、profile 裡定義的變數和函式命令都取用得到。
 
 執行現行測試：
 ```bash
 npm run test:pi   # pi-extensions native-powershell（14 項）
-npm run test:oc   # oc 插件 packaging 檢查（22 項）＋ pwsh-profile-loader 測試（20 項）
+npm run test:oc   # oc 插件 packaging 檢查（22 項）＋ chat-trim-context 測試（30 項）＋ pwsh-profile-loader 測試（20 項）
 ```
 
 執行環境：Node.js ≥ 22.6（測試與插件都以 Node 內建的 TypeScript 型別剝離功能直接執行，不需編譯）。

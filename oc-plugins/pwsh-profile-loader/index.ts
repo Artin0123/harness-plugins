@@ -5,8 +5,8 @@
 // PowerShell profile never loads. The fix prefixes event.command (in
 // shell.create.before) with a four-file profile chain; the mutation is safe
 // because the spawner reads event.command only AFTER the hook (binary
-// evidence, v2.2.6). Mechanism, error behavior and cost: docs/spec.md §3;
-// decision & measurement log (binary symbols, timings): docs/archive/PLAN.md §9.
+// evidence, v2.2.6). Mechanism, error behavior and cost: ../../docs/spec.md §3;
+// decision & measurement log (binary symbols, timings): ../../docs/archive/PLAN.md §9.
 const define = <T>(plugin: T): T => plugin
 
 // The snippet must also run under Windows PowerShell 5.1 (the hook matches

@@ -5,7 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"test:pi": "node pi-extensions/tests/native-powershell/index.mjs",
-		"test:oc": "node oc-plugins/tests/packaging/index.mjs && node oc-plugins/tests/pwsh-profile-loader/index.mjs"
+		"test:oc": "node oc-plugins/tests/packaging/index.mjs && node oc-plugins/tests/chat-trim-context/index.mjs && node oc-plugins/tests/pwsh-profile-loader/index.mjs"
 	},
 	"pi": {
 		"extensions": [
