@@ -10,7 +10,7 @@
 
 Windows 環境全面轉向原生 PowerShell（PWSH），捨棄 Bash 環境修復層。轉向的理由、實測數據與封存原因都記在 [`README.md`](../README.md) 與 [`docs/bash-vs-pwsh.md`](bash-vs-pwsh.md)，此處不重複。
 
-本文件 §1–§3 即現行全部三個模組；退役與封存模組（`cmdc-mods` 全系列、pi 與 oc 的 `env-guard`、`pwsh-profile-shim`）記載在 [`archive/README.md`](../archive/README.md)，歷史規格書見 [`docs/archive/spec-old.md`](archive/spec-old.md)。
+本文件 §1–§3 即現行全部三個模組；退役與封存模組（pi 與 oc 的 `env-guard`、`pwsh-profile-shim`）記載在 [`archive/README.md`](../archive/README.md)，歷史規格書見 [`docs/archive/spec-old.md`](archive/spec-old.md)。
 
 ---
 
@@ -119,6 +119,6 @@ npm run test:oc   # oc 插件 packaging 檢查（22 項）＋ pwsh-profile-loade
 
 # 封存模組歷史技術規格
 
-舊版環境修復層（包含 `cmdc-mods` 全系列、`pi-extensions/env-guard`、`oc-plugins/env-guard`）之完整歷史技術架構、設計判準、問題根因分析（`MSYS_NO_PATHCONV` 閘門、temp 錨點、使用統計分類學、以及「只能靠寫對的情境」與「未修復問題記錄」）均已完整留存於：
+舊版環境修復層（`pi-extensions/env-guard`、`oc-plugins/env-guard`）之完整歷史技術架構、設計判準、問題根因分析（`MSYS_NO_PATHCONV` 閘門、temp 錨點、使用統計分類學、以及「只能靠寫對的情境」與「未修復問題記錄」）均已完整留存於：
 
 👉 **[`docs/archive/spec-old.md`](archive/spec-old.md)**
