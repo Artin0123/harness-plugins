@@ -41,10 +41,10 @@ const warn = (message: string) => console.error(WARN_PREFIX + message);
 // In-box compiler location, constant on Windows 10+ (verified on this machine).
 const CSC_RELATIVE = join("Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
 
-// Embedded copy of shim-src.cs, byte-identical (oc-plugins/tests/shim pins it).
+// Embedded copy of shim-src.cs, byte-identical (opencode/tests/shim pins it).
 // The C# source deliberately contains no backslash literals, no backticks and
 // no dollar-brace sequences, so this template literal needs no escaping.
-const SHIM_CS = `// shim-src.cs — compiled by the plugin (oc-plugins/pwsh-profile-shim/index.ts) at
+const SHIM_CS = `// shim-src.cs — compiled by the plugin (opencode/pwsh-profile-shim/index.ts) at
 // first setup with the in-box compiler C:\Windows\Microsoft.NET\Framework64\
 // v4.0.30319\csc.exe, then spawned by opencode in place of the real pwsh.
 //

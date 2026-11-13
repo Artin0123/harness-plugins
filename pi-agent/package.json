@@ -1,5 +1,5 @@
 {
-	"name": "harness-plugins-pi",
+	"name": "harness-setup-pi-agent",
 	"version": "1.0.0",
 	"description": "pi extensions: restore native PowerShell spawning for the powershell tool.",
 	"keywords": [
@@ -7,7 +7,7 @@
 		"pi-extension"
 	],
 	"type": "module",
-	"repository": "git+https://github.com/Artin0123/harness-plugins.git",
+	"repository": "git+https://github.com/Artin0123/harness-setup.git",
 	"pi": {
 		"extensions": [
 			"./native-powershell"

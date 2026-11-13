@@ -1,4 +1,4 @@
-# harness-plugins
+# harness-setup
 
 Coding Agent 的環境修復插件合集。Windows 上以原生 PowerShell 為目標，不使用 Git Bash。
 
@@ -35,10 +35,10 @@ Coding Agent 的環境修復插件合集。Windows 上以原生 PowerShell 為�
 
 ```bash
 # 套件安裝（推薦）
-pi install git:github.com/Artin0123/harness-plugins
+pi install git:github.com/Artin0123/harness-setup
 
 # 手動安裝：複製到全域擴充目錄
-cp -r pi-extensions/native-powershell ~/.pi/agent/extensions/
+cp -r pi-agent/native-powershell ~/.pi/agent/extensions/
 ```
 
 安裝後確認三件事：
@@ -47,16 +47,16 @@ cp -r pi-extensions/native-powershell ~/.pi/agent/extensions/
 - `pi list` 看得到這個擴充。
 - 不需要另外設定編碼。模組沿用內建工具那段 UTF-8 設定指令，非 ASCII 輸出在安裝完就能正常顯示。
 
-移除：`pi remove git:github.com/Artin0123/harness-plugins`。
+移除：`pi remove git:github.com/Artin0123/harness-setup`。
 
 ### 2. OpenCode：chat-trim-context
 
 ```bash
 # 指令安裝（推薦）
-opencode plugin add "github:Artin0123/harness-plugins#master::path:oc-plugins/chat-trim-context"
+opencode plugin add "github:Artin0123/harness-setup#master::path:opencode/chat-trim-context"
 
 # 手動安裝：複製到全域或專案外掛目錄
-cp -r oc-plugins/chat-trim-context ~/.config/opencode/plugins/
+cp -r opencode/chat-trim-context ~/.config/opencode/plugins/
 ```
 
 確認與更新：`opencode plugin list`、`opencode plugin update chat.trim-context`。移除：`opencode plugin remove chat.trim-context`。
@@ -65,10 +65,10 @@ cp -r oc-plugins/chat-trim-context ~/.config/opencode/plugins/
 
 ```bash
 # 指令安裝（推薦）
-opencode plugin add "github:Artin0123/harness-plugins#master::path:oc-plugins/pwsh-profile-loader"
+opencode plugin add "github:Artin0123/harness-setup#master::path:opencode/pwsh-profile-loader"
 
 # 手動安裝：複製整個目錄到全域外掛位置
-cp -r oc-plugins/pwsh-profile-loader ~/.config/opencode/plugins/
+cp -r opencode/pwsh-profile-loader ~/.config/opencode/plugins/
 ```
 
 確認與更新：`opencode plugin list`、`opencode plugin update pwsh.profile-loader`。移除：`opencode plugin remove pwsh.profile-loader`。

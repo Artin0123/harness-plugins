@@ -1,6 +1,6 @@
-// Unit battery for oc-plugins/env-guard/index.ts (2026-11-05 redesign)
+// Unit battery for opencode/env-guard/index.ts (2026-11-05 redesign)
 //
-//   node oc-plugins/tests/env-guard/index.mjs
+//   node opencode/tests/env-guard/index.mjs
 //
 // Imports the plugin's TypeScript directly (type stripping, no build step)
 // and asserts: every closed-set temp-path guard on all four surfaces, the

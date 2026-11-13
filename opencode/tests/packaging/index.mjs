@@ -1,6 +1,6 @@
 // Packaging guard for OpenCode plugins.
 //
-//   node oc-plugins/tests/packaging/index.mjs
+//   node opencode/tests/packaging/index.mjs
 //
 // `opencode plugin add` fetches the package and then runs an npm install into
 // ~/.cache/opencode/npm/<key>/<timestamp>/, so every dependency declared here is

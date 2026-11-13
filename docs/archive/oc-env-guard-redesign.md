@@ -1,6 +1,6 @@
 # oc env-guard redesign — 決策記錄
 
-> **狀態：已實作**（oc-plugins/env-guard/index.ts redesign＋電池重寫，2026-11-05）。
+> **狀態：已實作**（opencode/env-guard/index.ts redesign＋電池重寫，2026-11-05）。
 > 本文件回答兩件事：pi 的解法**為什麼**能終止那個無限 code review 迴圈（概念判準，
 > 不依賴 pi 環境即可裁決），以及 oc 依同理念調整後**實際做了什麼、為什麼與 pi 的三
 > 點不盡同**。交接期（redesign 前）的事實清單與陷阱記錄在 §5 保留。
@@ -71,11 +71,11 @@ pi 代理的解拆成三條，每條都是機制而非承諾：
 
 ## 4. 落地記錄
 
-- `oc-plugins/env-guard/index.ts`：redesign 版 ~660 行（含統計與探測），從 1594 行
+- `opencode/env-guard/index.ts`：redesign 版 ~660 行（含統計與探測），從 1594 行
   縮下；**2026-11-07 提示面移除後 527 行**（§8）。cmd 形的輸入側完全移除：
   shell create.before 只做身分驗證＋workdir 改寫（不再碰 `event.command`；
   轉換狀態探測快取隨提示面移除，§8）。
-- `oc-plugins/tests/env-guard/index.mjs`：電池重寫。保留：temp 族全表面釘樁、
+- `opencode/tests/env-guard/index.mjs`：電池重寫。保留：temp 族全表面釘樁、
   glob 分拆、patch 指令行、分類單一來源、shell 身分、統計（分母/分子/
   持久化/併發/畸形/壞 storage）、worker（無錨）、非 win32、packaging。刪除：
   scanBash 的全套釘樁（heredoc 本體、case region、函式本體、註解、引號詞、
@@ -119,7 +119,7 @@ pi 代理的解拆成三條，每條都是機制而非承諾：
 
 ## 7. 紅線
 
-- **不動 pi 版**（`pi-extensions/`）；不動 cmdc 版
+- **不動 pi 版**（`pi-agent/`）；不動 cmdc 版
 - 不為零頻率形加輸入側分支；不列舉工具（AGENTS 明文）
 - **不重加任何依賴 AI 跟從的字串提示**（提示面已於 2026-11-07 移除；§8）
 - 臨時腳本／探測產物放系統暫存目錄、用完清掉

@@ -114,7 +114,7 @@ lab 資產可複用：`lab/mockserver.mjs`、`lab/lab-plugin-shim/*`（已是 �
 
 現行做法與行為規格的唯一來源是 [`docs/spec.md`](../spec.md) §3；本節只記「何時做了什麼決定、量到了什麼數」，不重複機制。
 
-- 第一版（C# 替身 exe）：插件把 shell 指向自編譯的替行程式，由它剔除 `-NoProfile` 後轉交真 pwsh。已停用——每呼叫多 ~17 毫秒的雙行程開銷，且依賴機器上的編譯鏈（鏈條某一環不在時，修復無聲消失）。成品與 11 項測試封存於 `archive/oc-plugins/pwsh-profile-shim/`，退役理由與技術精華見 `archive/README.md`。
+- 第一版（C# 替身 exe）：插件把 shell 指向自編譯的替行程式，由它剔除 `-NoProfile` 後轉交真 pwsh。已停用——每呼叫多 ~17 毫秒的雙行程開銷，且依賴機器上的編譯鏈（鏈條某一環不在時，修復無聲消失）。成品與 11 項測試封存於 `archive/opencode/pwsh-profile-shim/`，退役理由與技術精華見 `archive/README.md`。
 - 決定性契約證據（v2.2.6 二進位拆解）：spawner 組出實際 spawn 呼叫（`Pae(PH.shell, PH.command)`）的時點在插件 hook（`trigger("shell","create.before",PH)`）之後才讀取命令文字；掃描與 permission 在 hook 之前以原始命令完成（`ShellTool.prepare` → `K2()`）。這使「純 hook 改寫命令」路線成立，取代替身方案。
 - 前綴 v1 → v2：單檔載入改為照原生順序的四檔守衛鏈；+3 毫秒（299 → 302ms，同批中位數）。
 - 前綴 v2 → v3 → v4：profile 讀取失敗由「靜默吞掉」改為 stderr 顯現；v3 曾採自訂錯誤格式（前綴 534 → 1379 字符），依「原生優先」判準再改為 v4 原生直通（原始錯誤記錄交回 pwsh 自家錯誤引擎原樣輸出；前綴 794 字符，成本 +0–1ms）。

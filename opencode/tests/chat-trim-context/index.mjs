@@ -1,6 +1,6 @@
 // Behavior battery for the chat-trim-context plugin.
 //
-//   node oc-plugins/tests/chat-trim-context/index.mjs
+//   node opencode/tests/chat-trim-context/index.mjs
 //
 // The test never runs OpenCode: it loads the ACTUAL plugin module (Node
 // native TS type-stripping), runs setup() with a plugin environment that

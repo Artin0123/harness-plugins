@@ -1,4 +1,4 @@
-// Windows regression battery for env-guard. Run: node pi-extensions/tests/env-guard/index.mjs
+// Windows regression battery for env-guard. Run: node pi-agent/tests/env-guard/index.mjs
 // Loads TypeScript directly from a throwaway copy, stubbing only pi's package API.
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';

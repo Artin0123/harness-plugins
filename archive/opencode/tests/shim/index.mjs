@@ -1,9 +1,9 @@
 // Behavior battery for the pwsh-profile-shim plugin.
 //
-//   node oc-plugins/tests/shim/index.mjs
+//   node opencode/tests/shim/index.mjs
 //
 // Ground rules (AGENTS.md discipline): every case runs the REAL pipeline —
-// the in-box compiler compiles oc-plugins/pwsh-profile-shim/shim-src.cs, and
+// the in-box compiler compiles opencode/pwsh-profile-shim/shim-src.cs, and
 // every assertion goes through the compiled exe (node -> spawn -> shim ->
 // CreateProcess target), never through a re-implementation of the logic.
 //

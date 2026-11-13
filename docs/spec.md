@@ -1,6 +1,6 @@
 # 技術規格（spec）
 
-本文件記錄**決策、成立條件與實測數據**。安裝方式、代價與使用說明在根目錄 [`README.md`](../README.md)；程式碼怎麼運作寫在原始碼的註解裡（[`pi-extensions/native-powershell/index.ts`](../pi-extensions/native-powershell/index.ts) 等），本文件不重述。通用開發原則（原生執行優先、修復審查清單、驗證紀律）寫在 [`AGENTS.md`](../AGENTS.md)。
+本文件記錄**決策、成立條件與實測數據**。安裝方式、代價與使用說明在根目錄 [`README.md`](../README.md)；程式碼怎麼運作寫在原始碼的註解裡（[`pi-agent/native-powershell/index.ts`](../pi-agent/native-powershell/index.ts) 等），本文件不重述。通用開發原則（原生執行優先、修復審查清單、驗證紀律）寫在 [`AGENTS.md`](../AGENTS.md)。
 
 ---
 
@@ -20,8 +20,8 @@
 
 ## 1. native-powershell（pi 擴充）
 
-- **原始碼**：[`pi-extensions/native-powershell/index.ts`](../pi-extensions/native-powershell/index.ts)
-- **測試**：[`pi-extensions/tests/native-powershell/index.mjs`](../pi-extensions/tests/native-powershell/index.mjs)
+- **原始碼**：[`pi-agent/native-powershell/index.ts`](../pi-agent/native-powershell/index.ts)
+- **測試**：[`pi-agent/tests/native-powershell/index.mjs`](../pi-agent/tests/native-powershell/index.mjs)
 - **目標**：pi 內建的 PowerShell 工具與本模組之間的差異，只有「少兩個啟動旗標」。
 
 ### 成因
@@ -123,8 +123,8 @@ pi 對 shell 的啟動方式提供兩條改動路徑，都碰不到啟動參數�
 
 ## 2. chat-trim-context（OpenCode 插件）
 
-- **原始碼**：[`oc-plugins/chat-trim-context/index.ts`](../oc-plugins/chat-trim-context/index.ts)
-- **測試**：[`oc-plugins/tests/packaging/index.mjs`](../oc-plugins/tests/packaging/index.mjs)、[`oc-plugins/tests/chat-trim-context/index.mjs`](../oc-plugins/tests/chat-trim-context/index.mjs)
+- **原始碼**：[`opencode/chat-trim-context/index.ts`](../opencode/chat-trim-context/index.ts)
+- **測試**：[`opencode/tests/packaging/index.mjs`](../opencode/tests/packaging/index.mjs)、[`opencode/tests/chat-trim-context/index.mjs`](../opencode/tests/chat-trim-context/index.mjs)
 
 ### 成因
 
@@ -146,8 +146,8 @@ OpenCode 在 `chat` 模式下，每次送給模型的請求都附帶一段環境
 
 ## 3. pwsh-profile-loader（OpenCode 插件）
 
-- **原始碼**：[`oc-plugins/pwsh-profile-loader/index.ts`](../oc-plugins/pwsh-profile-loader/index.ts)
-- **測試**：[`oc-plugins/tests/pwsh-profile-loader/index.mjs`](../oc-plugins/tests/pwsh-profile-loader/index.mjs)
+- **原始碼**：[`opencode/pwsh-profile-loader/index.ts`](../opencode/pwsh-profile-loader/index.ts)
+- **測試**：[`opencode/tests/pwsh-profile-loader/index.mjs`](../opencode/tests/pwsh-profile-loader/index.mjs)
 - **技術記錄**：[`docs/archive/PLAN.md`](archive/PLAN.md)（決策與量測日誌、計畫推演歷史）
 
 ### 成因
@@ -182,7 +182,7 @@ OpenCode 提供給插件的 shell 掛鉤是 `shell.create.before`：這個掛鉤
 
 ## 現行模組測試
 
-- **`pi-extensions/tests/native-powershell/index.mjs`**（44 項檢查）：測試直接執行真的 pwsh，觀察 pwsh 實際如何被啟動、如何結束，不檢查原始碼寫了什麼。確認的項目如下：
+- **`pi-agent/tests/native-powershell/index.mjs`**（44 項檢查）：測試直接執行真的 pwsh，觀察 pwsh 實際如何被啟動、如何結束，不檢查原始碼寫了什麼。確認的項目如下：
   - 啟動參數：`-NonInteractive` 與那段 UTF-8 指令都在，`-NoProfile`、`-ExecutionPolicy`、`Bypass` 都不在；命令列與「直接用同樣參數啟動 pwsh」的結果一致。
   - 參數過濾的單元檢查：從內建版的五個參數過濾後只剩 `-NonInteractive -Command`；模組不認得的參數照樣保留。這兩項不需要 pwsh，任何機器都會執行。
   - 命令的離開碼原樣回傳；呼叫端提供的 `env` 會傳進子行程。
@@ -194,15 +194,15 @@ OpenCode 提供給插件的 shell 掛鉤是 `shell.create.before`：這個掛鉤
   - 上游比對：拿機器上實際安裝的 pi 比對模組複製的內容。執行面的一項用 pi 自己的 `createPowerShellTool` 建立真的工具物件、執行真實命令，確認子行程的命令列裡沒有那兩個旗標、字碼頁是 65001、非 ASCII 輸出原樣返回、非零離開碼照實回報；文字面則直接讀 pi 的 `dist`，比對 `POWERSHELL_ARGS`（包含結尾是不是 `-Command`）、`UTF8_OUTPUT_PREFIX`、`EXIT_STDIO_GRACE_MS`、`MAX_TIMEOUT_MS` 與模組的複本是否一致。比對會在每一項結果裡附上 pi 的版本；找不到 pi 套件時（可用 `NPS_PI_ROOT` 指定）這些項目標記 SKIP。
   - 沒有安裝 PowerShell 時，工具仍會註冊，`exec` 以內建版的錯誤訊息失敗。
   - 找不到任何 PowerShell 執行檔時，所有需要真的執行 pwsh 的項目一律標記 SKIP。輸出會分開統計 `passed`、`skipped`、`failed` 三個數字，跳過的項目不會被算成通過。
-- **`oc-plugins/tests/packaging/index.mjs`**（22 項檢查）：發布前的完整性檢查，分成 `package.json` 與插件程式碼兩個部分。
+- **`opencode/tests/packaging/index.mjs`**（22 項檢查）：發布前的完整性檢查，分成 `package.json` 與插件程式碼兩個部分。
   - `package.json` 部分：插件不宣告任何依賴欄位（npm 安裝插件時不會自動下載大量套件）、`main` 指向的檔案確實存在、名稱以 `opencode-` 開頭。
   - 插件程式碼部分：不從 `@opencode/plugin` 匯入任何東西。兩個插件唯一用到的 OpenCode 介面只有 `define` 一個函式，而 `define` 實際上只是把傳入的插件原樣回傳（順便標註型別），因此在插件檔案裡自行宣告一個相同行為的函式就夠了。真的去匯入的話，npm 安裝插件時會把 OpenCode 整套相依套件一起抓下來（實測一次安裝多下載 273 個套件、168 MB）；改為本地宣告之後，每次安裝只多出插件本身 1 個套件、42 KB。
   - 匯出的插件物件要有 `id` 與 `setup` 兩個欄位。插件程式碼部分的檢查，載入測試也會查到（載入測試會真的把插件匯入執行，缺任何一項都會失敗）；`package.json` 的部分只有 packaging 檢查會查。
-- **`oc-plugins/tests/chat-trim-context/index.mjs`**（30 項檢查）：測試不經過 OpenCode，直接以 Node 載入插件原始碼並執行 `setup()`。
+- **`opencode/tests/chat-trim-context/index.mjs`**（30 項檢查）：測試不經過 OpenCode，直接以 Node 載入插件原始碼並執行 `setup()`。
   - 傳入的插件環境只會把 `setup()` 註冊的 hook 函式記錄下來，測試確認三個時機點（`context`、`compaction`、`generate`）都有註冊；若 OpenCode 根本沒有提供這個註冊函式，`setup()` 也要正常返回，而且不註冊任何 hook。
   - 接著直接呼叫記錄下來的三個 hook 函式（三個時機點各跑一次同一組檢查），傳入預先準備好的系統提示內容，比對插件改寫後的結果：以兩句環境開頭組成的段落，無論獨佔一個區塊、夾在其他段落中間，或後面只剩空白，都會被移除；其餘段落逐字不變；第一個區塊與非文字區塊一律原樣保留；非 `chat` agent 完全不碰；不含環境段落的系統提示逐字不變。
   - 兩句環境開頭字串本身也在檢查之列：測試會逐字比對插件原始碼，一字之差就失敗。OpenCode 日後修改這兩句時，測試會提醒重新確認。
-- **`oc-plugins/tests/pwsh-profile-loader/index.mjs`**（20 項檢查）：測試只看插件實際執行的結果，不看原始碼寫了什麼，分兩層進行。
+- **`opencode/tests/pwsh-profile-loader/index.mjs`**（20 項檢查）：測試只看插件實際執行的結果，不看原始碼寫了什麼，分兩層進行。
   - 第一層把插件真的載入進來、執行一次 hook，觀察插件改寫了什麼：pwsh 與 powershell 的命令要加上前綴，bash 不動，命令不是字串或只有空白時不動，命令裡已經有載入程式碼時不再加一次，四個 profile 檔都會逐一確認之後才載入，其中一個載入出錯時用 pwsh 原生的錯誤格式回報，OpenCode 沒有提供這個 hook 時整個插件不動作。
   - 第二層拿改寫出來的前綴真的去執行 pwsh，證明前綴確實載入 profile 且不干擾原本的命令。「確實載入」的證據是把環境裡的 git 從 PATH 移除，再由 profile 加回來。另外確認離開碼原樣回傳、四個 profile 檔全都不存在時前綴什麼也不做、profile 出錯時錯誤以 pwsh 原生格式出現在 stderr 且命令照常執行、profile 裡定義的變數與函式在命令中都取用得到。
 
@@ -223,4 +223,4 @@ npm run test:oc   # OpenCode 插件：packaging（22 項）＋ chat-trim-context
 
 # 封存模組歷史技術規格
 
-舊版環境修復層（`pi-extensions/env-guard`、`oc-plugins/env-guard`）的完整歷史技術架構、設計判準與問題根因分析——包含 `MSYS_NO_PATHCONV` 閘門、temp 掛載點、使用統計分類，以及「只能靠寫對的情境」與「未修復問題記錄」——全部留存於 [`docs/archive/spec-old.md`](archive/spec-old.md)。
+舊版環境修復層（`pi-agent/env-guard`、`opencode/env-guard`）的完整歷史技術架構、設計判準與問題根因分析——包含 `MSYS_NO_PATHCONV` 閘門、temp 掛載點、使用統計分類，以及「只能靠寫對的情境」與「未修復問題記錄」——全部留存於 [`docs/archive/spec-old.md`](archive/spec-old.md)。

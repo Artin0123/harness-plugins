@@ -1,15 +1,15 @@
 {
-	"name": "harness-plugins",
+	"name": "harness-setup",
 	"version": "1.0.0",
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test:pi": "node pi-extensions/tests/native-powershell/index.mjs",
-		"test:oc": "node oc-plugins/tests/packaging/index.mjs && node oc-plugins/tests/chat-trim-context/index.mjs && node oc-plugins/tests/pwsh-profile-loader/index.mjs"
+		"test:pi": "node pi-agent/tests/native-powershell/index.mjs",
+		"test:oc": "node opencode/tests/packaging/index.mjs && node opencode/tests/chat-trim-context/index.mjs && node opencode/tests/pwsh-profile-loader/index.mjs"
 	},
 	"pi": {
 		"extensions": [
-			"./pi-extensions"
+			"./pi-agent"
 		]
 	}
 }

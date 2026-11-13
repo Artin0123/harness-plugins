@@ -6,14 +6,14 @@
 > 導正；歷史統計鍵由 `adoptCounts` 保留。文中引用的「現僅約束 oc 版」掃描器規則
 > 已全部隨掃描器失效；下方原狀態註記描述的是 redesign 前的落地。
 
-> **已實作**（redesign 前，2026-11-04：oc-plugins/env-guard/index.ts + oc-plugins/tests/env-guard/
+> **已實作**（redesign 前，2026-11-04：opencode/env-guard/index.ts + opencode/tests/env-guard/
 > index.mjs，電池全綠；pi 256、cmdc 175 重跑確認無跨 host 影響）。本指南保留為
 > 移植過程的事實基礎與陷阱記錄；第 0 步的驗證已在本機完成：oc 實際 bash =
 > `C:\Users\artin\scoop\apps\git\2.56.0\usr\bin\bash.exe`，與 `findBash()` 一致，
 > 「已釘死事實」重測全部吻合。
 
-給要在 oc-plugins/env-guard 補上「bash 前綴賦值 POSIX 路徑值改寫」（`shell.envPath`）的
-agent。pi 版已落地（見 pi-extensions/env-guard/index.ts 檔頭與 docs/spec.md〈掃描器要點〉
+給要在 opencode/env-guard 補上「bash 前綴賦值 POSIX 路徑值改寫」（`shell.envPath`）的
+agent。pi 版已落地（見 pi-agent/env-guard/index.ts 檔頭與 docs/spec.md〈掃描器要點〉
 ，commit cb4522a），但 **oc 環境與 pi 不同，不能直接抄 patch**——這份指南列出哪些是
 「同一顆 bash 的事實」可直接沿用、哪些是「host 結構差異」必須重做、以及 pi 版兩輪
 review 踩過的全部坑（每個坑都對應一條 pinned test，漏一條就是重蹈覆轍）。
@@ -80,7 +80,7 @@ A=/c$(echo foo) node -e '...'   # 預期 <msys-root>/cfoo（組合律前提）
 | 關鍵字集 | `RESERVED_WORD`，大小寫敏感（刻意：大寫 ENV/ECHO 是程式名），不含 for/case/esac/in/select/function（case 另有 caseRegion 追蹤） | `SHELL_KEYWORDS`，**toLowerCase 後比對**，集合較全 | envp 的觸發判定必須大小寫敏感（pi 版已定義語意）；oc 既有的 toLowerCase 是 cmdFlag 面的歷史行為，本移植不動它，但 envp 判定不得走它（見 oc-2） |
 | 暫存機制 | `pendingEnv` 跨度暫存＋多點丟棄 | 無 | 核心新增物；pi 的 patch 是對 pi 掃描器結構寫的，oc 的 token 機制（scanDq、casePending、clearTok 時機）結構不同，**要按 oc 自己的 commitTok/EOF 結構重新落點**，逐點對照 pi 的丟棄點清單（第 3 節） |
 | 統計 | `getAgentDir()/env-guard-stats.json` | 官方 `ctx.storage` | 只需新增 key `shell.envPath`（spec 統計表已留位，現標「(pi)」，實作後更新） |
-| 測試 | `pi-extensions/tests/env-guard/index.mjs`（stub getAgentDir） | `oc-plugins/tests/env-guard/index.mjs`（temp 複製載入、worker 隔離） | 新 pinned tests 加在 oc 電池，載入方式沿用 oc 現有骨架 |
+| 測試 | `pi-agent/tests/env-guard/index.mjs`（stub getAgentDir） | `opencode/tests/env-guard/index.mjs`（temp 複製載入、worker 隔離） | 新 pinned tests 加在 oc 電池，載入方式沿用 oc 現有骨架 |
 
 ## 3. 掃描器改動點清單（照 pi 版語意、按 oc 結構落點）
 
@@ -134,7 +134,7 @@ oc 的 `scanBash` 需要新增的狀態與規則（對照 pi 版同名物）：
 ## 5. 驗證要求（repo 紀律，缺一不算完成）
 
 > **已驗**（本機）：第 0 步 bash 身分記錄、修前對照、e2e 真實 spawn（含緊貼形與
-> no-op）、電池 oc 259 ＋ pi 256 ＋ cmdc 175 全綠、測試在 oc-plugins/tests/env-guard/
+> no-op）、電池 oc 259 ＋ pi 256 ＋ cmdc 175 全綠、測試在 opencode/tests/env-guard/
 > 。e2e 判準採平行形式——**改寫後的輸出必須 bit-identical 於原生轉換輸出**（原生
 > 側用 `env -u MSYS_NO_PATHCONV -u BASH_ENV` 的新鮮 bash 對照），這是「環境轉換層
 > 造成的失敗＝漏修」判準的驗證形式（工具回傳≡原生才算修對）。
@@ -145,15 +145,15 @@ oc 的 `scanBash` 需要新增的狀態與規則（對照 pi 版同名物）：
    `A=/c/x bash -c 'echo $A'`（direct-read 不發散）、緊貼形 `A=/c/x$(pwd) node`
    （組合律）、事件原形 no-op。用 oc 實際 spawn 的 bash（第 0 步拿到的路徑）。
 3. **電池**：oc 電池新增後全綠（現 158 條起跳）；pi 256、cmdc 175 重跑確認無跨
-   host 影響（本移植只動 oc-plugins/ 與 docs/）。
-4. **測試位置**：oc-plugins/tests/env-guard/ 下（host 資料夾 tests/，與插件分離）。
+   host 影響（本移植只動 opencode/ 與 docs/）。
+4. **測試位置**：opencode/tests/env-guard/ 下（host 資料夾 tests/，與插件分離）。
 5. **臨時探測腳本**放系統暫存目錄，用完清掉；插件檔內不留 debug 殘留。
 
 ## 6. 文檔同步
 
 - `docs/spec.md`：〈掃描器要點〉的「oc 版尚未跟進」句、統計表 `shell.envPath`
   的「(pi)」標記、（若量測歸屬有變）〈測量歸屬〉段。
-- `oc-plugins/env-guard/index.ts` 檔頭：對應 pi 版檔頭的刻意不修/殘餘邊界條目，
+- `opencode/env-guard/index.ts` 檔頭：對應 pi 版檔頭的刻意不修/殘餘邊界條目，
   措辭照 oc 檔案既有風格（英文、語氣一致）。
 - README 的 oc 段落若列了修復清單，補一條。
 

@@ -1,6 +1,6 @@
 // native-powershell tests.
 //
-//   node pi-extensions/tests/native-powershell/index.mjs      (or: npm run test:pi)
+//   node pi-agent/tests/native-powershell/index.mjs      (or: npm run test:pi)
 //
 // The suite runs the real powershell executable and looks at how it is actually
 // spawned, not at what the source says. Checks that need a Windows PowerShell are
@@ -124,7 +124,7 @@ const LIVE_LABELS = [
 try {
   // ---- packaging: the extension has to be installable and self-contained ------
   const pkgPath = join(here, '..', '..', 'package.json');
-  check('P: pi-extensions/package.json readable', existsSync(pkgPath), pkgPath);
+  check('P: pi-agent/package.json readable', existsSync(pkgPath), pkgPath);
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
   for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
     check(`P: no ${field} (install pulls nothing)`, pkg[field] === undefined, JSON.stringify(pkg[field]));
@@ -135,7 +135,7 @@ try {
     check(`P: extension target exists (${target})`, existsSync(join(here, '..', '..', target, 'index.ts')), target);
   }
   const rootPkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  check('P: root package re-exports pi-extensions', (rootPkg.pi?.extensions ?? []).includes('./pi-extensions'), JSON.stringify(rootPkg.pi?.extensions));
+  check('P: root package re-exports pi-agent', (rootPkg.pi?.extensions ?? []).includes('./pi-agent'), JSON.stringify(rootPkg.pi?.extensions));
 
   // ---- wiring -----------------------------------------------------------------
   let registered;

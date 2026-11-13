@@ -1,6 +1,6 @@
 // env-guard -- protects OpenCode's Windows shell and file tools from this
 // machine's measured environment failures. Same judgement framework as the
-// pi-extensions and cmdc-mods siblings in the harness-plugins repo; every fix
+// pi-agent and cmdc-mods siblings in the harness-setup repo; every fix
 // is anchored to a failure MEASURED on this machine (Git for Windows 2.56.0 /
 // MINGW64, opencode v2.2.5). User view & install: README.md; the design
 // record (why the input-side bash lexer was removed and replaced by

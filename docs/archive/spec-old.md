@@ -1,6 +1,6 @@
 # 技術規格（舊版封存 / Historical Spec）
 
-> **封存說明**：本文件為舊版環境修復層（包含 `cmdc-mods` 全系列、`pi-extensions/env-guard`、`oc-plugins/env-guard`）之完整歷史技術規格書存檔。
+> **封存說明**：本文件為舊版環境修復層（包含 `cmdc-mods` 全系列、`pi-agent/env-guard`、`opencode/env-guard`）之完整歷史技術規格書存檔。
 > 專案在 Windows 環境下已經全面轉向原生 PowerShell（PWSH），不再使用 Bash。現行模組技術規格請參閱 [`docs/spec.md`](../spec.md)。
 
 ---
@@ -149,7 +149,7 @@ pi bash 的執行結果形狀（參考 `dist/core/tools/bash.js`）：`content:[
 - 若宣告 `dependencies` 或 `peerDependencies`，npm 會下載整個依賴樹（例如宣告 `@opencode/plugin` 會下載 270+ 套件、占用約 168 MB）。
 - 本專案規範**完全不宣告任何執行期依賴**：安裝目錄僅約 12 KB（`chat-trim-context`）至 48 KB（`env-guard`）。
 - `Plugin.define` 僅是 identity 函式，插件可於本地自行宣告，不需引入外部執行期模組。
-- `oc-plugins/tests/packaging/` 測試會嚴格檢查 package.json，確保零外部依賴與導出契約正確。
+- `opencode/tests/packaging/` 測試會嚴格檢查 package.json，確保零外部依賴與導出契約正確。
 
 ---
 
@@ -248,5 +248,5 @@ pi bash 的執行結果形狀（參考 `dist/core/tools/bash.js`）：`content:[
 測試程式碼一律置於各 Host 資料夾的 `tests/` 目錄下，與外掛交付目錄嚴格分離：
 
 - **單元測試套件**：直接以 Node 原生執行 TypeScript（利用 Type Stripping），無需建置步驟。
-- **打包體積檢查**（`oc-plugins/tests/packaging/index.mjs`）：嚴格檢查無外部依賴、無 host 執行期引用，確保安裝輕量。
+- **打包體積檢查**（`opencode/tests/packaging/index.mjs`）：嚴格檢查無外部依賴、無 host 執行期引用，確保安裝輕量。
 - **斷言防回歸**：針對每項路徑改寫規則、刻意不修情境、Hook 契約防護與統計持久化邏輯均包含完整單元測試。

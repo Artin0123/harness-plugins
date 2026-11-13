@@ -1,6 +1,6 @@
 // Behavior battery for the pwsh-profile-loader plugin.
 //
-//   node oc-plugins/tests/pwsh-profile-loader/index.mjs
+//   node opencode/tests/pwsh-profile-loader/index.mjs
 //
 // Two layers, both real:
 //   1. The ACTUAL module is imported (Node native TS type-stripping), setup()

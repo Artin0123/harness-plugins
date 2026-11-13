@@ -1,8 +1,8 @@
-// shim-src.cs — compiled by the plugin (oc-plugins/pwsh-profile-shim/index.ts) at
+// shim-src.cs — compiled by the plugin (opencode/pwsh-profile-shim/index.ts) at
 // first setup with the in-box compiler C:\Windows\Microsoft.NET\Framework64\
 // v4.0.30319\csc.exe, then spawned by opencode in place of the real pwsh.
 //
-// Contract (docs/PLAN.md section 3, variant B):
+// Contract (docs/archive/PLAN.md section 3, variant B):
 //   * forward every argument verbatim, order preserved
 //   * drop the injected "-NoProfile" token only when the whole token equals it
 //     (case-insensitive); "-NoProfileX" and friends are forwarded as-is
