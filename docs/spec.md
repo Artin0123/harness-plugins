@@ -6,7 +6,7 @@
 
 ## 架構現狀：Windows 上使用原生 PowerShell
 
-本專案原本為每個 Harness 各維護一套 `env-guard`，修復 Git Bash 在 Windows 上的環境轉換問題。這套修復層已停止維護，模組與歷史規格封存於 [`archive/README.md`](../archive/README.md) 與 [`docs/archive/spec-old.md`](archive/spec-old.md)。
+本專案原本為每個 Harness 各維護一套 `env-guard`，修復 Git Bash 在 Windows 上的環境轉換問題。這套修復層已停止維護，設置與歷史規格封存於 [`archive/README.md`](../archive/README.md) 與 [`docs/archive/spec-old.md`](archive/spec-old.md)。
 
 評測與計分在 [`docs/bash-vs-pwsh.md`](bash-vs-pwsh.md)，本文件不重複評測內容。結論是 PowerShell 得 −3.0，Bash 加上 `.bashrc` 三段修復之後最好也只有 −8.0，兩者相差 5 分。−8.0 這個上限本身已經包含修復加分，而本機的 `.bashrc` 確實套用了那三段修復（實測 `$TMPDIR` 為 `C:/Users/artin/AppData/Local/Temp`，`type -t cmd`、`type -t taskkill`、`type -t findstr` 都回報 `function`），所以本機的 Bash 就落在這個上限；即使如此仍然低於 PowerShell。
 
@@ -22,7 +22,7 @@
 
 - **原始碼**：[`pi-agent/native-powershell/index.ts`](../pi-agent/native-powershell/index.ts)
 - **測試**：[`pi-agent/tests/native-powershell/index.mjs`](../pi-agent/tests/native-powershell/index.mjs)
-- **目標**：pi 內建的 PowerShell 工具與本模組之間的差異，只有「少兩個啟動旗標」。
+- **目標**：pi 內建的 PowerShell 工具與本擴充之間的差異，只有「少兩個啟動旗標」。
 
 ### 成因
 
@@ -41,16 +41,16 @@ POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"
 
 pi 對 shell 的啟動方式提供兩條改動路徑，都碰不到啟動參數：
 
-- `spawnHook` 只能修改命令文字、工作目錄與環境變數三樣東西。啟動參數由 pi 內部的 exec 程式組出來，組參數的程式碼不對插件開放。
+- `spawnHook` 只能修改命令文字、工作目錄與環境變數三樣東西。啟動參數由 pi 內部的 exec 程式組出來，組參數的程式碼不對擴充開放。
 - `PowerShellToolOptions` 只開放 `operations`、`exposeSessionEnvironment` 與 `spawnHook` 三個欄位，沒有一個能改動啟動參數。
 
-因此模組採用 `pi.registerTool(createPowerShellTool(process.cwd(), { operations }))`：註冊同名工具取代內建版，pi 呼叫 `powershell` 工具時執行的是模組的實作，pwsh 行程由模組自己啟動。代價是內建版原本替使用者做的事情必須由模組自己實作，因此套件入口沒有匯出的部分（本地 shell 後端、`getShellEnv`、子行程 pid 登記簿）只能自行複製或放棄，逐項後果列在「已知差異」。
+因此擴充採用 `pi.registerTool(createPowerShellTool(process.cwd(), { operations }))`：註冊同名工具取代內建版，pi 呼叫 `powershell` 工具時執行的是擴充的實作，pwsh 行程由擴充自己啟動。代價是內建版原本替使用者做的事情必須由擴充自己實作，因此套件入口沒有匯出的部分（本地 shell 後端、`getShellEnv`、子行程 pid 登記簿）只能自行複製或放棄，逐項後果列在「已知差異」。
 
 深層匯入 `dist/core/tools/bash.js` 的替代路線也驗證過不可行：實測得到 `ERR_PACKAGE_PATH_NOT_EXPORTED`。入口匯出的 `createLocalPowerShellOperations` 本身就會注入那組啟動參數與 UTF-8 指令，正好是要改動的內容，不能沿用。
 
 ### 保留 UTF-8 指令與 `-NonInteractive`
 
-這兩項都不在故障範圍，模組照原樣保留。UTF-8 指令的理由是可量測的：由程式直接啟動、沒有終端可繼承的 pwsh（headless spawn），輸出字碼頁是系統的 ANSI 值，不是 UTF-8。本機（zh-CN 系統）實測，pwsh 7 與 Windows PowerShell 5.1 的行為相同：
+這兩項都不在故障範圍，擴充照原樣保留。UTF-8 指令的理由是可量測的：由程式直接啟動、沒有終端可繼承的 pwsh（headless spawn），輸出字碼頁是系統的 ANSI 值，不是 UTF-8。本機（zh-CN 系統）實測，pwsh 7 與 Windows PowerShell 5.1 的行為相同：
 
 | 命令前面有沒有那段 UTF-8 指令 | `[Console]::OutputEncoding` | `Write-Output '漢字AB'` 的原始位元組 | 以 UTF-8 解碼的結果 |
 | ----------------------------- | --------------------------- | ------------------------------------ | ------------------- |
@@ -63,15 +63,15 @@ pi 對 shell 的啟動方式提供兩條改動路徑，都碰不到啟動參數�
 
 ### 啟動參數不寫死
 
-參數清單不寫死在模組裡，每次呼叫時向 `getPowerShellConfig()` 取得，再過濾掉 `-NoProfile` 與 `-ExecutionPolicy`（連同 `-ExecutionPolicy` 的值）。上游日後增刪其他參數時模組會跟著變，不需要同步修改；模組不認得的旗標照樣傳遞。
+參數清單不寫死在擴充裡，每次呼叫時向 `getPowerShellConfig()` 取得，再過濾掉 `-NoProfile` 與 `-ExecutionPolicy`（連同 `-ExecutionPolicy` 的值）。上游日後增刪其他參數時擴充會跟著變，不需要同步修改；擴充不認得的旗標照樣傳遞。
 
 ### 命令的送出方式
 
-把命令送進 pwsh 有兩種方式：當成 `-Command` 的參數值，或是在啟動後從 stdin 寫入。模組採用前者，與內建版相同。stdin 餵法雖然能讓命令文字不出現在行程命令列上，但多行命令會被靜默吞掉：沒有輸出、離開碼 0，看起來像成功。實測之後判定不可用。
+把命令送進 pwsh 有兩種方式：當成 `-Command` 的參數值，或是在啟動後從 stdin 寫入。擴充採用前者，與內建版相同。stdin 餵法雖然能讓命令文字不出現在行程命令列上，但多行命令會被靜默吞掉：沒有輸出、離開碼 0，看起來像成功。實測之後判定不可用。
 
 ### 與內建版的比對結果
 
-判定「與內建版一致」的方法是同一道命令分別經內建版與模組送出，比對四項可觀察結果，而不是比對原始碼。同一輪的實測結果：
+判定「與內建版一致」的方法是同一道命令分別經內建版與擴充送出，比對四項可觀察結果，而不是比對原始碼。同一輪的實測結果：
 
 | 比對項目                                                      | 結果                               |
 | ------------------------------------------------------------- | ---------------------------------- |
@@ -80,44 +80,44 @@ pi 對 shell 的啟動方式提供兩條改動路徑，都碰不到啟動參數�
 | `[Console]::OutputEncoding.WebName`                           | 相同（`utf-8`）                    |
 | `exit 7` 的回傳離開碼                                         | 相同（7）                          |
 
-結束判定的驗證數字，同一道命令分別經本模組與內建版送出，各取三次的中位數（本機 zh-CN、pwsh 7.6.9、Node 26.13.0）：
+結束判定的驗證數字，同一道命令分別經本擴充與內建版送出，各取三次的中位數（本機 zh-CN、pwsh 7.6.9、Node 26.13.0）：
 
-| 命令 | 本模組 | 內建版 |
+| 命令 | 本擴充 | 內建版 |
 |---|---|---|
 | `Start-Process -NoNewWindow`（背景持有 15 秒） | 733 毫秒 | 670 毫秒 |
 | `cmd /c start /b`（背景持有 12 秒） | 718 毫秒 | 636 毫秒 |
 
-本模組比內建版多 63 毫秒與 82 毫秒，上表的差額全部來自載入 profile：獨立量測 pwsh 啟動，不載入 profile 為 236 毫秒、載入 profile 為 334 毫秒，相差 98 毫秒；最直接的對照是同一道命令 `1`，本模組中位數 443 毫秒、內建版中位數 341 毫秒，差 102 毫秒。上表兩個差額與這些值同一量級，差別屬於量測噪音。
+本擴充比內建版多 63 毫秒與 82 毫秒，上表的差額全部來自載入 profile：獨立量測 pwsh 啟動，不載入 profile 為 236 毫秒、載入 profile 為 334 毫秒，相差 98 毫秒；最直接的對照是同一道命令 `1`，本擴充中位數 443 毫秒、內建版中位數 341 毫秒，差 102 毫秒。上表兩個差額與這些值同一量級，差別屬於量測噪音。
 
-這些差異的具體數值取決於使用者自己的 profile，不是模組的固定成本：空 profile 幾乎不花時間，載入模組、主題或版本管理員的 profile 可能多出數百毫秒。同一個模組在別的機器上會有不同差額；能通用的關係只有一項：差額等於同一台機器上載入 profile 的時間。
+這些差異的具體數值取決於使用者自己的 profile，不是擴充的固定成本：空 profile 幾乎不花時間，載入模組、主題或版本管理員的 profile 可能多出數百毫秒。同一個擴充在別的機器上會有不同差額；能通用的關係只有一項：差額等於同一台機器上載入 profile 的時間。
 
 參數驗證的順序也必須與內建版相同：先驗逾時，再驗取消狀態，最後驗工作目錄。順序有實際後果，逾時上限就是其中一例：缺少 `MAX_TIMEOUT_MS = 2_147_483_647` 這道上限檢查時，`timeout: 3e9` 會讓 `setTimeout` 溢出成 1 毫秒，變成一個訊息誤導的假逾時。
 
 ### 上游改版時的失去同步
 
-模組從 pi 內建版複製了幾樣東西，因為套件入口沒有匯出。這些複本不會隨 pi 升級自動更新。`npm run test:pi` 會拿機器上實際安裝的 pi 逐項比對，並在每一項的結果裡印出比對到的版本；找不到 pi 套件時這些項目標記 SKIP 並說明原因，不會算成通過。
+擴充從 pi 內建版複製了幾樣東西，因為套件入口沒有匯出。這些複本不會隨 pi 升級自動更新。`npm run test:pi` 會拿機器上實際安裝的 pi 逐項比對，並在每一項的結果裡印出比對到的版本；找不到 pi 套件時這些項目標記 SKIP 並說明原因，不會算成通過。
 
 | 複本 | 取得方式 | 升級後會不會失去同步 | 由什麼發現 |
 |---|---|---|---|
-| 啟動參數清單 | 不複製：每次呼叫向 `getPowerShellConfig()` 取得 | 不會，pi 增刪其他參數時模組自動跟上 | — |
-| 命令的送出方式（command 接在參數清單的最後） | 假設，不是複本：直接讀取 pi 的參數清單，因此預設清單以 `-Command` 結尾 | 會。pi 改成從 stdin 餵命令時，清單結尾不再是 `-Command`，而模組仍把命令接在最後一個參數後面 | 測試讀取 `POWERSHELL_ARGS`，確認最後一項是 `-Command` |
-| 兩個旗標的名稱（`-NoProfile`、`-ExecutionPolicy`） | 寫在模組裡的兩個常數 | 會。旗標改名，或 `-ExecutionPolicy` 改成自帶值的形式時，過濾什麼都濾不到，兩個旗標會被原樣送出，而且沒有任何錯誤訊息 | 測試讀取 pi 原始碼裡的 `POWERSHELL_ARGS`，確認兩個旗標還在，並確認過濾結果不含 `Bypass` |
-| UTF-8 前綴字串 | 逐字複製 | 會。pi 改字串時模組留舊字串；只要新舊字串都設成 UTF-8，行為就相同，執行結果看不出來 | 測試比對兩邊的常數字串，不一致時印出兩份內容 |
-| 結束寬限與逾時上限（`EXIT_STDIO_GRACE_MS`、`MAX_TIMEOUT_MS`） | 複製數值 | 會。pi 調整其中一個時，模組留舊值 | 測試比對兩邊的數值 |
-| exec 的驗證順序、錯誤訊息、結束判定寫法 | 照內建版重寫 | 會。訊息或順序改變時模組不會跟上，但這類差異大多只影響文字 | 沒有專門的上游比對；測試自己的斷言（逾時上限訊息、找不到工作目錄的訊息、取消與工作目錄的優先序）會在訊息或順序改變時失敗 |
+| 啟動參數清單 | 不複製：每次呼叫向 `getPowerShellConfig()` 取得 | 不會，pi 增刪其他參數時擴充自動跟上 | — |
+| 命令的送出方式（command 接在參數清單的最後） | 假設，不是複本：直接讀取 pi 的參數清單，因此預設清單以 `-Command` 結尾 | 會。pi 改成從 stdin 餵命令時，清單結尾不再是 `-Command`，而擴充仍把命令接在最後一個參數後面 | 測試讀取 `POWERSHELL_ARGS`，確認最後一項是 `-Command` |
+| 兩個旗標的名稱（`-NoProfile`、`-ExecutionPolicy`） | 寫在擴充裡的兩個常數 | 會。旗標改名，或 `-ExecutionPolicy` 改成自帶值的形式時，過濾什麼都濾不到，兩個旗標會被原樣送出，而且沒有任何錯誤訊息 | 測試讀取 pi 原始碼裡的 `POWERSHELL_ARGS`，確認兩個旗標還在，並確認過濾結果不含 `Bypass` |
+| UTF-8 前綴字串 | 逐字複製 | 會。pi 改字串時擴充留舊字串；只要新舊字串都設成 UTF-8，行為就相同，執行結果看不出來 | 測試比對兩邊的常數字串，不一致時印出兩份內容 |
+| 結束寬限與逾時上限（`EXIT_STDIO_GRACE_MS`、`MAX_TIMEOUT_MS`） | 複製數值 | 會。pi 調整其中一個時，擴充留舊值 | 測試比對兩邊的數值 |
+| exec 的驗證順序、錯誤訊息、結束判定寫法 | 照內建版重寫 | 會。訊息或順序改變時擴充不會跟上，但這類差異大多只影響文字 | 沒有專門的上游比對；測試自己的斷言（逾時上限訊息、找不到工作目錄的訊息、取消與工作目錄的優先序）會在訊息或順序改變時失敗 |
 | 工具註冊的方式（`createPowerShellTool(cwd, { operations })` 是否採用傳入的 `operations`） | 呼叫內建工廠 | 會。若 pi 不再採用傳入的 `operations`，覆蓋會無聲失效，兩個旗標回到命令列 | 測試用 pi 自己的工廠建立真的工具物件，執行一道命令後檢查命令列裡沒有那兩個旗標 |
 
-比對用的 pi 從四個地方找：環境變數 `NPS_PI_ROOT`、`npm` 的 global prefix（在 `npm run` 之下由 `npm_config_global_prefix` 提供，另外試 `%APPDATA%\npm`）、Node 執行檔往上四層的 `node_modules` 與 `bin\node_modules`、專案自己的 `node_modules`。模組本身沒有為了比對而增加執行期檢查；比對全部在測試裡，所以升級後必須跑一次測試才會知道有沒有失步。
+比對用的 pi 從四個地方找：環境變數 `NPS_PI_ROOT`、`npm` 的 global prefix（在 `npm run` 之下由 `npm_config_global_prefix` 提供，另外試 `%APPDATA%\npm`）、Node 執行檔往上四層的 `node_modules` 與 `bin\node_modules`、專案自己的 `node_modules`。擴充本身沒有為了比對而增加執行期檢查；比對全部在測試裡，所以升級後必須跑一次測試才會知道有沒有失步。
 
 這些比對失敗只代表「repo 裡的複本與機器上安裝的 pi 不一致」，不代表當下的 PowerShell 輸出錯了。實例：故意讓前綴字串多一個空白後跑測試，字碼頁仍然是 65001、中文輸出仍然正確，而字串比對仍然失敗。因此失敗訊息不會斷定「工具壞了」，只會指出哪一項不一致、以及是跟哪個版本比的。
 
 ### 已知差異
 
-- **子行程 pid 登記簿**：內建版的 exec 程式會把每個子行程的 pid 記進 `trackDetachedChildPid`，pi 本體在收到 SIGTERM、SIGHUP 或崩潰清理時，透過 `killTrackedDetachedChildren` 一次結束登記簿裡的所有行程。這個登記簿與共用的 exec 程式同為 `utils/shell.js` 的內部狀態，套件入口沒有匯出，模組掛不進去；自行處理訊號會與 pi 本體重複執行同一份清理工作，風險更高，所以不補。後果是 pi 本體在指令執行途中被訊號終止時，模組啟動的行程樹不會被 pi 清理。逾時與取消兩條路徑不受影響，那兩條由模組自己呼叫 `taskkill`，而且 `taskkill` 以 `detached: true` 啟動，可以在 pi 本體結束後繼續完成清理。
-- **環境變數的預設值**：內建版在呼叫端沒有提供 `env` 時，會改用 `getShellEnv()`（這個函式會在 PATH 前面補上 `.pi/agent/bin`）。`getShellEnv` 沒有匯出，模組只能原樣轉交呼叫端提供的 `env`。pi 本體一定會提供 `env`（`resolveSpawnContext` 會組好包含 `PI_*` 的環境變數），所以實際使用上沒有差別；差別只出現在 pi 本體之外直接呼叫模組的情況，那時 PATH 的前置項目會少一層。
-- **工具的建立選項**：內建工具接受 `exposeSessionEnvironment`、`spawnHook`、`commandPrefix` 三個選項，模組只轉交 `operations`。pi 本體建立工具時不會傳入任何 `powershell` 選項（`dist` 裡只有 `options?.powershell` 的讀取端，沒有設定端），因此兩邊行為相同；若有外部程式用這些選項建立工具，模組的覆蓋會忽略那些選項。
-- **UTF-8 指令是一份字串複本**：內建版把那段指令放在私有常數 `UTF8_OUTPUT_PREFIX` 裡，套件入口沒有匯出，模組只能複製字串。上游若改動那段指令，模組不會自動跟上；測試只能驗證結果（字碼頁是 UTF-8），驗不到字串本身是否與上游一致。
-- **工具的預設工作目錄**：模組在擴充載入時用 `process.cwd()` 建立工具，內建工具由 pi 用當下 session 的工作目錄建立。兩者在正常啟動（pi 在專案目錄裡啟動）完全相同；差別只出現在同一個 pi 程序內把 session 換到另一個工作目錄的情況（例如 `/resume`），那時模組的預設工作目錄不會跟著換。
+- **子行程 pid 登記簿**：內建版的 exec 程式會把每個子行程的 pid 記進 `trackDetachedChildPid`，pi 本體在收到 SIGTERM、SIGHUP 或崩潰清理時，透過 `killTrackedDetachedChildren` 一次結束登記簿裡的所有行程。這個登記簿與共用的 exec 程式同為 `utils/shell.js` 的內部狀態，套件入口沒有匯出，擴充掛不進去；自行處理訊號會與 pi 本體重複執行同一份清理工作，風險更高，所以不補。後果是 pi 本體在指令執行途中被訊號終止時，擴充啟動的行程樹不會被 pi 清理。逾時與取消兩條路徑不受影響，那兩條由擴充自己呼叫 `taskkill`，而且 `taskkill` 以 `detached: true` 啟動，可以在 pi 本體結束後繼續完成清理。
+- **環境變數的預設值**：內建版在呼叫端沒有提供 `env` 時，會改用 `getShellEnv()`（這個函式會在 PATH 前面補上 `.pi/agent/bin`）。`getShellEnv` 沒有匯出，擴充只能原樣轉交呼叫端提供的 `env`。pi 本體一定會提供 `env`（`resolveSpawnContext` 會組好包含 `PI_*` 的環境變數），所以實際使用上沒有差別；差別只出現在 pi 本體之外直接呼叫擴充的情況，那時 PATH 的前置項目會少一層。
+- **工具的建立選項**：內建工具接受 `exposeSessionEnvironment`、`spawnHook`、`commandPrefix` 三個選項，擴充只轉交 `operations`。pi 本體建立工具時不會傳入任何 `powershell` 選項（`dist` 裡只有 `options?.powershell` 的讀取端，沒有設定端），因此兩邊行為相同；若有外部程式用這些選項建立工具，擴充的覆蓋會忽略那些選項。
+- **UTF-8 指令是一份字串複本**：內建版把那段指令放在私有常數 `UTF8_OUTPUT_PREFIX` 裡，套件入口沒有匯出，擴充只能複製字串。上游若改動那段指令，擴充不會自動跟上；測試只能驗證結果（字碼頁是 UTF-8），驗不到字串本身是否與上游一致。
+- **工具的預設工作目錄**：擴充在載入時用 `process.cwd()` 建立工具，內建工具由 pi 用當下 session 的工作目錄建立。兩者在正常啟動（pi 在專案目錄裡啟動）完全相同；差別只出現在同一個 pi 程序內把 session 換到另一個工作目錄的情況（例如 `/resume`），那時擴充的預設工作目錄不會跟著換。
 
 ---
 
@@ -180,18 +180,18 @@ OpenCode 提供給插件的 shell 掛鉤是 `shell.create.before`：這個掛鉤
 
 測試與插件資料夾分開放置，插件資料夾只包含交付物，因此手動安裝（`cp -r` 複製插件資料夾）不會把測試一起帶進安裝目錄。
 
-## 現行模組測試
+## 現行設置測試
 
 - **`pi-agent/tests/native-powershell/index.mjs`**（44 項檢查）：測試直接執行真的 pwsh，觀察 pwsh 實際如何被啟動、如何結束，不檢查原始碼寫了什麼。確認的項目如下：
   - 啟動參數：`-NonInteractive` 與那段 UTF-8 指令都在，`-NoProfile`、`-ExecutionPolicy`、`Bypass` 都不在；命令列與「直接用同樣參數啟動 pwsh」的結果一致。
-  - 參數過濾的單元檢查：從內建版的五個參數過濾後只剩 `-NonInteractive -Command`；模組不認得的參數照樣保留。這兩項不需要 pwsh，任何機器都會執行。
+  - 參數過濾的單元檢查：從內建版的五個參數過濾後只剩 `-NonInteractive -Command`；擴充不認得的參數照樣保留。這兩項不需要 pwsh，任何機器都會執行。
   - 命令的離開碼原樣回傳；呼叫端提供的 `env` 會傳進子行程。
   - 背景子行程持有繼承的輸出管道時仍在一秒內返回，測試涵蓋 `Start-Process -NoNewWindow` 與 `cmd /c start /b` 兩種寫法。
   - 逾時與取消的驗證順序、上限與錯誤訊息都與內建版一致；工作目錄不存在時會回報錯誤。
   - 命令要求輸入時（`$Host.UI.PromptForChoice`、`Get-Credential`、`Read-Host` 三種），立刻以錯誤結束，不會卡住等待。
   - 包裝檢查：`pi.extensions` 指向的檔案存在，而且 `package.json` 沒有任何依賴欄位，安裝時不會額外下載套件。
   - 編碼：字碼頁是 65001，中文輸出正確。這兩項看的是那段 UTF-8 指令的效果，不依賴 profile，因此不需要環境前提。
-  - 上游比對：拿機器上實際安裝的 pi 比對模組複製的內容。執行面的一項用 pi 自己的 `createPowerShellTool` 建立真的工具物件、執行真實命令，確認子行程的命令列裡沒有那兩個旗標、字碼頁是 65001、非 ASCII 輸出原樣返回、非零離開碼照實回報；文字面則直接讀 pi 的 `dist`，比對 `POWERSHELL_ARGS`（包含結尾是不是 `-Command`）、`UTF8_OUTPUT_PREFIX`、`EXIT_STDIO_GRACE_MS`、`MAX_TIMEOUT_MS` 與模組的複本是否一致。比對會在每一項結果裡附上 pi 的版本；找不到 pi 套件時（可用 `NPS_PI_ROOT` 指定）這些項目標記 SKIP。
+  - 上游比對：拿機器上實際安裝的 pi 比對擴充複製的內容。執行面的一項用 pi 自己的 `createPowerShellTool` 建立真的工具物件、執行真實命令，確認子行程的命令列裡沒有那兩個旗標、字碼頁是 65001、非 ASCII 輸出原樣返回、非零離開碼照實回報；文字面則直接讀 pi 的 `dist`，比對 `POWERSHELL_ARGS`（包含結尾是不是 `-Command`）、`UTF8_OUTPUT_PREFIX`、`EXIT_STDIO_GRACE_MS`、`MAX_TIMEOUT_MS` 與擴充的複本是否一致。比對會在每一項結果裡附上 pi 的版本；找不到 pi 套件時（可用 `NPS_PI_ROOT` 指定）這些項目標記 SKIP。
   - 沒有安裝 PowerShell 時，工具仍會註冊，`exec` 以內建版的錯誤訊息失敗。
   - 找不到任何 PowerShell 執行檔時，所有需要真的執行 pwsh 的項目一律標記 SKIP。輸出會分開統計 `passed`、`skipped`、`failed` 三個數字，跳過的項目不會被算成通過。
 - **`opencode/tests/packaging/index.mjs`**（22 項檢查）：發布前的完整性檢查，分成 `package.json` 與插件程式碼兩個部分。
@@ -213,14 +213,14 @@ npm run test:pi   # pi 擴充：native-powershell（44 項）
 npm run test:oc   # OpenCode 插件：packaging（22 項）＋ chat-trim-context（30 項）＋ pwsh-profile-loader（20 項）
 ```
 
-執行環境需求：Node.js 22.6 以上。測試與插件都靠 Node 內建的 TypeScript 型別剝離功能直接執行，不需要編譯。
+執行環境需求：Node.js 22.6 以上。測試與設置都靠 Node 內建的 TypeScript 型別剝離功能直接執行，不需要編譯。
 
-## 封存模組測試
+## 封存設置測試
 
 封存的測試套件（五套回歸測試，加上已退役方案 `pwsh-profile-shim` 的 11 項測試）以及用 Node 直接執行的方式，記載在 [`archive/README.md`](../archive/README.md)。
 
 ---
 
-# 封存模組歷史技術規格
+# 封存設置歷史技術規格
 
 舊版環境修復層（`pi-agent/env-guard`、`opencode/env-guard`）的完整歷史技術架構、設計判準與問題根因分析——包含 `MSYS_NO_PATHCONV` 閘門、temp 掛載點、使用統計分類，以及「只能靠寫對的情境」與「未修復問題記錄」——全部留存於 [`docs/archive/spec-old.md`](archive/spec-old.md)。
