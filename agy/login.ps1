@@ -1,33 +1,28 @@
-﻿# Antigravity CLI SSH Login Helper
-$logDir = "C:\Users\artin\.gemini\antigravity-cli\log"
+# Antigravity CLI SSH Login Helper
+$logDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\log'
 $existingLogs = @()
 if (Test-Path $logDir) {
     $existingLogs = @(Get-ChildItem -Path $logDir -Filter "cli-*.log" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
 }
 
+# 短網址輔助函式 (僅使用可直接跳轉授權的 TinyURL)
 function Get-ShortUrl($url) {
     $enc = [System.Uri]::EscapeDataString($url)
-
     try {
-        $res = (Invoke-RestMethod -Uri ("https://tinyurl.com/api-create.php?url=" + $enc) -UserAgent "curl/8.0.0" -TimeoutSec 3).Trim()
+        $res = (Invoke-RestMethod -Uri ("https://tinyurl.com/api-create.php?url=" + $enc) -UserAgent "curl/8.0.0" -TimeoutSec 5).Trim()
         if ($res -match '^https?://tinyurl\.com/\w+') { return $res }
     } catch {}
-
-    try {
-        $res = (Invoke-RestMethod -Uri ("https://is.gd/create.php?format=simple&url=" + $enc) -UserAgent "curl/8.0.0" -TimeoutSec 3).Trim()
-        if ($res -match '^https?://is\.gd/\w+') { return $res }
-    } catch {}
-
-    try {
-        $res = (Invoke-RestMethod -Uri ("https://v.gd/create.php?format=simple&url=" + $enc) -UserAgent "curl/8.0.0" -TimeoutSec 3).Trim()
-        if ($res -match '^https?://v\.gd/\w+') { return $res }
-    } catch {}
-
     return $url
 }
 
+$agy = "$env:LOCALAPPDATA\agy\bin\agy.exe"
+if (-not (Test-Path $agy)) {
+    $fallbackAgy = Join-Path $env:USERPROFILE '.gemini\bin\agy.exe'
+    if (Test-Path $fallbackAgy) { $agy = $fallbackAgy }
+}
+
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = "C:\Users\artin\.gemini\bin\agy.exe"
+$psi.FileName = $agy
 $psi.Arguments = "--print-timeout=1s -p=done"
 $psi.RedirectStandardError = $true
 $psi.RedirectStandardOutput = $false
@@ -51,10 +46,10 @@ while (-not $proc.HasExited) {
         $fullUrl = $matches[1]
         $shortUrl = Get-ShortUrl $fullUrl
 
-        Write-Host "`n登入授權短網址 (點擊後在頁面上點選 Google 連結直達授權)：" -ForegroundColor Cyan
+        Write-Host "`n登入授權短網址 (點擊後直達 Google 授權)：" -ForegroundColor Cyan
         Write-Host $shortUrl -ForegroundColor Yellow
         Write-Host ""
-    } elseif ($line.Trim().Length -gt 0 -and $line -notmatch 'Error: -p took' -and $line -notmatch 'print timeout') {
+    } elseif ($line.Trim().Length -gt 0 -and $line -notmatch 'Error: -p took' -and $line -notmatch 'print timeout' -and $line -notmatch 'AGY_ERROR') {
         Write-Host $line
     }
 }

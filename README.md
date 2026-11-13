@@ -25,6 +25,13 @@ Coding Agent 的環境修復設置合集。Windows 上以原生 PowerShell 為�
 - **代價**：每道命令開頭多一段 794 字元的載入程式碼，加上執行 profile 的時間（由你的 profile 內容決定）。profile 印出的內容會出現在工具輸出裡。
 - **需求**：OpenCode ≥ 2.2.5。
 
+### agy-tools（Antigravity CLI 認證工具）
+
+針對 Google Antigravity CLI (`agy`) 的遠端登入與憑證提取腳本，詳見 [`agy/README.md`](agy/README.md)。
+
+- **`agy/login.ps1`**：遠端裝置（例如手機 SSH）登入專用。自動攔截 Google OAuth 長網址並轉為 TinyURL 短網址，直達授權頁面，貼回授權碼即可完成登入。
+- **`agy/get-agy-token.ps1`**：無法進行 OAuth 的環境（例如嵌入式 iframe 視窗）連線專用。免參數自動刷新並自 Windows 憑證庫與本地檔案提取最新 Token，自動複製到剪貼簿，保護隱私不印出 raw token。
+
 ## 安裝
 
 每個 Harness 都提供「套件安裝」與「手動複製」兩種方式。
@@ -72,6 +79,18 @@ cp -r opencode/pwsh-profile-loader ~/.config/opencode/plugins/
 ```
 
 確認與更新：`opencode plugin list`、`opencode plugin update pwsh.profile-loader`。移除：`opencode plugin remove pwsh.profile-loader`。
+
+### 4. agy：遠端登入與憑證提取
+
+無需下載至本機，可在終端機直接透過一行指令載入執行（詳見 [`agy/README.md`](agy/README.md)）：
+
+```powershell
+# 手機 SSH 遠端登入（攔截網址轉 TinyURL 短網址直達授權）：
+pwsh -Command "irm https://raw.githubusercontent.com/Artin0123/harness-setup/master/agy/login.ps1 | iex"
+
+# 取得 access token 到剪貼簿（iframe / 嵌入視窗連線）：
+pwsh -Command "irm https://raw.githubusercontent.com/Artin0123/harness-setup/master/agy/get-agy-token.ps1 | iex"
+```
 
 ## 測試
 
